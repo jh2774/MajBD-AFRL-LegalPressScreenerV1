@@ -18,5 +18,6 @@ build/
 .ms-playwright/
 # Local dev convenience; contains machine-specific interpreter paths.
 .claude/
-# Release archives are build output, not source.
+# Release archives and handover bundles are build output, not source.
 foci-screen-v*.zip
+*.bundle
