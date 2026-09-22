@@ -1,0 +1,22 @@
+.env
+*.db
+.cache/
+out/
+probe/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+credentials.json
+token.json
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+*.eml
+.ms-playwright/
+# Local dev convenience; contains machine-specific interpreter paths.
+.claude/
+# Release archives are build output, not source.
+foci-screen-v*.zip

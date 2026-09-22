@@ -1,0 +1,14 @@
+# This repository is authored on Windows and runs on Linux. Git on Windows
+# checks files out with CRLF by default, and a Docker build takes its context
+# from the working copy — so without this, a shell line inside a RUN step can
+# arrive at the image with a trailing carriage return and fail in ways that read
+# as nonsense ("/bin/sh: 1: \r: not found").
+#
+# Normalise everything textual to LF in the repository and on checkout.
+* text=auto eol=lf
+
+*.zip binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.eml -text

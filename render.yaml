@@ -1,0 +1,107 @@
+# Render Blueprint. Deploy with: New > Blueprint, pointed at this repository.
+#
+# Four services, and each one earns its place:
+#   foci-api        FastAPI. Validates, enqueues, reads back. Never screens.
+#   foci-worker     Runs screens. Carries Chromium; needs the memory.
+#   foci-scheduler  Nightly sweep of active watchlists.
+#   foci-db / -kv   Postgres and Redis.
+#
+# Values marked `sync: false` are NOT set from this file. Render prompts for
+# them on first deploy, which is correct — they are secrets, and one of them
+# decides whether the API is reachable at all.
+
+databases:
+  - name: foci-db
+    databaseName: foci
+    user: foci
+    plan: basic-256mb          # `free` works, but Render expires free DBs at 30 days
+    postgresMajorVersion: "16"
+
+services:
+  # ------------------------------------------------------------------ cache
+  - type: redis
+    name: foci-kv
+    plan: free
+    maxmemoryPolicy: noeviction   # a queue must not have jobs evicted under pressure
+    ipAllowList: []               # private network only
+
+  # -------------------------------------------------------------------- API
+  - type: web
+    name: foci-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: foci-db, property: connectionString }
+      - key: REDIS_URL
+        fromService: { type: redis, name: foci-kv, property: connectionString }
+      # "tenant:key" pairs, comma separated. With this unset the API returns 503
+      # on every authenticated route — it fails closed on purpose.
+      - key: FOCI_API_KEYS
+        sync: false
+      # SEC and other .gov APIs block a User-Agent with no real contact address.
+      - key: FOCI_USER_AGENT
+        sync: false
+      - key: FOCI_CORS_ORIGINS
+        sync: false
+      - key: SAM_API_KEY
+        sync: false
+      - key: USPTO_API_KEY
+        sync: false
+      # Step 3 stays inert. Read the note in README before changing either.
+      - key: GMAIL_ENABLED
+        value: "false"
+      - key: GMAIL_SEND
+        value: "false"
+      # Safety valve for a pilot: while set, every notice goes here, never to a
+      # contracting officer.
+      - key: FOCI_EMAIL_REDIRECT_TO
+        sync: false
+
+  # ----------------------------------------------------------------- worker
+  - type: worker
+    name: foci-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile.worker
+    plan: standard              # Chromium needs the headroom; starter will OOM
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: foci-db, property: connectionString }
+      - key: REDIS_URL
+        fromService: { type: redis, name: foci-kv, property: connectionString }
+      - key: FOCI_USER_AGENT
+        sync: false
+      - key: SAM_API_KEY
+        sync: false
+      - key: USPTO_API_KEY
+        sync: false
+      - key: FOCI_BROWSER
+        value: "true"
+      # Render's filesystem is ephemeral; the HTTP cache is a per-deploy
+      # convenience, not storage. Snapshots live in Postgres.
+      - key: FOCI_CACHE
+        value: /tmp/foci-cache
+      - key: GMAIL_ENABLED
+        value: "false"
+      - key: GMAIL_SEND
+        value: "false"
+      - key: FOCI_EMAIL_REDIRECT_TO
+        sync: false
+
+  # -------------------------------------------------------------- scheduler
+  - type: cron
+    name: foci-scheduler
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    schedule: "0 7 * * *"       # 07:00 UTC daily
+    dockerCommand: python -m foci_screen.scheduler
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase: { name: foci-db, property: connectionString }
+      - key: REDIS_URL
+        fromService: { type: redis, name: foci-kv, property: connectionString }
+      - key: FOCI_USER_AGENT
+        sync: false

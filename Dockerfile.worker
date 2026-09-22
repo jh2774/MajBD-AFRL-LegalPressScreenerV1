@@ -1,0 +1,28 @@
+# Screening worker. Carries Chromium so investor-relations pages can be read.
+#
+# This image is roughly 700MB larger than the API's because of the browser and
+# its system libraries. That is the reason the two are separate: the API is
+# redeployed far more often and has no use for any of it.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /app
+
+COPY pyproject.toml README.md ./
+COPY foci_screen ./foci_screen
+RUN pip install --no-cache-dir ".[api,queue,postgres,browser]"
+
+# --with-deps pulls the shared libraries Chromium needs and requires root.
+# Installing to a shared path (not /root/.cache) so the unprivileged user can
+# read it afterwards.
+RUN playwright install --with-deps chromium \
+    && chmod -R a+rX /ms-playwright
+
+RUN useradd --create-home --uid 10001 app && chown -R app:app /app
+USER app
+
+CMD ["python", "-m", "foci_screen.worker"]

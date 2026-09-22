@@ -1,0 +1,125 @@
+# Tests, then the two Docker images.
+#
+# The image jobs are the point. The images were written without a container
+# runtime available to build them, so until this workflow runs they are
+# unverified — and an image that will not boot is the most expensive kind of
+# thing to discover during a first Render deploy. GitHub Actions has Docker, so
+# the first push proves them.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"       # matches the images
+
+      - name: Install (non-editable, as the images do)
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[api,queue,postgres,dev]"
+
+      - name: Lint
+        run: ruff check foci_screen tests tools
+
+      - name: Tests
+        run: pytest -q
+
+      - name: Install smoke test
+        # From a directory with no source tree, so it exercises what the wheel
+        # actually ships rather than the checkout.
+        run: |
+          mkdir -p /tmp/elsewhere
+          cd /tmp/elsewhere
+          python "$GITHUB_WORKSPACE/tools/install_smoke.py"
+
+  api-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: foci-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Boot it and check the Render health path
+        run: |
+          docker run -d --name api -p 8000:8000 \
+            -e FOCI_API_KEYS=ci:ci-key \
+            -e FOCI_USER_AGENT="foci-screen CI (ci@example.org)" \
+            foci-api:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/health > /tmp/health.json; then break; fi
+            sleep 2
+          done
+          cat /tmp/health.json
+          # The web UI must be inside the image, not just the repo.
+          curl -fsS http://localhost:8000/ | grep -q foci-screen
+          curl -fsS http://localhost:8000/app.js > /dev/null
+          # Auth must fail closed.
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/v1/overview)" = 401
+          curl -fsS -H 'Authorization: Bearer ci-key' http://localhost:8000/v1/overview > /dev/null
+          docker logs api | grep -i traceback && exit 1 || true
+          docker rm -f api
+
+  worker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.worker
+          push: false
+          load: true
+          tags: foci-worker:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Chromium actually launches as the unprivileged user
+        # The failure this catches: `playwright install --with-deps` runs as root
+        # and the image then drops to uid 10001. If the browser or its system
+        # libraries are unreadable afterwards, every IR page silently goes
+        # unread in production while the worker looks healthy.
+        run: |
+          docker run --rm foci-worker:ci python -c "
+          from foci_screen.connectors.browser import LAUNCH_ARGS, user_agent
+          from playwright.sync_api import sync_playwright
+          p = sync_playwright().start()
+          b = p.chromium.launch(headless=True, args=list(LAUNCH_ARGS))
+          page = b.new_context(user_agent=user_agent('foci-screen CI (ci@example.org)')).new_page()
+          page.set_content('<main>rendered</main>')
+          assert 'rendered' in page.content()
+          print('chromium ok:', b.version)
+          b.close(); p.stop()
+          "
+
+      - name: Worker entry point starts and reports a missing queue
+        run: |
+          set +e
+          out=$(docker run --rm foci-worker:ci python -m foci_screen.worker 2>&1)
+          code=$?
+          set -e
+          echo "$out"
+          echo "exit $code"
+          echo "$out" | grep -qi "redis" || { echo "expected a queue diagnostic"; exit 1; }
+          echo "$out" | grep -qi traceback && exit 1 || true

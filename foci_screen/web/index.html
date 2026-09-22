@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>foci-screen</title>
+<link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <a class="brand" href="#/">
+    <span class="brand-mark"></span>
+    <span>foci-screen</span>
+  </a>
+
+  <form class="searchbar" id="search-form" role="search">
+    <input id="search-input" type="search" autocomplete="off" spellcheck="false"
+           placeholder="Search contractors, awards, contracting officers, agencies…"
+           aria-label="Search">
+    <button type="submit">Search</button>
+  </form>
+
+  <nav class="topnav">
+    <a href="#/">Overview</a>
+    <a href="#/notices">Notices <span id="notice-badge" class="badge" hidden></span></a>
+    <button id="key-button" type="button" class="linkish">API key</button>
+  </nav>
+</header>
+
+<main id="view" aria-live="polite"></main>
+
+<dialog id="key-dialog">
+  <form method="dialog" id="key-form">
+    <h2>API key</h2>
+    <p class="muted">
+      This deployment requires a key. It is kept in this browser's local storage
+      and sent as a bearer token — treat it like a password and use a private
+      browser profile on a shared machine.
+    </p>
+    <input id="key-input" type="password" placeholder="sk_…" autocomplete="off">
+    <div class="dialog-actions">
+      <button value="cancel" class="ghost">Cancel</button>
+      <button value="save" class="primary">Save</button>
+    </div>
+  </form>
+</dialog>
+
+<footer class="foot">
+  Screening output from public records. Not a FOCI determination, a sanctions
+  adjudication, or a finding of non-compliance.
+</footer>
+
+<script src="./app.js"></script>
+</body>
+</html>
