@@ -6,26 +6,40 @@ Concrete steps. Roughly 30 minutes, most of it waiting for the worker image to b
 
 ## 1. Push to GitHub
 
-`.gitignore` already excludes `.env`, `credentials.json`, `token.json`, `*.db` and `out/`.
-Check that it worked before the first push rather than after:
+**The repository already exists, with one commit.** It ships two ways:
+
+* `foci-screen.bundle` — a git bundle carrying the full history. Clone it:
+
+  ```bash
+  git clone foci-screen.bundle foci-screen
+  cd foci-screen
+  git remote remove origin          # points at the bundle file, not GitHub
+  ```
+
+* or the release zip, which is the same files without the history. Then `git init && git add -A
+  && git commit`.
+
+The first commit was audited before it was made: 54 files, no `.env`, no `*.db`, no
+`credentials.json`, no local editor config, and no release archive. Verify for yourself with
+`git log --stat -1`. If anything sensitive ever does appear, fix it *before* pushing — a secret
+in a pushed commit stays in the history even if the next commit deletes it.
+
+Create the repository on GitHub (new, empty, **private**, no README or .gitignore — the repo
+has both), then:
 
 ```bash
-git init
-git add -A
-git status                    # read this list; no .env, no *.db, no credentials
-```
-
-If anything sensitive appears, stop and fix `.gitignore` first — a secret in the first commit
-stays in the history even if the next commit deletes it.
-
-```bash
-git commit -m "foci-screen: contract FOCI/IP screening service"
-gh repo create foci-screen --private --source=. --push
+git remote add origin git@github.com:<you>/foci-screen.git
+git push -u origin main
 ```
 
 **Keep it private.** The repository contains a working method for identifying and emailing
 federal contracting officers about named companies. Public is a decision to make deliberately,
 not by default.
+
+Pushing runs `.github/workflows/ci.yml`, which is where the Docker images get built and booted
+for the first time — see [CI](#ci-is-the-first-real-image-build) below. **Wait for it to pass
+before touching Render.** A red CI run tells you what is wrong in two minutes; a failed Render
+deploy takes longer to read.
 
 **Before the first deploy, check the install.** The Docker images have not been built during
 development. The next best thing is to install the package exactly as the images do — normal
@@ -39,7 +53,27 @@ python -m venv /tmp/foci-check
 
 It should report 16 of 16. It catches missing web assets, broken entrypoints, the health check
 and fail-closed auth. It cannot catch OS-level problems in the images themselves (system
-libraries, Chromium, file permissions); if the first Render build fails, look there first.
+libraries, Chromium, file permissions) — that is what CI is for.
+
+### CI is the first real image build
+
+No container runtime was available while this was written, so until the first push the two
+Dockerfiles are unverified. `.github/workflows/ci.yml` closes that gap, and the image jobs are
+the point of it:
+
+| Job | What it proves |
+|---|---|
+| `test` | Lint, 188 tests, and the install smoke on Python 3.12 — the version the images use |
+| `api-image` | The API image builds, boots, serves `/health` and the web UI, and refuses an unauthenticated call |
+| `worker-image` | The worker image builds **and Chromium actually launches as the unprivileged user** |
+
+That last one is the check worth having. `playwright install --with-deps` runs as root and the
+image then drops to uid 10001; if the browser or its libraries are unreadable afterwards, every
+investor-relations page silently goes unread in production while the worker looks healthy.
+
+If CI is red, read it before deploying. Most likely causes, in order: a missing system library
+in the worker image, the web assets not shipping in the wheel (`[tool.setuptools.package-data]`),
+and an extra that does not resolve on Python 3.12.
 
 ---
 
@@ -138,6 +172,11 @@ cron service.
 
 ## Costs and gotchas
 
+- **If Render rejects `type: redis` in the blueprint, change it to `keyvalue`.** Render renamed
+  the product to Key Value and accepts both spellings at the time of writing, but this
+  blueprint has not been applied against a live account — the rest of it cross-checks
+  (every `fromDatabase` and `fromService` reference resolves), but the schema itself is
+  unverified.
 - **The worker needs `standard`.** Chromium OOMs on `starter`. This is the main running cost
   and the reason the browser is in its own service.
 - **Free Postgres expires at 30 days.** The blueprint asks for `basic-256mb`. Losing the
