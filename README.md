@@ -358,17 +358,19 @@ to each document is diffable rather than each needing to change twice first.
 
 ## Session log
 
-`docs/SESSION_LOG.md` is the conversation this was built from — the prompts and the replies, in
-order. Most of the reasoning behind the awkward parts (why EDGAR search is CIK-constrained, why
-`<main>` is not trusted, why delivery stays inert) happened there rather than in commit
-messages. Regenerate with:
+The conversation this was built from — the prompts and the replies, in order. Most of the
+reasoning behind the awkward parts (why EDGAR search is CIK-constrained, why `<main>` is not
+trusted, why delivery stays inert) happened there rather than in commit messages. Generate it
+with:
 
 ```bash
-python tools/export_session_log.py
+python tools/export_session_log.py        # writes docs/SESSION_LOG.md
 ```
 
-Secrets, personal email addresses and home paths are redacted on export; government contact
-addresses are public record and are kept. Read it before publishing anywhere.
+**It is deliberately not committed**, and `.gitignore` keeps it out. The export redacts
+secrets, personal email addresses and home paths, but it keeps government contact addresses,
+and it quotes draft notices naming real contractors. In a public repository that combination is
+a liability rather than a record. Generate it locally, read it, and decide per destination.
 
 ### Deploying to Render
 

@@ -1,7 +1,7 @@
 # foci-screen — complete source
 
-Every source file in one document. Commit `f7d23e9 Ignore handover bundles`.
-50 files, 10,919 lines.
+Every source file in one document. Commit `7e174f8 Merge the uploaded source listing with the project history`.
+50 files, 10,925 lines.
 
 Prose documentation (README, ROADMAP, DEPLOY, the session log) is not included —
 it ships in the zip and the repository.
@@ -52,7 +52,7 @@ it ships in the zip and the repository.
   - [`tests/test_robots.py`](#teststestrobotspy) — 294 lines
   - [`tests/test_scheduler.py`](#teststestschedulerpy) — 115 lines
   - [`tests/test_screening.py`](#teststestscreeningpy) — 714 lines
-  - [`tests/test_search.py`](#teststestsearchpy) — 330 lines
+  - [`tests/test_search.py`](#teststestsearchpy) — 332 lines
   - [`tests/test_service.py`](#teststestservicepy) — 711 lines
 - **Tools**
   - [`tools/check_web_coverage.py`](#toolscheckwebcoveragepy) — 95 lines
@@ -66,7 +66,7 @@ it ships in the zip and the repository.
   - [`.github/workflows/ci.yml`](#githubworkflowsciyml) — 125 lines
   - [`.dockerignore`](#dockerignore) — 21 lines
   - [`.gitattributes`](#gitattributes) — 14 lines
-  - [`.gitignore`](#gitignore) — 23 lines
+  - [`.gitignore`](#gitignore) — 27 lines
   - [`.env.example`](#envexample) — 72 lines
 
 ---
@@ -2886,11 +2886,11 @@ def _all_text(elem, path: str) -> list[str]:
 
 
 def _pretty_name(email: str) -> str:
-    """JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL -> 'Julie Bakewellchisholm'.
+    """JANE.DOEBAKEWELL.N00019@JSF.MIL -> 'Jane Doebakewell'.
 
     DoD appends a disambiguating digit when two people share a name
-    (SANDRA.T.REYES2.CIV@MAIL.MIL). It belongs to the mailbox, not the person,
-    and "Dear Sandra T Reyes2," in a notice to a federal official reads as a
+    (JOHN.Q.ROE2.CIV@MAIL.MIL). It belongs to the mailbox, not the person,
+    and "Dear John Q Roe2," in a notice to a federal official reads as a
     broken tool. Dropped for display; the address itself is untouched.
     """
     local = email.split("@")[0]
@@ -9110,7 +9110,7 @@ class TestFPDSParsing(unittest.TestCase):
           <content><award>
             <transactionInformation>
               <createdBy>CLERK.SMITH.N00019@JSF.MIL</createdBy>
-              <lastModifiedBy>JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL</lastModifiedBy>
+              <lastModifiedBy>JANE.DOEBAKEWELL.N00019@JSF.MIL</lastModifiedBy>
               <approvedBy>KO.WARRANT.N00019@JSF.MIL</approvedBy>
             </transactionInformation>
             <purchaserInformation><contractingOfficeID>N00019</contractingOfficeID></purchaserInformation>
@@ -9128,11 +9128,11 @@ class TestFPDSParsing(unittest.TestCase):
 
         xml = """<entry xmlns="http://www.w3.org/2005/Atom"><content><award>
             <transactionInformation>
-              <lastModifiedBy>JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL</lastModifiedBy>
+              <lastModifiedBy>JANE.DOEBAKEWELL.N00019@JSF.MIL</lastModifiedBy>
             </transactionInformation></award></content></entry>"""
         officer = FPDSConnector(None)._officer_from_entry(ET.fromstring(xml))
         self.assertEqual(officer.confidence, "medium")
-        self.assertEqual(officer.name, "Julie Bakewellchisholm")
+        self.assertEqual(officer.name, "Jane Doebakewell")
 
 
 class TestWebNormalisation(unittest.TestCase):
@@ -9371,11 +9371,13 @@ def populated(store):
 # --------------------------------------------------------- officer names
 
 @pytest.mark.parametrize("email,expected", [
-    ("JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL", "Julie Bakewellchisholm"),
+    # Placeholder names throughout: these formats came from live FPDS records,
+    # and the real officials' addresses have no business in a source tree.
+    ("JANE.DOEBAKEWELL.N00019@JSF.MIL", "Jane Doebakewell"),
     # DoD's disambiguating digit belongs to the mailbox, not the person.
-    ("SANDRA.T.REYES2.CIV@MAIL.MIL", "Sandra T Reyes"),
-    ("LAUREN.H.MARTIN3.CIV@MAIL.MIL", "Lauren H Martin"),
-    ("aubrey.r.callahan.civ@mail.mil", "Aubrey R Callahan"),
+    ("JOHN.Q.ROE2.CIV@MAIL.MIL", "John Q Roe"),
+    ("JANE.R.DOE3.CIV@MAIL.MIL", "Jane R Doe"),
+    ("alex.p.roe.civ@mail.mil", "Alex P Roe"),
 ])
 def test_officer_display_name_is_readable(email, expected):
     from foci_screen.connectors.fpds import _pretty_name
@@ -11355,6 +11357,10 @@ build/
 # Release archives and handover bundles are build output, not source.
 foci-screen-v*.zip
 *.bundle
+# The build conversation. Regenerate with tools/export_session_log.py when you
+# want it; it carries federal contact addresses and draft notices naming real
+# contractors, which do not belong in a public repository.
+docs/SESSION_LOG.md
 ```
 
 

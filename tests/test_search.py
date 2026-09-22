@@ -53,11 +53,13 @@ def populated(store):
 # --------------------------------------------------------- officer names
 
 @pytest.mark.parametrize("email,expected", [
-    ("JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL", "Julie Bakewellchisholm"),
+    # Placeholder names throughout: these formats came from live FPDS records,
+    # and the real officials' addresses have no business in a source tree.
+    ("JANE.DOEBAKEWELL.N00019@JSF.MIL", "Jane Doebakewell"),
     # DoD's disambiguating digit belongs to the mailbox, not the person.
-    ("SANDRA.T.REYES2.CIV@MAIL.MIL", "Sandra T Reyes"),
-    ("LAUREN.H.MARTIN3.CIV@MAIL.MIL", "Lauren H Martin"),
-    ("aubrey.r.callahan.civ@mail.mil", "Aubrey R Callahan"),
+    ("JOHN.Q.ROE2.CIV@MAIL.MIL", "John Q Roe"),
+    ("JANE.R.DOE3.CIV@MAIL.MIL", "Jane R Doe"),
+    ("alex.p.roe.civ@mail.mil", "Alex P Roe"),
 ])
 def test_officer_display_name_is_readable(email, expected):
     from foci_screen.connectors.fpds import _pretty_name

@@ -514,7 +514,7 @@ class TestFPDSParsing(unittest.TestCase):
           <content><award>
             <transactionInformation>
               <createdBy>CLERK.SMITH.N00019@JSF.MIL</createdBy>
-              <lastModifiedBy>JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL</lastModifiedBy>
+              <lastModifiedBy>JANE.DOEBAKEWELL.N00019@JSF.MIL</lastModifiedBy>
               <approvedBy>KO.WARRANT.N00019@JSF.MIL</approvedBy>
             </transactionInformation>
             <purchaserInformation><contractingOfficeID>N00019</contractingOfficeID></purchaserInformation>
@@ -532,11 +532,11 @@ class TestFPDSParsing(unittest.TestCase):
 
         xml = """<entry xmlns="http://www.w3.org/2005/Atom"><content><award>
             <transactionInformation>
-              <lastModifiedBy>JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL</lastModifiedBy>
+              <lastModifiedBy>JANE.DOEBAKEWELL.N00019@JSF.MIL</lastModifiedBy>
             </transactionInformation></award></content></entry>"""
         officer = FPDSConnector(None)._officer_from_entry(ET.fromstring(xml))
         self.assertEqual(officer.confidence, "medium")
-        self.assertEqual(officer.name, "Julie Bakewellchisholm")
+        self.assertEqual(officer.name, "Jane Doebakewell")
 
 
 class TestWebNormalisation(unittest.TestCase):

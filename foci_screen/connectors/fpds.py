@@ -50,11 +50,11 @@ def _all_text(elem, path: str) -> list[str]:
 
 
 def _pretty_name(email: str) -> str:
-    """JULIE.BAKEWELLCHISHOLM.N00019@JSF.MIL -> 'Julie Bakewellchisholm'.
+    """JANE.DOEBAKEWELL.N00019@JSF.MIL -> 'Jane Doebakewell'.
 
     DoD appends a disambiguating digit when two people share a name
-    (SANDRA.T.REYES2.CIV@MAIL.MIL). It belongs to the mailbox, not the person,
-    and "Dear Sandra T Reyes2," in a notice to a federal official reads as a
+    (JOHN.Q.ROE2.CIV@MAIL.MIL). It belongs to the mailbox, not the person,
+    and "Dear John Q Roe2," in a notice to a federal official reads as a
     broken tool. Dropped for display; the address itself is untouched.
     """
     local = email.split("@")[0]
