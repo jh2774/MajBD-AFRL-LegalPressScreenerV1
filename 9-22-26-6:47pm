@@ -1,0 +1,4 @@
+git clone --branch main foci-screen-ready.bundle foci-screen
+cd foci-screen
+git remote set-url origin https://github.com/jh2774/MajBD-AFRL-LegalPressScreenerV1.git
+git push origin main
