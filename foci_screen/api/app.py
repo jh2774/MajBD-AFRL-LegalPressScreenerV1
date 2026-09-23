@@ -26,7 +26,13 @@ from ..jobs import JobQueue
 from ..notify import render as render_notice
 from ..store import Store, annotate_diff
 from . import auth
-from .schemas import NoticeDecision, ScreenRequest, SignalDisposition, WatchlistRequest
+from .schemas import (
+    IdentityDecision,
+    NoticeDecision,
+    ScreenRequest,
+    SignalDisposition,
+    WatchlistRequest,
+)
 
 log = logging.getLogger("foci.api")
 
@@ -299,6 +305,46 @@ def agency_profile(name: str, store: Store = Depends(tenant_store)) -> dict:
         "officers": [o for o in store.search_officers("", limit=200)
                      if o.get("agency") == name],
     }
+
+
+# --------------------------------------------------------------- identity
+
+@app.get("/v1/identity", tags=["identity"])
+def list_identities(status: str = Query("", pattern="^(|auto|confirmed|rejected)$"),
+                    limit: int = Query(200, ge=1, le=500),
+                    store: Store = Depends(tenant_store)) -> dict:
+    """Resolved identities, least confident first — the review queue."""
+    return {"links": store.entity_links(status=status, limit=limit)}
+
+
+@app.get("/v1/entities/{entity_key}/identity", tags=["identity"])
+def get_identity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
+    link = store.get_entity_link(entity_key)
+    if link is None:
+        raise HTTPException(404, "No identity resolution recorded for that entity.")
+    return link
+
+
+@app.post("/v1/entities/{entity_key}/identity", tags=["identity"])
+def set_identity(entity_key: str, body: IdentityDecision,
+                 tenant: str = Depends(require_tenant)) -> dict:
+    """Confirm, correct or reject which SEC registrant a contractor is.
+
+    This is the highest-leverage correction in the tool. EDGAR full-text search
+    is constrained by CIK, so a wrong mapping does not return nothing — it
+    returns another registrant's exhibits under this contractor's name. A
+    decision here is remembered and outranks the name matcher permanently.
+    """
+    store = store_for(tenant)
+    known_cik = (store.get_entity_link(entity_key) or {}).get("cik")
+    if body.status == "confirmed" and not (body.cik or known_cik):
+        raise HTTPException(
+            422, "Confirming an identity needs a CIK — either already resolved for "
+                 "this entity or supplied here.")
+    return store.set_entity_link(
+        entity_key, status=body.status, cik=body.cik, note=body.note,
+        matched_title=body.matched_title,
+        decided_by=body.decided_by.strip() or f"api-key:{tenant}")
 
 
 # ------------------------------------------------------------ dispositions

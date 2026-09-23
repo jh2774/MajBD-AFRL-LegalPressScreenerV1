@@ -480,14 +480,16 @@ async function viewSearch(q, kind) {
 
 async function viewEntity(key) {
   setBusy("Loading contractor…");
-  const [d, docs, verdicts] = await Promise.all([
+  const [d, docs, verdicts, identity] = await Promise.all([
     api(`/v1/entities/${encodeURIComponent(key)}`),
     api(`/v1/documents?entity_key=${encodeURIComponent(key)}`).catch(() => ({ documents: [] })),
     api(`/v1/entities/${encodeURIComponent(key)}/dispositions`)
       .catch(() => ({ dispositions: {} })),
+    api(`/v1/entities/${encodeURIComponent(key)}/identity`).catch(() => null),
   ]);
   d.documents = docs.documents || [];
   d.dispositions = verdicts.dispositions || {};
+  d.identity = identity;
   const e = d.entity || {};
   const f = d.latest_finding;
 
@@ -520,6 +522,8 @@ async function viewEntity(key) {
       ${e.parent_name ? `<span class="pill">parent: ${esc(e.parent_name)}</span>` : ""}
     </div>` : ""}
 
+    ${identityCard(d.identity, key)}
+
     ${f ? `<div class="card"><h2>Signals</h2>
       <div class="muted" style="font-size:12px;margin-bottom:10px">
         Marking these is what makes rule weights measurable rather than assumed —
@@ -547,6 +551,103 @@ async function viewEntity(key) {
     </div>`;
 
   wireVerdicts(view, key, f ? f.run_id : "");
+  wireIdentity(view, key);
+}
+
+/* Which SEC registrant this contractor is. Shown prominently because EDGAR
+ * full-text search is constrained by CIK: a wrong mapping does not come back
+ * empty, it comes back with another company's filings attached to this name. */
+function identityCard(link, key) {
+  if (!link) {
+    return `<div class="card"><h3>SEC identity</h3>
+      <div class="muted">Not resolved yet — screen this contractor to attempt a match.</div>
+    </div>`;
+  }
+  const pct = link.confidence ? Math.round(link.confidence * 100) : null;
+  const state = {
+    confirmed: '<span class="pill warn">confirmed by a reviewer</span>',
+    rejected: '<span class="pill warn">rejected — filings are not attributed</span>',
+    auto: '<span class="pill">matched by name similarity, unreviewed</span>',
+  }[link.status] || "";
+
+  return `<div class="card" id="identity">
+    <h3>SEC identity</h3>
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      ${link.cik
+        ? `<strong class="mono">CIK ${esc(link.cik)}</strong>
+           <span>${esc(link.matched_title || "")}</span>`
+        : "<strong>No registrant attributed</strong>"}
+      ${state}
+      ${pct !== null && link.status === "auto"
+        ? `<span class="muted">name match ${pct}%</span>` : ""}
+    </div>
+    ${link.note ? `<div class="muted" style="margin-top:6px">${esc(link.note)}</div>` : ""}
+    ${link.decided_by ? `<div class="muted" style="font-size:12px;margin-top:4px">
+      decided by ${esc(link.decided_by)}</div>` : ""}
+    <div class="muted" style="font-size:12px;margin-top:10px">
+      Getting this wrong attributes another company's SEC filings to this one. A
+      decision here is remembered and overrides the matcher on every later run.</div>
+    <div class="actions" id="identity-actions">
+      ${link.status !== "confirmed" && link.cik
+        ? '<button class="primary id-btn" data-status="confirmed">Correct registrant</button>'
+        : ""}
+      ${link.status !== "rejected"
+        ? '<button class="id-btn" data-status="rejected">Not this company</button>'
+        : ""}
+      <button class="ghost id-btn" data-status="override">Set a different CIK</button>
+    </div>
+    <div class="decide-panel" id="identity-panel" hidden>
+      <label class="decide-prompt" for="cik-${esc(key)}">
+        Ten-digit CIK, as EDGAR writes it (zero-padded).</label>
+      <input id="cik-${esc(key)}" class="decide-note" inputmode="numeric"
+             placeholder="0000936468">
+      <label class="decide-prompt" style="margin-top:8px">Why? (recorded)</label>
+      <textarea class="decide-note id-note" rows="2"></textarea>
+      <div class="panel-error error" hidden></div>
+      <div class="actions">
+        <button class="primary id-save">Save</button>
+        <button class="ghost id-cancel">Cancel</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function wireIdentity(root, key) {
+  const panel = root.querySelector("#identity-panel");
+  if (!panel) return;
+  const errorBox = panel.querySelector(".panel-error");
+  const cikBox = panel.querySelector("input");
+  const noteBox = panel.querySelector(".id-note");
+
+  const send = async (status, cik) => {
+    errorBox.hidden = true;
+    const payload = { status, note: noteBox ? noteBox.value : "" };
+    if (cik) payload.cik = cik;
+    try {
+      await apiPost(`/v1/entities/${encodeURIComponent(key)}/identity`, payload);
+      route();
+    } catch (e) {
+      errorBox.innerHTML = `<strong>${esc(e.title)}</strong>
+        <div class="muted" style="margin-top:4px">${esc(e.message)}</div>`;
+      errorBox.hidden = false;
+      panel.hidden = false;
+    }
+  };
+
+  root.querySelectorAll(".id-btn").forEach((btn) => {
+    btn.onclick = () => {
+      if (btn.dataset.status === "override") {
+        panel.hidden = false;
+        cikBox.focus();
+        return;
+      }
+      send(btn.dataset.status, null);
+    };
+  });
+  const save = panel.querySelector(".id-save");
+  if (save) save.onclick = () => send("confirmed", cikBox.value.trim());
+  const cancel = panel.querySelector(".id-cancel");
+  if (cancel) cancel.onclick = () => { panel.hidden = true; };
 }
 
 async function viewRules() {

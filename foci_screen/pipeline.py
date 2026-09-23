@@ -244,7 +244,8 @@ class Screener:
     def _build_entity(self, name: str, contracts: list[Contract],
                       opts: ScreenOptions) -> Entity:
         first = contracts[0]
-        cik, matched = self.edgar.resolve_cik(first.parent_recipient_name or name)
+        entity_key = (first.recipient_uei or name).upper().strip()
+        cik, matched = self._resolve_identity(entity_key, name, first)
         domain = opts.domains.get(name) or opts.domains.get(name.upper(), "")
         countries = sorted({c.recipient_country for c in contracts if c.recipient_country}
                            | {c.country_of_incorporation for c in contracts
@@ -257,6 +258,33 @@ class Screener:
             domains=[domain] if domain else [],
             countries=countries,
             contracts=[c.piid or c.award_id for c in contracts])
+
+    def _resolve_identity(self, entity_key: str, name: str,
+                          first: Contract) -> tuple[str, str]:
+        """Which SEC registrant this contractor is, preferring a human answer.
+
+        A wrong CIK is the failure this project has already made once: EDGAR
+        full-text search is constrained by CIK, so a bad mapping does not
+        return nothing, it returns another company's exhibits under this
+        company's name. Name similarity alone is rerun every screen and can
+        land differently as the ticker file changes, so the answer is stored
+        and a reviewer's verdict outranks it.
+        """
+        link = self.store.get_entity_link(entity_key)
+        if link and link["status"] == "confirmed":
+            return link["cik"] or "", link["matched_title"] or ""
+        if link and link["status"] == "rejected":
+            # Someone looked and said this contractor is not that registrant.
+            # Re-deciding it by similarity would reintroduce the misattribution
+            # they just removed.
+            return "", ""
+
+        cik, matched, score = self.edgar.resolve_cik_scored(
+            first.parent_recipient_name or name)
+        self.store.record_auto_link(
+            entity_key, entity_name=name, uei=first.recipient_uei, cik=cik,
+            matched_title=matched, confidence=score)
+        return cik, matched if cik else ""
 
     # ------------------------------------------------------------ evidence
     def _gather(self, entity: Entity, opts: ScreenOptions,

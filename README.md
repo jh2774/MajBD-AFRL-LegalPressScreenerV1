@@ -384,6 +384,35 @@ revision that existed is still *known* to have existed after its text is gone, a
 Upgrading an existing database backfills bodies from the current snapshots, so the next change
 to each document is diffable rather than each needing to change twice first.
 
+## Who this contractor is
+
+Name matching between USAspending, SEC, IAPD and USPTO is the weakest link in the chain, and
+the CIK is the one that bites: EDGAR full-text search is *constrained* by CIK, so a wrong
+mapping does not come back empty — it comes back with another registrant's exhibits attached to
+this contractor's name. That is the first bug this project ever had.
+
+Resolutions are now stored rather than recomputed, because a similarity score rerun each week
+against a changing ticker file can land somewhere new without anyone noticing:
+
+| | |
+|---|---|
+| `GET /v1/identity?status=auto` | The review queue, least confident first |
+| `GET /v1/entities/{key}/identity` | What this contractor was resolved to, and how confidently |
+| `POST /v1/entities/{key}/identity` | Confirm, correct, or reject it |
+
+A human verdict outranks the matcher **permanently, in both directions**:
+
+- **Confirmed** is never re-resolved. The matcher does not get a second opinion after a person
+  has decided, and no lookup is even attempted.
+- **Rejected** means no registrant has been identified — not merely "unreviewed". Re-deciding it
+  by similarity on the next run would reintroduce exactly the misattribution the reviewer had
+  just removed, so the screen stops attributing filings to that contractor until someone says
+  otherwise.
+
+Unreviewed mappings do keep tracking the matcher, so improving the matcher still helps
+everything nobody has looked at yet. The entity page shows the CIK, the matched registrant
+title, the match percentage, and who decided.
+
 ## Measuring the rules
 
 Every weight in `risk/engine.py` — `IP_COLLATERAL` at 7.0, the China multiplier at 3.0, the

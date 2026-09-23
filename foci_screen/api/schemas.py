@@ -43,6 +43,20 @@ class NoticeDecision(BaseModel):
     decided_by: str = ""
 
 
+class IdentityDecision(BaseModel):
+    """A human verdict on which SEC registrant a contractor is.
+
+    `rejected` means no registrant has been identified, and the screen stops
+    attributing filings to this contractor — not merely "unconfirmed".
+    """
+    status: Literal["auto", "confirmed", "rejected"]
+    # 10 digits, zero-padded, as EDGAR returns them.
+    cik: str | None = Field(None, pattern=r"^\d{10}$")
+    matched_title: str = ""
+    note: str = ""
+    decided_by: str = ""
+
+
 class SignalDisposition(BaseModel):
     """A reviewer's verdict on one signal — the tool's only labelled data."""
     signal_id: str = Field(..., min_length=4, max_length=64)

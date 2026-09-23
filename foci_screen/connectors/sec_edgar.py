@@ -82,12 +82,23 @@ class EdgarConnector:
     def resolve_cik(self, company_name: str) -> tuple[str, str]:
         """Best-effort name -> (CIK10, matched title). Conservative on purpose:
         a wrong CIK produces confident nonsense."""
+        cik, title, _score = self.resolve_cik_scored(company_name)
+        return cik, title
+
+    def resolve_cik_scored(self, company_name: str) -> tuple[str, str, float]:
+        """As `resolve_cik`, but also returns the similarity behind the match.
+
+        The score is worth keeping: it is the difference between "this is
+        certainly the registrant" and "this was the closest of several near
+        misses", and a reviewer deciding whether to confirm a mapping needs to
+        see which one they are looking at.
+        """
         data = self._load_tickers()
         if not data:
-            return "", ""
+            return "", "", 0.0
         target = _normalise(company_name)
         if not target:
-            return "", ""
+            return "", "", 0.0
         best: tuple[float, str, str] = (0.0, "", "")
         for row in data.values():
             title = row.get("title") or ""
@@ -95,8 +106,10 @@ class EdgarConnector:
             if score > best[0]:
                 best = (score, str(row.get("cik_str") or "").zfill(10), title)
         if best[0] >= 0.86:
-            return best[1], best[2]
-        return "", ""
+            return best[1], best[2], round(best[0], 4)
+        # Returned even when rejected, so the review queue can show how close
+        # the nearest registrant was rather than only that nothing matched.
+        return "", best[2], round(best[0], 4)
 
     # -------------------------------------------------------------- filings
     def recent_filings(self, cik: str, limit: int = 25) -> list[Document]:

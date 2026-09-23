@@ -180,6 +180,27 @@ CREATE TABLE IF NOT EXISTS dispositions (
     run_id      TEXT,
     PRIMARY KEY (tenant_id, signal_id, entity_key)
 );
+-- Which SEC registrant (and eventually which CAGE, which CRD) a contractor is.
+-- Name matching across USAspending, SEC, IAPD and USPTO is the weakest link in
+-- the chain, and a wrong CIK does not fail loudly: it attributes another
+-- company's filings with full confidence. Resolutions are therefore remembered
+-- rather than recomputed each run, and a human verdict outranks the matcher
+-- permanently in both directions.
+CREATE TABLE IF NOT EXISTS entity_links (
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    entity_key    TEXT NOT NULL,
+    entity_name   TEXT,
+    uei           TEXT,
+    cik           TEXT,
+    matched_title TEXT,
+    confidence    REAL,
+    status        TEXT NOT NULL DEFAULT 'auto',   -- auto | confirmed | rejected
+    source        TEXT,
+    note          TEXT,
+    decided_by    TEXT,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, entity_key)
+);
 CREATE TABLE IF NOT EXISTS watchlists (
     watchlist_id TEXT PRIMARY KEY,
     tenant_id    TEXT NOT NULL DEFAULT 'default',
@@ -802,6 +823,82 @@ class Store:
         # Worst first: the point of the page is finding rules to retire.
         return sorted(out, key=lambda e: (e["precision"] if e["precision"] is not None
                                           else 2, -e["reviewed"]))
+
+    # --------------------------------------------------------- entity identity
+    LINK_STATUSES = ("auto", "confirmed", "rejected")
+
+    def get_entity_link(self, entity_key: str) -> dict | None:
+        return self._one("SELECT * FROM entity_links WHERE tenant_id=? AND entity_key=?",
+                         (self.tenant_id, entity_key.upper()))
+
+    def record_auto_link(self, entity_key: str, *, entity_name: str = "", uei: str = "",
+                         cik: str = "", matched_title: str = "",
+                         confidence: float = 0.0) -> None:
+        """Remember what the name matcher concluded.
+
+        Never overwrites a human decision. A reviewer who has confirmed or
+        rejected a mapping has supplied better information than a similarity
+        score, and a later run finding a different name match must not quietly
+        undo that.
+        """
+        existing = self.get_entity_link(entity_key)
+        if existing and existing["status"] in ("confirmed", "rejected"):
+            return
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO entity_links (tenant_id, entity_key, entity_name, uei,"
+                " cik, matched_title, confidence, status, source, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT (tenant_id, entity_key) DO UPDATE SET"
+                " entity_name=excluded.entity_name, uei=excluded.uei,"
+                " cik=excluded.cik, matched_title=excluded.matched_title,"
+                " confidence=excluded.confidence, updated_at=excluded.updated_at",
+                (self.tenant_id, entity_key.upper(), entity_name, uei, cik,
+                 matched_title, float(confidence or 0.0), "auto",
+                 "edgar_name_match", _now()))
+
+    def set_entity_link(self, entity_key: str, *, status: str, cik: str | None = None,
+                        note: str = "", decided_by: str = "",
+                        matched_title: str = "") -> dict:
+        """Record a human decision about who this contractor is.
+
+        `rejected` is not merely "unconfirmed": it means no SEC registrant has
+        been identified, and the screen must stop attributing filings to this
+        contractor until someone says otherwise.
+        """
+        if status not in self.LINK_STATUSES:
+            raise ValueError(f"status must be one of {self.LINK_STATUSES}, got {status!r}")
+
+        existing = self.get_entity_link(entity_key) or {}
+        new_cik = "" if status == "rejected" else (
+            cik if cik is not None else existing.get("cik") or "")
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO entity_links (tenant_id, entity_key, entity_name, uei,"
+                " cik, matched_title, confidence, status, source, note, decided_by,"
+                " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT (tenant_id, entity_key) DO UPDATE SET"
+                " cik=excluded.cik, status=excluded.status, note=excluded.note,"
+                " matched_title=excluded.matched_title,"
+                " decided_by=excluded.decided_by, source=excluded.source,"
+                " updated_at=excluded.updated_at",
+                (self.tenant_id, entity_key.upper(), existing.get("entity_name", ""),
+                 existing.get("uei", ""), new_cik,
+                 matched_title or existing.get("matched_title", ""),
+                 existing.get("confidence") or 0.0, status, "manual", note,
+                 decided_by, _now()))
+        return self.get_entity_link(entity_key)
+
+    def entity_links(self, status: str = "", limit: int = 200) -> list[dict]:
+        """Resolutions, least confident first — that is the review queue."""
+        if status:
+            return self._query(
+                "SELECT * FROM entity_links WHERE tenant_id=? AND status=?"
+                " ORDER BY confidence ASC, entity_name LIMIT ?",
+                (self.tenant_id, status, limit))
+        return self._query(
+            "SELECT * FROM entity_links WHERE tenant_id=?"
+            " ORDER BY status, confidence ASC LIMIT ?", (self.tenant_id, limit))
 
     # ------------------------------------------------------------ watchlists
     def create_watchlist(self, name: str, params: dict) -> str:

@@ -180,9 +180,15 @@ Ordered by how much they limit the tool today.
    Also open: **distinguishing sole proprietors properly.** The individual test is a name
    heuristic. SAM.gov's entity registration states whether a registrant is a sole proprietor,
    which is authoritative; that needs `SAM_API_KEY` (item 2).
-6. **Entity resolution.** Name matching between USAspending, SEC, IAPD and USPTO is the weakest
-   link in the chain. Build a UEI / CIK / CAGE / CRD crosswalk table, seeded from SAM and
-   corrected by hand. Precision here lifts every rule at once.
+6. ~~**Entity resolution.**~~ **Done for UEI → CIK**, which is the mapping that bites: EDGAR
+   full-text search is constrained by CIK, so a wrong answer returns another registrant's
+   exhibits rather than nothing. `entity_links` stores the resolution with its confidence, and
+   a reviewer can confirm, correct or reject it; both verdicts outrank the matcher permanently,
+   and rejection actively stops attribution rather than merely leaving it unreviewed.
+
+   Still open: **CAGE and CRD**. IAPD adviser matching is still by name each run, and there is
+   no CAGE crosswalk at all. Both want SAM.gov (item 2) as the authoritative seed rather than
+   another similarity score.
 7. ~~**Feedback loop.**~~ **Done.** Verdicts are recorded per signal (`POST /v1/dispositions`),
    keyed on a hash of rule plus evidence so rewording a rule does not orphan them, and
    `GET /v1/rules/precision` reports precision per rule, worst first. The UI collects them
