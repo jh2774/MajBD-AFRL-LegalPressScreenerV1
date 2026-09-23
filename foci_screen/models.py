@@ -13,6 +13,19 @@ from typing import Any
 SEVERITY_ORDER = ["info", "low", "medium", "high", "critical"]
 
 
+def signal_key(rule_id: str, evidence: str) -> str:
+    """Stable identity for one rule firing on one piece of text.
+
+    The rule alone is too coarse — a rule fires many times — and the finding is
+    too broad, since a reviewer's verdict is usually about one specific claim
+    inside it. Keyed on the evidence rather than the rendered rationale so
+    wording changes to a rule do not orphan the verdicts already recorded
+    against it.
+    """
+    raw = f"{rule_id}|{' '.join((evidence or '').split())[:200]}"
+    return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0, tzinfo=None).isoformat() + "Z"
 
@@ -194,6 +207,14 @@ class Signal(Serialisable):
 
     def severity_rank(self) -> int:
         return SEVERITY_ORDER.index(self.severity) if self.severity in SEVERITY_ORDER else 0
+
+    def key(self) -> str:
+        return signal_key(self.rule_id, self.evidence)
+
+    def to_dict(self) -> dict:
+        # Carried in the payload so a reviewer's verdict can be attached to this
+        # exact signal rather than to the finding as a whole.
+        return {**super().to_dict(), "signal_id": self.key()}
 
 
 @dataclass

@@ -317,6 +317,20 @@ td.num + td, th.num + th { padding-left: 18px; }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 
+/* Verdict controls sit under a signal's evidence, where the reviewer is
+   already looking, rather than on a separate screen. */
+.verdict {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 10px;
+  padding-top: 9px;
+  border-top: 1px dashed var(--border);
+}
+.verdict-btn { padding: 3px 10px; font-size: 12px; }
+.verdict-btn:disabled { opacity: 0.5; cursor: default; }
+
 .decide-panel {
   margin-top: 14px;
   padding-top: 14px;

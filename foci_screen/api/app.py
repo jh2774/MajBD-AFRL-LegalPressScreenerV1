@@ -26,7 +26,7 @@ from ..jobs import JobQueue
 from ..notify import render as render_notice
 from ..store import Store, annotate_diff
 from . import auth
-from .schemas import NoticeDecision, ScreenRequest, WatchlistRequest
+from .schemas import NoticeDecision, ScreenRequest, SignalDisposition, WatchlistRequest
 
 log = logging.getLogger("foci.api")
 
@@ -299,6 +299,55 @@ def agency_profile(name: str, store: Store = Depends(tenant_store)) -> dict:
         "officers": [o for o in store.search_officers("", limit=200)
                      if o.get("agency") == name],
     }
+
+
+# ------------------------------------------------------------ dispositions
+
+@app.post("/v1/dispositions", tags=["dispositions"], status_code=201)
+def record_disposition(body: SignalDisposition,
+                       tenant: str = Depends(require_tenant)) -> dict:
+    """Record whether a signal was right.
+
+    Rule weights were set by judgement and have never been measured against
+    anything. This is the measurement: every verdict here is one labelled
+    example, and `GET /v1/rules/precision` is what they add up to.
+    """
+    store = store_for(tenant)
+    store.record_disposition(
+        signal_id=body.signal_id, entity_key=body.entity_key, rule_id=body.rule_id,
+        verdict=body.verdict, category=body.category, severity=body.severity,
+        note=body.note, decided_by=body.decided_by.strip() or f"api-key:{tenant}",
+        run_id=body.run_id)
+    return {"signal_id": body.signal_id, "verdict": body.verdict}
+
+
+@app.get("/v1/rules/precision", tags=["dispositions"])
+def rule_precision(store: Store = Depends(tenant_store)) -> dict:
+    """Per-rule precision from reviewer verdicts, worst first.
+
+    A rule with no verdicts has `precision: null` — unmeasured, which is not
+    the same as perfect, and the UI says so rather than showing a hopeful 100%.
+    """
+    rules = store.rule_precision()
+    judged = sum(r["true_positive"] + r["false_positive"] for r in rules)
+    return {
+        "rules": rules,
+        "totals": {
+            "rules_with_verdicts": len(rules),
+            "verdicts": sum(r["reviewed"] for r in rules),
+            "judged": judged,
+            "overall_precision": (
+                round(sum(r["true_positive"] for r in rules) / judged, 3)
+                if judged else None),
+        },
+    }
+
+
+@app.get("/v1/entities/{entity_key}/dispositions", tags=["dispositions"])
+def entity_dispositions(entity_key: str,
+                        store: Store = Depends(tenant_store)) -> dict:
+    return {"entity_key": entity_key.upper(),
+            "dispositions": store.dispositions_for_entity(entity_key)}
 
 
 # -------------------------------------------------------------- documents

@@ -183,9 +183,22 @@ Ordered by how much they limit the tool today.
 6. **Entity resolution.** Name matching between USAspending, SEC, IAPD and USPTO is the weakest
    link in the chain. Build a UEI / CIK / CAGE / CRD crosswalk table, seeded from SAM and
    corrected by hand. Precision here lifts every rule at once.
-7. **Feedback loop.** Persist analyst dispositions on each signal (true/false positive). Without
-   it, weight tuning is guesswork; with it, you can measure precision per rule and retire rules
-   that do not earn their place.
+7. ~~**Feedback loop.**~~ **Done.** Verdicts are recorded per signal (`POST /v1/dispositions`),
+   keyed on a hash of rule plus evidence so rewording a rule does not orphan them, and
+   `GET /v1/rules/precision` reports precision per rule, worst first. The UI collects them
+   under each signal, where the reviewer is already reading the evidence.
+
+   What this now unblocks, and could not be attempted before:
+
+   - **Retiring rules.** A rule at 0% precision over a meaningful sample is not a rule, it is
+     noise with a weight attached. The page sorts worst-first for exactly this.
+   - **Tuning weights against evidence** rather than judgement. Every number in
+     `risk/engine.py` is currently an assumption.
+   - **Risk-ordered screening** (item 5 remainder): ordering the population by predicted risk
+     needs a target variable, and this is it.
+
+   Needed before any of that is statistically meaningful: enough verdicts. A handful tells you
+   nothing, and the page says "not measured" rather than implying otherwise.
 
 ---
 

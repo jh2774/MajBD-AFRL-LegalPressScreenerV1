@@ -6,6 +6,8 @@ two definitions of the same thing that drift apart.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -39,3 +41,16 @@ class NoticeDecision(BaseModel):
     note: str = ""
     body_text: str = ""
     decided_by: str = ""
+
+
+class SignalDisposition(BaseModel):
+    """A reviewer's verdict on one signal — the tool's only labelled data."""
+    signal_id: str = Field(..., min_length=4, max_length=64)
+    entity_key: str = Field(..., min_length=1, max_length=128)
+    rule_id: str = Field(..., min_length=1, max_length=64)
+    verdict: Literal["true_positive", "false_positive", "unclear"]
+    category: str = ""
+    severity: str = ""
+    note: str = ""
+    decided_by: str = ""
+    run_id: str = ""

@@ -384,6 +384,38 @@ revision that existed is still *known* to have existed after its text is gone, a
 Upgrading an existing database backfills bodies from the current snapshots, so the next change
 to each document is diffable rather than each needing to change twice first.
 
+## Measuring the rules
+
+Every weight in `risk/engine.py` — `IP_COLLATERAL` at 7.0, the China multiplier at 3.0, the
+×0.35 damping for periodic reports — was set by judgement. None of it has ever been checked
+against an outcome.
+
+The web UI puts three buttons under each signal, where the reviewer is already reading the
+evidence: **confirmed**, **false positive**, **unclear**. Each verdict is one labelled example,
+and `#/rules` is what they add up to:
+
+| | |
+|---|---|
+| `POST /v1/dispositions` | Record a verdict on one signal |
+| `GET /v1/rules/precision` | Per-rule precision, worst first |
+| `GET /v1/entities/{key}/dispositions` | Verdicts recorded against one contractor |
+
+Three decisions in how this counts, each of which could have gone the flattering way:
+
+- **"Unclear" is kept out of the denominator.** A reviewer who could not tell has not said the
+  rule was wrong, and folding that in would punish rules that raise genuinely hard questions.
+- **A rule with no verdicts reads "not measured", never 100%.** Unmeasured is not perfect.
+- **Verdicts are revisable.** A notice decision is final because it is an action; a verdict is
+  a judgement, and a reviewer who looks again and changes their mind is producing better data,
+  not a second data point.
+
+A signal is identified by a hash of its rule and its evidence, not by the rendered wording, so
+rewording a rule's rationale does not orphan the verdicts already recorded against it. Findings
+written before this existed get an id computed on read, so old findings can still be marked.
+
+This is the input that the two open ranking problems need: retiring rules that do not earn
+their place, and ordering contractors by risk rather than by obligated dollars.
+
 ## Session log
 
 The conversation this was built from — the prompts and the replies, in order. Most of the

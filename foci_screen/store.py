@@ -28,7 +28,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import Change, Document, Finding
+from .models import Change, Document, Finding, signal_key
 
 log = logging.getLogger("foci.store")
 
@@ -163,6 +163,23 @@ CREATE TABLE IF NOT EXISTS contracts (
     updated_at    TEXT NOT NULL,
     UNIQUE (tenant_id, contract_key)
 );
+-- One reviewer's verdict on one signal. The only labelled data the tool ever
+-- gets: without it, "is this rule earning its place?" is unanswerable and
+-- weight tuning is guesswork.
+CREATE TABLE IF NOT EXISTS dispositions (
+    tenant_id   TEXT NOT NULL DEFAULT 'default',
+    signal_id   TEXT NOT NULL,
+    entity_key  TEXT NOT NULL,
+    rule_id     TEXT NOT NULL,
+    category    TEXT,
+    severity    TEXT,
+    verdict     TEXT NOT NULL,
+    note        TEXT,
+    decided_by  TEXT,
+    decided_at  TEXT NOT NULL,
+    run_id      TEXT,
+    PRIMARY KEY (tenant_id, signal_id, entity_key)
+);
 CREATE TABLE IF NOT EXISTS watchlists (
     watchlist_id TEXT PRIMARY KEY,
     tenant_id    TEXT NOT NULL DEFAULT 'default',
@@ -186,6 +203,8 @@ CREATE INDEX IF NOT EXISTS idx_contracts_entity ON contracts(tenant_id, entity_k
 CREATE INDEX IF NOT EXISTS idx_contracts_ko ON contracts(tenant_id, ko_email);
 CREATE INDEX IF NOT EXISTS idx_contracts_agency ON contracts(tenant_id, agency);
 CREATE INDEX IF NOT EXISTS idx_entdocs ON entity_documents(tenant_id, entity_key);
+CREATE INDEX IF NOT EXISTS idx_disp_rule ON dispositions(tenant_id, rule_id);
+CREATE INDEX IF NOT EXISTS idx_disp_entity ON dispositions(tenant_id, entity_key);
 """
 
 # Columns added after the first single-user release. `CREATE TABLE IF NOT
@@ -719,6 +738,71 @@ class Store:
         lines, added, removed = _unified(original, notice.get("body_text") or "")
         return {"lines": lines, "stats": {"added": added, "removed": removed}}
 
+    # ---------------------------------------------------------- dispositions
+    VERDICTS = ("true_positive", "false_positive", "unclear")
+
+    def record_disposition(self, *, signal_id: str, entity_key: str, rule_id: str,
+                           verdict: str, category: str = "", severity: str = "",
+                           note: str = "", decided_by: str = "", run_id: str = "") -> None:
+        """Record what a reviewer concluded about one signal.
+
+        Re-deciding replaces the previous verdict: a reviewer who looks again
+        and changes their mind is producing better data, not a second data
+        point. Notice decisions are final because they are actions; these are
+        judgements, and judgements can be revised.
+        """
+        if verdict not in self.VERDICTS:
+            raise ValueError(f"verdict must be one of {self.VERDICTS}, got {verdict!r}")
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO dispositions (tenant_id, signal_id, entity_key, rule_id,"
+                " category, severity, verdict, note, decided_by, decided_at, run_id)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT (tenant_id, signal_id, entity_key) DO UPDATE SET"
+                " verdict=excluded.verdict, note=excluded.note,"
+                " decided_by=excluded.decided_by, decided_at=excluded.decided_at",
+                (self.tenant_id, signal_id, entity_key.upper(), rule_id, category,
+                 severity, verdict, note, decided_by, _now(), run_id))
+
+    def dispositions_for_entity(self, entity_key: str) -> dict[str, dict]:
+        rows = self._query("SELECT * FROM dispositions WHERE tenant_id=? AND entity_key=?",
+                           (self.tenant_id, entity_key.upper()))
+        return {r["signal_id"]: r for r in rows}
+
+    def rule_precision(self) -> list[dict]:
+        """Per-rule precision, for deciding which rules earn their place.
+
+        `unclear` is counted but kept out of the precision denominator: a
+        reviewer who could not tell has not said the rule was wrong, and
+        folding that into a score would quietly punish rules that raise
+        genuinely hard questions.
+        """
+        fired = {r["rule_id"]: r["n"] for r in self._query(
+            "SELECT rule_id, COUNT(*) AS n FROM dispositions WHERE tenant_id=?"
+            " GROUP BY rule_id", (self.tenant_id,))}
+        rows = self._query(
+            "SELECT rule_id, verdict, COUNT(*) AS n, MAX(category) AS category"
+            " FROM dispositions WHERE tenant_id=? GROUP BY rule_id, verdict",
+            (self.tenant_id,))
+
+        by_rule: dict[str, dict] = {}
+        for r in rows:
+            entry = by_rule.setdefault(r["rule_id"], {
+                "rule_id": r["rule_id"], "category": r["category"],
+                "true_positive": 0, "false_positive": 0, "unclear": 0})
+            entry[r["verdict"]] = r["n"]
+
+        out = []
+        for entry in by_rule.values():
+            judged = entry["true_positive"] + entry["false_positive"]
+            entry["reviewed"] = fired.get(entry["rule_id"], 0)
+            entry["precision"] = (round(entry["true_positive"] / judged, 3)
+                                  if judged else None)
+            out.append(entry)
+        # Worst first: the point of the page is finding rules to retire.
+        return sorted(out, key=lambda e: (e["precision"] if e["precision"] is not None
+                                          else 2, -e["reviewed"]))
+
     # ------------------------------------------------------------ watchlists
     def create_watchlist(self, name: str, params: dict) -> str:
         watchlist_id = uuid.uuid4().hex[:12]
@@ -976,12 +1060,21 @@ class _Cursor:
 
 
 def _with_id(row: dict) -> dict:
-    """Merge the stored finding payload with its row id."""
+    """Merge the stored finding payload with its row id.
+
+    Signals stored before `signal_id` existed get one computed here, from the
+    same rule-and-evidence hash, so a verdict can be attached to a finding
+    recorded by an older build.
+    """
     try:
         payload = json.loads(row["payload"])
     except Exception:
         payload = {}
     payload["finding_id"] = row.get("id")
+    for signal in payload.get("signals", []):
+        if not signal.get("signal_id"):
+            signal["signal_id"] = signal_key(signal.get("rule_id", ""),
+                                             signal.get("evidence", ""))
     return payload
 
 

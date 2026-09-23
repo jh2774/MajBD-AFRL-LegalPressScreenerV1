@@ -282,11 +282,38 @@ function agenciesTable(agencies) {
       <tbody>${rows}</tbody></table></div>`;
 }
 
-function signalList(signals) {
+const VERDICT_LABEL = {
+  true_positive: "confirmed",
+  false_positive: "false positive",
+  unclear: "unclear",
+};
+
+/* `opts.entityKey` turns on the verdict controls. A verdict is the only
+ * labelled data this tool ever produces, so it is collected where a reviewer
+ * is already reading the evidence rather than on a separate screen. */
+function signalList(signals, opts = {}) {
   if (!signals || !signals.length) return `<div class="empty">No signals.</div>`;
+  const verdicts = opts.dispositions || {};
   return signals
-    .map(
-      (s) => `<div class="signal s-${esc(s.severity)}">
+    .map((s) => {
+      const recorded = verdicts[s.signal_id];
+      const controls =
+        opts.entityKey && s.signal_id
+          ? `<div class="verdict" data-signal="${esc(s.signal_id)}"
+                  data-rule="${esc(s.rule_id)}" data-category="${esc(s.category || "")}"
+                  data-severity="${esc(s.severity || "")}">
+               ${recorded
+                 ? `<span class="pill ${recorded.verdict === "false_positive" ? "warn" : ""}">
+                      marked ${esc(VERDICT_LABEL[recorded.verdict] || recorded.verdict)}
+                      ${recorded.decided_by ? `by ${esc(recorded.decided_by)}` : ""}</span>
+                    <button class="verdict-btn ghost" data-verdict="">Change</button>`
+                 : `<span class="muted" style="font-size:12px">Was this right?</span>
+                    <button class="verdict-btn" data-verdict="true_positive">Confirmed</button>
+                    <button class="verdict-btn" data-verdict="false_positive">False positive</button>
+                    <button class="verdict-btn ghost" data-verdict="unclear">Unclear</button>`}
+             </div>`
+          : "";
+      return `<div class="signal s-${esc(s.severity)}">
         <div class="title">${sevTag(s.severity)} ${esc(s.title)}
           ${s.is_new ? '<span class="pill warn">new</span>' : ""}</div>
         <div class="why">${esc(s.rationale)}</div>
@@ -294,9 +321,49 @@ function signalList(signals) {
         <div class="muted" style="margin-top:6px;font-size:12px">
           ${esc(s.rule_id)} · ${esc(s.source)}
           ${s.source_url ? ` · <a href="${esc(s.source_url)}" target="_blank" rel="noopener noreferrer">source</a>` : ""}
-        </div></div>`
-    )
+        </div>
+        ${controls}</div>`;
+    })
     .join("");
+}
+
+/* Wires the verdict buttons inside `root` for one entity. */
+function wireVerdicts(root, entityKey, runId) {
+  root.querySelectorAll(".verdict").forEach((box) => {
+    box.querySelectorAll(".verdict-btn").forEach((btn) => {
+      btn.onclick = async () => {
+        const verdict = btn.dataset.verdict;
+        if (!verdict) {            // "Change" — offer the choices again
+          box.innerHTML =
+            `<span class="muted" style="font-size:12px">Was this right?</span>
+             <button class="verdict-btn" data-verdict="true_positive">Confirmed</button>
+             <button class="verdict-btn" data-verdict="false_positive">False positive</button>
+             <button class="verdict-btn ghost" data-verdict="unclear">Unclear</button>`;
+          wireVerdicts(box.parentElement, entityKey, runId);
+          return;
+        }
+        btn.disabled = true;
+        try {
+          await apiPost("/v1/dispositions", {
+            signal_id: box.dataset.signal,
+            entity_key: entityKey,
+            rule_id: box.dataset.rule,
+            category: box.dataset.category,
+            severity: box.dataset.severity,
+            verdict,
+            run_id: runId || "",
+          });
+          box.innerHTML = `<span class="pill ${verdict === "false_positive" ? "warn" : ""}">
+            marked ${esc(VERDICT_LABEL[verdict])}</span>`;
+        } catch (e) {
+          btn.disabled = false;
+          box.insertAdjacentHTML(
+            "beforeend",
+            `<span class="muted" style="font-size:12px"> — ${esc(e.message)}</span>`);
+        }
+      };
+    });
+  });
 }
 
 /* ------------------------------------------------------------------- views */
@@ -413,11 +480,14 @@ async function viewSearch(q, kind) {
 
 async function viewEntity(key) {
   setBusy("Loading contractor…");
-  const [d, docs] = await Promise.all([
+  const [d, docs, verdicts] = await Promise.all([
     api(`/v1/entities/${encodeURIComponent(key)}`),
     api(`/v1/documents?entity_key=${encodeURIComponent(key)}`).catch(() => ({ documents: [] })),
+    api(`/v1/entities/${encodeURIComponent(key)}/dispositions`)
+      .catch(() => ({ dispositions: {} })),
   ]);
   d.documents = docs.documents || [];
+  d.dispositions = verdicts.dispositions || {};
   const e = d.entity || {};
   const f = d.latest_finding;
 
@@ -450,7 +520,11 @@ async function viewEntity(key) {
       ${e.parent_name ? `<span class="pill">parent: ${esc(e.parent_name)}</span>` : ""}
     </div>` : ""}
 
-    ${f ? `<div class="card"><h2>Signals</h2>${signalList(f.signals)}</div>` : ""}
+    ${f ? `<div class="card"><h2>Signals</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:10px">
+        Marking these is what makes rule weights measurable rather than assumed —
+        see <a href="#/rules">rule precision</a>.</div>
+      ${signalList(f.signals, { entityKey: key, dispositions: d.dispositions })}</div>` : ""}
 
     ${history.length > 1 ? `<div class="card">
       <h2>Severity over time</h2>
@@ -471,6 +545,65 @@ async function viewEntity(key) {
       <h2>Awards</h2>
       ${contractsTable(d.contracts || [])}
     </div>`;
+
+  wireVerdicts(view, key, f ? f.run_id : "");
+}
+
+async function viewRules() {
+  setBusy("Loading rule precision…");
+  const d = await api("/v1/rules/precision");
+  const t = d.totals;
+
+  const rows = d.rules
+    .map((r) => {
+      const judged = r.true_positive + r.false_positive;
+      const pct = r.precision === null ? null : Math.round(r.precision * 100);
+      const colour = pct === null ? "var(--info)"
+        : pct >= 80 ? "var(--low)" : pct >= 50 ? "var(--medium)" : "var(--critical)";
+      return `<tr>
+        <td class="mono">${esc(r.rule_id)}</td>
+        <td>${esc(CATEGORY_LABEL[r.category] || r.category || "—")}</td>
+        <td class="num">${esc(num(r.true_positive))}</td>
+        <td class="num">${esc(num(r.false_positive))}</td>
+        <td class="num">${esc(num(r.unclear))}</td>
+        <td class="num">${pct === null
+          ? '<span class="muted">not measured</span>'
+          : `<strong style="color:${colour}">${pct}%</strong>
+             <span class="muted">of ${judged}</span>`}</td>
+      </tr>`;
+    })
+    .join("");
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Rule precision</h1>
+      <div class="sub">What reviewers concluded, worst first. Weights in this tool
+        were set by judgement; this is the only thing that measures them.</div>
+    </div>
+
+    <div class="grid cols-3">
+      ${statCard("Verdicts recorded", num(t.verdicts))}
+      ${statCard("Rules with verdicts", num(t.rules_with_verdicts))}
+      ${statCard("Overall precision",
+                 t.overall_precision === null ? "—"
+                   : Math.round(t.overall_precision * 100) + "%")}
+    </div>
+
+    ${d.rules.length ? `<div class="card">
+      <div class="table-wrap"><table>
+        <thead><tr><th>Rule</th><th>Category</th><th class="num">Confirmed</th>
+        <th class="num">False positive</th><th class="num">Unclear</th>
+        <th class="num">Precision</th></tr></thead>
+        <tbody>${rows}</tbody></table></div>
+      <div class="muted" style="font-size:12px;margin-top:12px">
+        "Unclear" is counted but kept out of the precision denominator: a reviewer
+        who could not tell has not said the rule was wrong, and folding that in
+        would punish rules that raise genuinely hard questions. A rule with no
+        verdicts reads "not measured" rather than 100% — unmeasured is not the
+        same as perfect.</div>
+    </div>` : `<div class="card"><div class="empty">
+      No verdicts recorded yet. Open a contractor and mark its signals
+      confirmed or false positive; they collect here.</div></div>`}`;
 }
 
 function documentsTable(docs, entityKey) {
@@ -920,6 +1053,7 @@ const ROUTES = [
                                     from ? decodeURIComponent(from) : "",
                                     (params && params.get("entity")) || "")],
   [/^\/notices$/, () => viewNotices()],
+  [/^\/rules$/, () => viewRules()],
 ];
 
 async function route() {
