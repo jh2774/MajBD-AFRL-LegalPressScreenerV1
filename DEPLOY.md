@@ -6,7 +6,18 @@ Concrete steps. Roughly 30 minutes, most of it waiting for the worker image to b
 
 ## 1. Push to GitHub
 
-**The repository already exists, with one commit.** It ships two ways:
+**A bundle is a clone source, not a file to upload.** Adding one through GitHub's web
+interface stores a binary blob and the project does not appear. The quickest correct route is:
+
+```powershell
+.\tools\push_to_github.ps1 -Bundle .\foci-screen-ready.bundle
+```
+
+It verifies the bundle, clones it, repoints the remote at GitHub, checks the push is additive
+rather than a rewrite, and pushes. Add `-WhatIfOnly` to see all of that and stop before the
+push. The push itself needs an interactive GitHub sign-in, so it has to run in your terminal.
+
+The manual equivalent, and what the rest of this section assumes:
 
 * `foci-screen.bundle` — a git bundle carrying the full history. Clone it:
 
