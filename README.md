@@ -149,6 +149,34 @@ Without the browser extra installed nothing crashes. Unreadable hosts — no bro
 or disallowed — are reported in the run notes, because silence there would read as "nothing
 found on their website", which is a different claim entirely.
 
+### Subcontractors
+
+`--subcontractors N` screens N suppliers underneath the primes. This is where FOCI risk
+concentrates — small, cash-hungry firms — and it is exactly what a ranking by obligated dollars
+buries. A live Navy run surfaced `INCHCAPE SHIPPING SERVICES(JAPAN) LTD.` as a supplier under a
+Navy prime; nothing in the prime population would have shown it.
+
+Subaward data is weaker than prime-award data, in ways established by querying the endpoint:
+
+- **The sub-agency filter is ignored.** Asking for Defense + Navy returns byte-identical results
+  to asking for Defense alone: 42 Navy, 26 Air Force, 19 Army out of 100. The filter is
+  therefore applied client-side, or a screen scoped to one command quietly reports another
+  command's suppliers as its own.
+- **Values are self-reported and frequently wrong.** The largest "subaward" in a live sample was
+  $5.0B to a machine shop, and the median was $53M. They are never used for ranking — ordering
+  is by date — and a notice labels the figure as self-reported rather than quoting it as an
+  obligation.
+- **Some subawardees are people.** Sole proprietors appear in the data; `JOSHUA D GOODWIN` came
+  back under a Navy prime. Screening a named individual, then writing to their customer's
+  contracting officer about them, is a different act from screening a company, and the tool
+  declines by default. The test is a heuristic — a two-word company with no "Inc" can land in
+  it — so skipped names are listed in the run notes instead of disappearing.
+
+A subcontractor has no contracting officer of its own, so a notice about one goes to the KO on
+the **prime** contract, and says so in its first sentence: the Government has no privity with
+the subcontractor, the prime does. FPDS data about the prime's vendor is never copied onto the
+subcontractor.
+
 ### How the contracting officer is resolved
 
 FPDS records who created, approved and last modified each contract action, and for DoD those

@@ -89,21 +89,49 @@ def render_text(finding: Finding, run_id: str = "") -> str:
     greeting = f"Dear {officer.name}," if officer.name else "Dear Contracting Officer,"
     ent = finding.entity
 
+    subawards = [c for c in finding.contracts if c.is_subaward]
+    all_sub = bool(subawards) and len(subawards) == len(finding.contracts)
+
     parts: list[str] = [greeting, ""]
-    parts.append(
-        f"An automated public-records screen returned a {SEVERITY_LABEL.get(finding.severity, '')}"
-        f" result for {ent.name}"
-        + (f" (UEI {ent.uei})" if ent.uei else "")
-        + ", which holds contract actions on which you are recorded in FPDS-NG as"
-          " the responsible or last-acting contracting official."
-    )
+    if all_sub:
+        # The recipient holds no contract with this company. Say so first, or
+        # the notice reads as though they do.
+        primes = sorted({c.prime_recipient_name for c in subawards if c.prime_recipient_name})
+        parts.append(
+            f"An automated public-records screen returned a "
+            f"{SEVERITY_LABEL.get(finding.severity, '')} result for {ent.name}"
+            + (f" (UEI {ent.uei})" if ent.uei else "")
+            + ", which is reported as a SUBCONTRACTOR under"
+            + (f" {', '.join(primes)}" if primes else " a prime contractor")
+            + " on prime contract actions where you are recorded in FPDS-NG as the"
+              " responsible or last-acting contracting official. The Government has"
+              " no privity with this company; the prime does. It is addressed to you"
+              " because the prime contract is where any action would be taken.")
+    else:
+        parts.append(
+            f"An automated public-records screen returned a "
+            f"{SEVERITY_LABEL.get(finding.severity, '')} result for {ent.name}"
+            + (f" (UEI {ent.uei})" if ent.uei else "")
+            + ", which holds contract actions on which you are recorded in FPDS-NG as"
+              " the responsible or last-acting contracting official.")
     parts.append("")
 
     # --- affected awards -------------------------------------------------
     parts.append("AFFECTED CONTRACT ACTIONS")
     for c in sorted(finding.contracts, key=lambda x: -x.award_amount)[:6]:
-        parts.append(f"  * {c.piid or c.award_id} — {c.awarding_sub_agency or c.awarding_agency}")
-        parts.append(f"    Value: {_fmt_money(c.award_amount)}   PoP: {c.start_date} to {c.end_date}")
+        where = c.awarding_sub_agency or c.awarding_agency
+        parts.append(f"  * {c.piid or c.award_id} — {where}")
+        if c.is_subaward:
+            parts.append(f"    Subaward under prime {c.prime_award_id}"
+                         + (f" ({c.prime_recipient_name})" if c.prime_recipient_name else ""))
+            # The figure is the prime's own FSRS entry. Quoting it as an
+            # obligation invites a correction that discredits the whole notice.
+            parts.append(f"    Reported subaward value: {_fmt_money(c.award_amount)}"
+                         f" (self-reported by the prime; not an obligated amount)")
+            parts.append(f"    Reported: {c.start_date}")
+            continue
+        parts.append(f"    Value: {_fmt_money(c.award_amount)}   "
+                     f"PoP: {c.start_date} to {c.end_date}")
         if c.psc_code:
             parts.append(f"    PSC {c.psc_code} {c.psc_description} | NAICS {c.naics_code}")
         if c.ip_clause_hits:
@@ -142,7 +170,8 @@ def render_text(finding: Finding, run_id: str = "") -> str:
     parts.append("LIMITATIONS")
     parts.append("  " + "\n  ".join(_wrap(DISCLAIMER, 92)))
     parts.append("")
-    parts.append(f"Screening run: {run_id or finding.run_id}   Generated: {finding.generated_at}")
+    parts.append(f"Screening run: {run_id or finding.run_id}   "
+                 f"Generated: {finding.generated_at}")
     if officer.source:
         parts.append(f"Addressee resolved from {officer.source} "
                      f"(confidence: {officer.confidence}). If this is not your file, "

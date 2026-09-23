@@ -18,6 +18,10 @@ class ScreenRequest(BaseModel):
     max_entities: int = Field(5, ge=1, le=100)
     keyword: str = ""
     include_idv: bool = False
+    # Subcontractors to screen as well, newest subaward first. Subaward values
+    # are self-reported by the prime and unreliable, so these are never ranked
+    # by dollars and any notice goes to the prime's contracting officer.
+    max_subaward_entities: int = Field(0, ge=0, le=50)
     # entity name -> domain, for the pages a company publishes itself
     domains: dict[str, str] = Field(default_factory=dict)
     fetch_filing_bodies: bool = True

@@ -80,6 +80,29 @@ class Contract(Serialisable):
     ip_clause_hits: list[str] = field(default_factory=list)
     source_url: str = ""
 
+    # --- subawards ---------------------------------------------------------
+    # A subcontract under someone else's prime. Worth screening because FOCI
+    # risk concentrates in small, cash-hungry suppliers, and a ranking by
+    # obligated dollars buries exactly those.
+    is_subaward: bool = False
+    prime_award_id: str = ""
+    prime_recipient_name: str = ""
+    prime_generated_internal_id: str = ""
+    # Subaward values are self-reported by the prime through FSRS and are
+    # frequently wrong — observed live: a $4.2B subaward to a small machine
+    # shop for "NON-COMPLEX MACHINED." Never rank or threshold on this.
+    amount_is_self_reported: bool = False
+
+    @property
+    def fpds_piid(self) -> str:
+        """The PIID to ask FPDS about.
+
+        For a subaward that is the *prime* contract: the subcontract has no
+        contracting officer of its own, and the official who would need to act
+        is the one on the prime.
+        """
+        return self.prime_award_id if self.is_subaward else self.piid
+
     @property
     def usaspending_url(self) -> str:
         if self.generated_internal_id:

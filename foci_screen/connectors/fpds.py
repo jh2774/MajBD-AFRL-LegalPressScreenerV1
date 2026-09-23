@@ -87,7 +87,9 @@ class FPDSConnector:
         return list(root.iter(f"{ATOM_NS}entry"))
 
     def enrich(self, contract: Contract) -> Contract:
-        entries = self.fetch_award(contract.piid or contract.award_id)
+        # `fpds_piid` is the prime's PIID for a subaward: a subcontract has no
+        # contracting officer of its own, and FPDS has no record of it at all.
+        entries = self.fetch_award(contract.fpds_piid or contract.award_id)
         if not entries:
             return contract
 
@@ -105,6 +107,15 @@ class FPDSConnector:
             _text(latest, "contractingOfficeID") or contract.contracting_office_id)
         contract.solicitation_id = (
             _text(latest, "solicitationID") or contract.solicitation_id)
+
+        if contract.is_subaward:
+            # Everything below describes the vendor on the FPDS record, which
+            # for a subaward is the *prime*. Copying it onto the subcontractor
+            # would attribute one company's ownership, parent and requirement
+            # to another — the precise mistake this tool exists to avoid. Who
+            # to notify is a fact about the prime contract; who the supplier is
+            # is not.
+            return contract
 
         coi = _text(latest, "countryOfIncorporation")
         if coi:

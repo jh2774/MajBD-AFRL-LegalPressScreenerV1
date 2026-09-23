@@ -202,7 +202,11 @@ function contractsTable(contracts) {
     .map(
       (c) => `<tr>
         <td><a href="#/contract/${encodeURIComponent(c.contract_key || c.piid)}"
-               class="mono">${esc(c.piid || c.contract_key)}</a></td>
+               class="mono">${esc(c.piid || c.contract_key)}</a>
+          ${c.is_subaward
+            ? `<div class="muted" style="font-size:11.5px">subaward under
+                 <span class="mono">${esc(c.prime_award_id || "?")}</span></div>`
+            : ""}</td>
         <td>${linkEntity(c.entity_key, c.entity_name)}</td>
         <td>${esc(c.sub_agency || c.agency || "—")}</td>
         <td>${esc(c.psc_description || c.naics_description || "—")}</td>

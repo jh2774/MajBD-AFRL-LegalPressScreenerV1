@@ -290,7 +290,8 @@ def rule_uspto_security_interest(doc: Document, ctx: RuleContext) -> list[Signal
     if not any(k in conveyance for k in lex.USPTO_SECURITY_CONVEYANCES):
         return []
     assignee = (doc.meta or {}).get("assignee", "")
-    juris = lex.find_jurisdictions(assignee + " " + (doc.meta or {}).get("assignee_address", ""))
+    address = (doc.meta or {}).get("assignee_address", "")
+    juris = lex.find_jurisdictions(f"{assignee} {address}")
     mult = 1.5
     jname = ""
     if juris:
@@ -317,7 +318,8 @@ def rule_contract_structural(contract: Contract, ctx: RuleContext) -> list[Signa
     signals: list[Signal] = []
     for field_name, value, label in (
         ("recipient_country", contract.recipient_country, "registered address"),
-        ("country_of_incorporation", contract.country_of_incorporation, "country of incorporation"),
+        ("country_of_incorporation", contract.country_of_incorporation,
+         "country of incorporation"),
     ):
         if not value:
             continue

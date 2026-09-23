@@ -62,3 +62,9 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]
 ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# Jurisdiction and terminology tables. Each entry is one row of data — a name,
+# a tier, a multiplier and its patterns — and wrapping them to 96 columns makes
+# the table harder to scan and to diff than leaving the rows intact.
+"foci_screen/risk/lexicon.py" = ["E501"]

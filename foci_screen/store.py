@@ -157,6 +157,9 @@ CREATE TABLE IF NOT EXISTS contracts (
     ko_confidence TEXT,
     ip_clauses    TEXT,
     source_url    TEXT,
+    is_subaward   INTEGER DEFAULT 0,
+    prime_award_id TEXT,
+    prime_recipient_name TEXT,
     updated_at    TEXT NOT NULL,
     UNIQUE (tenant_id, contract_key)
 );
@@ -198,6 +201,9 @@ COLUMN_ADDITIONS = [
     ("findings", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
     ("notifications", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
     ("notices", "original_body_text", "TEXT"),
+    ("contracts", "is_subaward", "INTEGER DEFAULT 0"),
+    ("contracts", "prime_award_id", "TEXT"),
+    ("contracts", "prime_recipient_name", "TEXT"),
 ]
 
 
@@ -766,8 +772,9 @@ class Store:
                 " end_date, naics_description, psc_description, description,"
                 " solicitation_id, recipient_uei, recipient_country,"
                 " country_of_incorporation, foreign_owned, foreign_funding, ko_name,"
-                " ko_email, ko_source, ko_confidence, ip_clauses, source_url, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ko_email, ko_source, ko_confidence, ip_clauses, source_url,"
+                " is_subaward, prime_award_id, prime_recipient_name, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT (tenant_id, contract_key) DO UPDATE SET"
                 " run_id=excluded.run_id, amount=excluded.amount,"
                 " entity_name=excluded.entity_name, ko_name=excluded.ko_name,"
@@ -783,7 +790,9 @@ class Store:
                  contract.recipient_country, contract.country_of_incorporation,
                  1 if contract.foreign_owned_and_located else 0,
                  contract.foreign_funding, o.name, o.email, o.source, o.confidence,
-                 json.dumps(contract.ip_clause_hits or []), contract.source_url, _now()))
+                 json.dumps(contract.ip_clause_hits or []), contract.source_url,
+                 1 if contract.is_subaward else 0, contract.prime_award_id,
+                 contract.prime_recipient_name, _now()))
 
     def get_contract(self, contract_key: str) -> dict | None:
         row = self._one("SELECT * FROM contracts WHERE tenant_id=? AND contract_key=?",
@@ -943,6 +952,7 @@ def _decode_contract(row: dict) -> dict:
     except (ValueError, TypeError):
         row["ip_clauses"] = []
     row["foreign_owned"] = bool(row.get("foreign_owned"))
+    row["is_subaward"] = bool(row.get("is_subaward"))
     return row
 
 

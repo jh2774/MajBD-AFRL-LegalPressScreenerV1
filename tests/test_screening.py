@@ -629,7 +629,8 @@ class TestAttributionSafety(unittest.TestCase):
         """The meaning must still be caught — just through metadata."""
         doc = Document(source="sec_edgar", key="s1", url="https://sec.gov/x",
                        published="2025-04-01",
-                       text="Form 8-K filed 2025-04-01 by Acme Corp. Reported items: 1.03, 5.01.",
+                       text=("Form 8-K filed 2025-04-01 by Acme Corp. "
+                             "Reported items: 1.03, 5.01."),
                        meta={"item_codes": ["1.03", "5.01"], "company": "Acme Corp"})
         ctx = engine.RuleContext(entity=ENTITY, contracts=[make_contract()])
         signals = engine.rule_edgar_8k_items(doc, ctx)

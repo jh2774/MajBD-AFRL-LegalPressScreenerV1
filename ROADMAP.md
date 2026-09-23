@@ -167,10 +167,19 @@ Ordered by how much they limit the tool today.
    improved every watched site.
 4. **State-level UCC-1 search.** Where IP liens are perfected outside USPTO. No national API;
    Delaware, California and New York cover most of it. Commercial aggregators exist.
-5. **Widen contract coverage.** The tool screens the top *N* contractors by obligated value,
-   which biases toward primes. FOCI risk concentrates in small, cash-hungry subcontractors -
-   exactly the ones a value ranking buries. Add subaward screening
-   (`/api/v2/search/spending_by_subaward`) and let users rank by risk rather than dollars.
+5. ~~**Widen contract coverage.**~~ **Done for subcontractors.** `--subcontractors N` screens
+   suppliers under the primes, via `spending_by_award` with `subawards: true` (the endpoint the
+   roadmap guessed at does not exist). Ranked by date, not dollars, because subaward values are
+   self-reported and unreliable. See the README for the three data caveats.
+
+   Still open here: **ranking by risk rather than dollars for primes.** Prime selection is
+   still `ORDER BY obligated DESC`. A risk-ordered population would use prior findings, sector,
+   and ownership-change signals — it needs the disposition data from item 7 to be worth
+   anything.
+
+   Also open: **distinguishing sole proprietors properly.** The individual test is a name
+   heuristic. SAM.gov's entity registration states whether a registrant is a sole proprietor,
+   which is authoritative; that needs `SAM_API_KEY` (item 2).
 6. **Entity resolution.** Name matching between USAspending, SEC, IAPD and USPTO is the weakest
    link in the chain. Build a UEI / CIK / CAGE / CRD crosswalk table, seeded from SAM and
    corrected by hand. Precision here lifts every rule at once.

@@ -63,7 +63,8 @@ def cmd_screen(args, cfg) -> int:
         agency=args.agency, sub_agency=args.sub_agency or "",
         months_back=args.months, max_awards=args.awards,
         max_entities=args.entities, keyword=args.keyword or "",
-        include_idv=args.include_idv, domains=_parse_domains(args.domain),
+        include_idv=args.include_idv, max_subaward_entities=args.subcontractors,
+        domains=_parse_domains(args.domain),
         fetch_filing_bodies=not args.fast, min_severity=args.min_severity,
         skip_web=args.no_web)
 
@@ -212,6 +213,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--entities", type=int, default=5, help="max contractors to screen")
     s.add_argument("--keyword", help="restrict awards by keyword")
     s.add_argument("--include-idv", action="store_true", help="include IDV vehicles")
+    s.add_argument("--subcontractors", type=int, default=0, metavar="N",
+                   help="also screen N subcontractors, newest subaward first "
+                        "(notices go to the prime's contracting officer)")
     s.add_argument("--domain", action="append", metavar='"NAME=domain.com"',
                    help="map a contractor to its website for IR/press/legal watching")
     s.add_argument("--min-severity", default="low",

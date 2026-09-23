@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from .connectors.fpds import FPDSConnector
 from .connectors.registries import IAPDConnector, OFACConnector, SAMConnector, USPTOConnector
 from .connectors.sec_edgar import EdgarConnector
-from .connectors.usaspending import USASpendingConnector
+from .connectors.usaspending import USASpendingConnector, looks_like_an_individual
 from .connectors.webwatch import WebWatchConnector
 from .models import Change, Contract, Document, Entity, Finding
 from .risk import engine
@@ -31,6 +31,9 @@ class ScreenOptions:
     max_entities: int = 5
     keyword: str = ""
     include_idv: bool = False
+    # Subcontractors to screen on top of the primes, newest subaward first.
+    # Off by default: it is extra requests and a different evidence quality.
+    max_subaward_entities: int = 0
     domains: dict[str, str] = field(default_factory=dict)   # entity name -> domain
     fetch_filing_bodies: bool = True
     min_severity: str = "low"
@@ -99,7 +102,9 @@ class Screener:
         selected = ranked[:opts.max_entities]
         progress(f"  screening top {len(selected)} contractor(s) by obligated value.")
 
-        for key, ent_contracts in selected:
+        selected += self._subaward_entities(opts, by_entity, result, progress)
+
+        for _key, ent_contracts in selected:
             name = ent_contracts[0].recipient_name
             progress(f"\n[{name}]")
             for c in ent_contracts[:4]:
@@ -129,6 +134,67 @@ class Screener:
         if owns_run:
             self.store.finish_run(run_id, stats=result.stats)
         return result
+
+    def _subaward_entities(self, opts: ScreenOptions,
+                           already: dict[str, list[Contract]],
+                           result: ScreenResult,
+                           progress) -> list[tuple[str, list[Contract]]]:
+        """Subcontractors to screen alongside the primes.
+
+        Ranked by recency rather than value. Subaward amounts are self-reported
+        by the prime and are wrong often enough that sorting on them would put
+        the worst data at the top — and the premise of screening subcontractors
+        at all is that the interesting ones are small, which a dollar ranking
+        hides.
+        """
+        if opts.max_subaward_entities <= 0:
+            return []
+
+        progress(f"\nSearching subawards under {opts.agency} primes...")
+        subs = self.usaspending.search_subawards(
+            opts.agency, months_back=opts.months_back,
+            limit=max(opts.max_awards, opts.max_subaward_entities * 4),
+            sub_agency=opts.sub_agency, keyword=opts.keyword)
+        if not subs:
+            progress("  no subawards returned.")
+            return []
+
+        grouped: dict[str, list[Contract]] = {}
+        individuals: set[str] = set()
+        for c in subs:
+            key = (c.recipient_uei or c.recipient_name).upper()
+            if not key or key in already:      # already screened as a prime
+                continue
+            if looks_like_an_individual(c.recipient_name):
+                # Sole proprietors appear in subaward reporting. Screening a
+                # named person, and writing to their customer's contracting
+                # officer about them, is not what this tool is for.
+                individuals.add(c.recipient_name)
+                continue
+            grouped.setdefault(key, []).append(c)
+
+        picked = list(grouped.items())[:opts.max_subaward_entities]
+        progress(f"  {len(subs)} subaward(s); screening {len(picked)} "
+                 f"subcontractor(s) not already covered.")
+        if individuals:
+            progress(f"  {len(individuals)} subawardee(s) skipped as individuals.")
+            result.notes.append(
+                f"Skipped {len(individuals)} subawardee(s) whose recipient looks like a "
+                f"person rather than a company: {', '.join(sorted(individuals))}. "
+                f"Subaward reporting includes sole proprietors, and screening a named "
+                f"individual — then writing to their customer's contracting officer "
+                f"about them — is not something this tool does by default. The test is "
+                f"a heuristic, so a company with a two-word name and no 'Inc' can land "
+                f"here; they are listed above so that is visible rather than silent.")
+        if picked:
+            result.notes.append(
+                f"{len(picked)} subcontractor(s) screened. Subaward values are "
+                f"self-reported by the prime through FSRS and are frequently wrong, "
+                f"so they are not used for ranking and should not be quoted as "
+                f"obligated amounts. Any notice about a subcontractor is addressed "
+                f"to the contracting officer on the prime contract, who is the "
+                f"official able to act on it.")
+        return picked
 
     def coverage_notes(self) -> list[str]:
         """Say so when a website was not fully read.
