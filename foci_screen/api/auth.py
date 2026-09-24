@@ -39,15 +39,29 @@ STARTUP_WARNING = (
 )
 
 
+DEFAULT_TENANT = "default"
+
+
 def parse_keys(raw: str) -> dict[str, str]:
-    """`"tenant:key,tenant2:key2"` -> {key: tenant}. Keys index the map."""
+    """`"tenant:key,tenant2:key2"` -> {key: tenant}. Keys index the map.
+
+    An entry with no colon is taken as a key for the `default` tenant. This is
+    the single most likely way to configure this wrong — pasting the key
+    without its tenant prefix — and the old behaviour was to discard the entry
+    silently, leaving a server that starts cleanly and then refuses everything.
+    Guessing "default" here is safe: it is the tenant the CLI writes as, so it
+    is the one a single-tenant deployment wants anyway.
+    """
     out: dict[str, str] = {}
     for pair in raw.split(","):
         pair = pair.strip()
-        if not pair or ":" not in pair:
+        if not pair:
             continue
-        tenant, _, key = pair.partition(":")
-        tenant, key = tenant.strip(), key.strip()
+        if ":" in pair:
+            tenant, _, key = pair.partition(":")
+            tenant, key = tenant.strip(), key.strip()
+        else:
+            tenant, key = DEFAULT_TENANT, pair
         if tenant and key:
             out[key] = tenant
     return out

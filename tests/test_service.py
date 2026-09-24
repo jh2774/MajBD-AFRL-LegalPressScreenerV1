@@ -443,7 +443,10 @@ def test_watchlist_round_trip(store):
 def test_parse_keys():
     assert auth.parse_keys("acme:k1,navy:k2") == {"k1": "acme", "k2": "navy"}
     assert auth.parse_keys("") == {}
-    assert auth.parse_keys("malformed") == {}
+    # A bare entry used to be discarded, which produced a server that started
+    # cleanly and then refused everything. It is now a key for the default
+    # tenant — see test_a_key_without_a_tenant_prefix_still_works.
+    assert auth.parse_keys("malformed") == {"malformed": "default"}
 
 
 def test_resolve_tenant():
@@ -475,6 +478,25 @@ def client(tmp_path, monkeypatch):
 
 
 AUTH = {"X-API-Key": "secret-key"}
+
+
+def test_a_key_without_a_tenant_prefix_still_works():
+    """The likeliest misconfiguration: pasting the key without "default:".
+    Discarding it silently produced a server that started and refused
+    everything, which is how a Render deployment came up closed."""
+    keymap = auth.parse_keys("jh6dagger6small3unsnap0blast5john6apikey4242kopi")
+    assert keymap == {"jh6dagger6small3unsnap0blast5john6apikey4242kopi": "default"}
+
+
+def test_prefixed_and_bare_keys_can_be_mixed():
+    keymap = auth.parse_keys("acme:sk_one, sk_two ,navy-pmo:sk_three")
+    assert keymap == {"sk_one": "acme", "sk_two": "default", "sk_three": "navy-pmo"}
+
+
+def test_empty_configuration_is_still_closed():
+    """Leniency about the prefix must not become leniency about having a key."""
+    for raw in ("", "   ", ",,", ":", "acme:"):
+        assert auth.parse_keys(raw) == {}, raw
 
 
 def test_a_closed_api_says_how_to_open_it(tmp_path, monkeypatch):

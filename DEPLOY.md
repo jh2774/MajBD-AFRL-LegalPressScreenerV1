@@ -184,6 +184,32 @@ cron service.
 
 ---
 
+## "API is closed" on Render
+
+`FOCI_API_KEYS` is marked `sync: false` in the blueprint, which means Render **asks** for it
+when the blueprint is applied and leaves it empty if the prompt is skipped. An empty value is
+the fail-closed state: the service starts, answers `/health`, and refuses everything else.
+
+Fix it on the service rather than in the repository — it is a secret:
+
+1. Render → the **`foci-api`** service → **Environment**
+2. Add `FOCI_API_KEYS` with a value like `default:sk_...`
+3. **Save changes**; the service restarts on its own
+
+Only the API service reads it. The worker and cron job do not.
+
+Confirm from outside without a key:
+
+```bash
+curl https://<your-api>.onrender.com/health
+```
+
+`"authenticated": true` means keys are loaded. `false` means the variable is still empty.
+
+Then open the site, click **API key**, and paste the key *without* the tenant prefix — the
+`default:` part names the tenant, not the key. (A value with no prefix at all is accepted and
+treated as the `default` tenant, so this is hard to get wrong now.)
+
 ## "The site loads but shows nothing"
 
 Almost always one of two things, and they look identical in the browser:
