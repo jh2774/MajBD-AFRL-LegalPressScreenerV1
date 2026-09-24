@@ -21,6 +21,9 @@ build/
 # Release archives and handover bundles are build output, not source.
 foci-screen-v*.zip
 *.bundle
+# Single-file source listing. Generated output that drifts the moment anything
+# changes; regenerate with tools/bundle_source.py rather than committing it.
+foci-screen-all-code.md
 # The build conversation. Regenerate with tools/export_session_log.py when you
 # want it; it carries federal contact addresses and draft notices naming real
 # contractors, which do not belong in a public repository.
