@@ -477,6 +477,35 @@ def client(tmp_path, monkeypatch):
 AUTH = {"X-API-Key": "secret-key"}
 
 
+def test_a_closed_api_says_how_to_open_it(tmp_path, monkeypatch):
+    """With no keys the symptom is a web page showing nothing, which reads as
+    missing data rather than missing configuration. The 503 has to carry the fix."""
+    monkeypatch.setenv("FOCI_API_KEYS", "")
+    monkeypatch.setenv("FOCI_DB", str(tmp_path / "closed.db"))
+    monkeypatch.setenv("FOCI_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("FOCI_OUT", str(tmp_path / "out"))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    from foci_screen.api import app as app_module
+    importlib.reload(app_module)
+    c = TestClient(app_module.app)
+
+    r = c.get("/v1/overview")
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert "FOCI_API_KEYS" in detail
+    assert "tenant:key" in detail
+    assert "default" in detail, "the CLI writes as tenant 'default'; say so"
+
+    # And the unauthenticated probe reports it too, so it is visible without a key.
+    assert c.get("/health").json()["authenticated"] is False
+
+
 def test_health_needs_no_key(client):
     c, _ = client
     body = c.get("/health").json()

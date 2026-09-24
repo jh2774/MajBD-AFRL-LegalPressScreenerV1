@@ -184,6 +184,26 @@ cron service.
 
 ---
 
+## "The site loads but shows nothing"
+
+Almost always one of two things, and they look identical in the browser:
+
+**No API keys.** `FOCI_API_KEYS` is unset, so every authenticated route returns 503 and the
+page has nothing to render. The server says so loudly on startup now, and `GET /health`
+reports `"authenticated": false` without needing a key. Fix it by generating one:
+
+```bash
+python -c "import secrets; print('default:sk_' + secrets.token_urlsafe(24))"
+```
+
+Put that in `FOCI_API_KEYS` — a `.env` file beside the package locally, or the service's
+environment on Render — and restart. Use the tenant `default` if you also run screens from the
+CLI, which writes as that tenant.
+
+**No data yet.** A key opens the API, but a fresh database is empty. Run a screen
+(`foci-screen screen --agency ...`, or `POST /v1/screens`) before expecting the dashboard to
+show anything. An empty database and a closed API are different problems with the same symptom.
+
 ## Costs and gotchas
 
 - **If Render rejects `type: redis` in the blueprint, change it to `keyvalue`.** Render renamed

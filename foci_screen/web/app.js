@@ -77,7 +77,13 @@ async function api(path) {
     throw { title: "Not authorised", message: "The API key is missing or wrong. Set it from the top right." };
   }
   if (res.status === 503) {
-    throw { title: "API is closed", message: "FOCI_API_KEYS is not configured on the server, so every authenticated route is refused." };
+    // The server's detail names the variable and how to set it; repeating a
+    // vaguer version here just hides the fix.
+    let detail = "The server is refusing authenticated requests.";
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch { /* not JSON */ }
+    throw { title: "API is closed", message: detail };
   }
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;

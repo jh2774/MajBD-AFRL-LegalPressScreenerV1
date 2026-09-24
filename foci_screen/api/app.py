@@ -42,6 +42,11 @@ keymap = auth.parse_keys(cfg.api_keys)
 require_tenant = auth.make_dependency(keymap)
 queue = JobQueue(cfg)
 
+if not keymap:
+    # logging may not be configured yet under some servers, so print as well.
+    log.error(auth.STARTUP_WARNING)
+    print(f"\n*** {auth.STARTUP_WARNING}\n", flush=True)
+
 app = FastAPI(
     title="foci-screen",
     version="0.2.0",

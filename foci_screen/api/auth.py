@@ -20,6 +20,24 @@ import secrets
 
 from fastapi import Header, HTTPException, status
 
+CLOSED_DETAIL = (
+    "FOCI_API_KEYS is not set, so the API is closed and no data can be read. "
+    "Set it to one or more \"tenant:key\" pairs and restart. Locally, put it in "
+    "a .env file beside the package; on Render, set it on the service. The CLI "
+    "writes as tenant \"default\", so use default:<key> to see data screened "
+    "from the command line."
+)
+
+# Printed once at startup, because a server that starts silently and then
+# refuses everything is diagnosed in the browser, which is the wrong place.
+STARTUP_WARNING = (
+    "FOCI_API_KEYS is not set. The API has started but every authenticated "
+    "route will return 503 and the web interface will show nothing. "
+    "Generate a key with:\n"
+    "    python -c \"import secrets; print('default:sk_' + secrets.token_urlsafe(24))\"\n"
+    "then put it in FOCI_API_KEYS (a .env file beside the package works locally)."
+)
+
 
 def parse_keys(raw: str) -> dict[str, str]:
     """`"tenant:key,tenant2:key2"` -> {key: tenant}. Keys index the map."""
@@ -53,9 +71,11 @@ def make_dependency(keymap: dict[str, str]):
         x_api_key: str = Header(default=""),
     ) -> str:
         if not keymap:
+            # Say how to fix it. The symptom otherwise is a web page that shows
+            # nothing, which looks like missing data rather than missing config.
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="FOCI_API_KEYS is not configured; the API is closed.")
+                detail=CLOSED_DETAIL)
 
         presented = x_api_key.strip()
         if not presented and authorization.lower().startswith("bearer "):
