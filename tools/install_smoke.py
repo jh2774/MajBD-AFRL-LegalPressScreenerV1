@@ -76,6 +76,11 @@ try:
     check("GET /health (Render healthCheckPath) reports a version",
           status == 200 and payload.get("version") not in (None, "unknown"),
           body[:140].decode())
+    # The field is how a misconfigured deployment announces itself; a sound
+    # local install must produce an empty list, or the banner cries wolf.
+    check("GET /health carries configuration warnings, and has none here",
+          payload.get("warnings") == [],
+          repr(payload.get("warnings")))
 
     status, body, _ = get("/")
     check("GET / serves the web UI from site-packages",

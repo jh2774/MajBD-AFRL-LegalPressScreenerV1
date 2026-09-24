@@ -42,11 +42,6 @@ keymap = auth.parse_keys(cfg.api_keys)
 require_tenant = auth.make_dependency(keymap)
 queue = JobQueue(cfg)
 
-if not keymap:
-    # logging may not be configured yet under some servers, so print as well.
-    log.error(auth.STARTUP_WARNING)
-    print(f"\n*** {auth.STARTUP_WARNING}\n", flush=True)
-
 app = FastAPI(
     title="foci-screen",
     version="0.2.0",
@@ -95,16 +90,56 @@ except metadata.PackageNotFoundError:   # running from a source tree, not instal
     VERSION = "unknown"
 
 
+def deployment_warnings() -> list[str]:
+    """Configuration that will lose data or silently do nothing.
+
+    None of these stop the service answering requests, which is exactly why
+    they need saying: a deployment holding its data on a disk that is about to
+    be discarded looks identical, from the outside, to one that is fine.
+    """
+    warnings: list[str] = []
+    host = cfg.managed_host
+    on_sqlite = not cfg.dsn.startswith("postgres")
+
+    if not keymap:
+        warnings.append(
+            "FOCI_API_KEYS is not set: every authenticated route returns 503 and "
+            "the web interface will show nothing.")
+    if on_sqlite and host:
+        warnings.append(
+            f"Using SQLite on {host}, where the filesystem is ephemeral. Every "
+            f"restart and deploy discards the database — and the stored snapshots "
+            f"are the baseline for change detection, so each wipe makes every "
+            f"document read as new. Set DATABASE_URL to a Postgres instance.")
+    if queue.backend == "thread" and host:
+        warnings.append(
+            f"No REDIS_URL on {host}: screens would run inside the web process and "
+            f"die with it mid-run. Add a Redis instance and a worker service.")
+    return warnings
+
+
+for _warning in deployment_warnings():
+    # logging may not be configured yet under some servers, so print as well.
+    log.error(_warning)
+    print(f"\n*** {_warning}\n", flush=True)
+if not keymap:
+    # The long form says how to set it; the health warning stays short enough
+    # to read in a banner.
+    print(f"*** {auth.STARTUP_WARNING}\n", flush=True)
+
+
 @app.get("/health", tags=["meta"])
 def health() -> dict:
     """Unauthenticated liveness probe. Says nothing about the data.
 
     Carries the version so a deploy can be confirmed as the build you meant to
-    ship, without an authenticated call.
+    ship, and any configuration warnings, so a misconfigured deployment can be
+    diagnosed from outside without a key.
     """
     return {"status": "ok", "version": VERSION, "queue": queue.backend,
             "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
-            "authenticated": bool(keymap)}
+            "authenticated": bool(keymap),
+            "warnings": deployment_warnings()}
 
 
 @app.get("/v1/config", tags=["meta"])

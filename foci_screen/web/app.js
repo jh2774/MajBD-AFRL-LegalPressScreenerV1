@@ -395,10 +395,45 @@ function wireVerdicts(root, entityKey, runId) {
 
 /* ------------------------------------------------------------------- views */
 
+/* An empty database and a closed API produce the same blank-looking page, and
+ * reading eight charts of zeros to tell them apart is not reasonable. Say
+ * which one it is, and how to leave the state. */
+function firstRunPanel() {
+  return `
+    <div class="page-head">
+      <h1>Overview</h1>
+      <div class="sub">Nothing has been screened into this database yet.</div>
+    </div>
+
+    <div class="card">
+      <h2>No screens have run</h2>
+      <p class="muted">The API is answering and your key works — this database
+      is simply empty, which is a different thing from a screen that found
+      nothing. Start one:</p>
+      <div class="code">curl -X POST ${esc(location.origin)}/v1/screens \\
+  -H "Authorization: Bearer &lt;your key&gt;" \\
+  -H "Content-Type: application/json" \\
+  -d '{"agency":"Department of Defense","months_back":6,"max_awards":25,"max_entities":5}'</div>
+      <p class="muted">Expect minutes, not seconds. The first run is a
+      <strong>baseline</strong>: it records what each document looks like now,
+      and damps its findings accordingly. The second run onward is where the
+      change detection earns its keep — so a database that gets discarded
+      between runs never produces the thing this tool is for.</p>
+      <p class="muted">Findings are scoped to the tenant that wrote them. The
+      command line writes as <code>default</code>, so screens run there are
+      invisible here unless your key names that tenant.</p>
+    </div>`;
+}
+
 async function viewOverview() {
   setBusy("Loading overview…");
   const d = await api("/v1/overview");
   const t = d.totals;
+
+  if (!t.contracts && !t.entities && !t.notices_pending) {
+    view.innerHTML = firstRunPanel();
+    return;
+  }
 
   view.innerHTML = `
     <div class="page-head">
@@ -1255,6 +1290,31 @@ async function route() {
   showError({ title: "Not found", message: `No view for ${path}` });
 }
 
+/* Configuration that loses data is silent by design: the service answers, the
+ * dashboard renders, and nothing on it says the disk is about to be discarded.
+ * /health needs no key, so this shows even while the API is closed. */
+async function refreshHealth() {
+  const banner = document.getElementById("config-banner");
+  if (!banner) return;
+  let health;
+  try {
+    const res = await fetch("/health");
+    if (!res.ok) return;
+    health = await res.json();
+  } catch {
+    return;   // unreachable server; the view's own error already says so
+  }
+  const warnings = health.warnings || [];
+  if (!warnings.length) {
+    banner.hidden = true;
+    banner.innerHTML = "";
+    return;
+  }
+  banner.innerHTML = `<strong>Check this deployment's configuration</strong>
+    <ul>${warnings.map((w) => `<li>${esc(w)}</li>`).join("")}</ul>`;
+  banner.hidden = false;
+}
+
 async function refreshBadge() {
   const badge = document.getElementById("notice-badge");
   try {
@@ -1301,3 +1361,4 @@ keyDialog.addEventListener("close", () => {
 
 window.addEventListener("hashchange", route);
 route();
+refreshHealth();

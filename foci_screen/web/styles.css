@@ -39,6 +39,11 @@
 
 * { box-sizing: border-box; }
 
+/* The `hidden` attribute is only a UA `display: none`, so any author rule that
+   sets `display` beats it — which is why the notices badge sat there showing
+   "0". Anything hidden in script stays hidden. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -308,6 +313,34 @@ td.num + td, th.num + th { padding-left: 18px; }
 .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 .empty { color: var(--muted); padding: 28px 0; text-align: center; }
+
+/* A deployment that will lose its data looks exactly like one that will not,
+   so the warning has to be on the page rather than in a health endpoint. */
+.config-banner {
+  margin: 16px auto 0;
+  max-width: 1180px;
+  padding: 12px 16px;
+  border: 1px solid var(--high);
+  border-left-width: 3px;
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 13.5px;
+}
+.config-banner ul { margin: 8px 0 0; padding-left: 20px; }
+.config-banner li { margin-bottom: 6px; color: var(--muted); }
+.config-banner li:last-child { margin-bottom: 0; }
+
+.code {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 10px 0;
+}
 .error {
   border-left: 3px solid var(--critical);
   background: var(--surface);

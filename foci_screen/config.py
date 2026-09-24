@@ -95,6 +95,22 @@ class Config:
             Path(d).mkdir(parents=True, exist_ok=True)
 
     @property
+    def managed_host(self) -> str:
+        """The platform this is running on, if it is a managed one.
+
+        Used only to decide whether a local-development default has been
+        carried into somewhere it will hurt: SQLite on a platform with an
+        ephemeral filesystem loses every snapshot on each deploy, and the
+        snapshots *are* the baseline the change detection depends on.
+        """
+        for var, name in (("RENDER", "Render"), ("DYNO", "Heroku"),
+                          ("FLY_APP_NAME", "Fly.io"), ("K_SERVICE", "Cloud Run"),
+                          ("WEBSITE_INSTANCE_ID", "Azure App Service")):
+            if os.environ.get(var):
+                return name
+        return ""
+
+    @property
     def dsn(self) -> str:
         """Where the store should read and write."""
         return self.database_url or self.db_path

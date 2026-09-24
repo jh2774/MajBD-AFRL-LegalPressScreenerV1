@@ -65,7 +65,7 @@ python -m venv /tmp/foci-check
 /tmp/foci-check/bin/python tools/install_smoke.py
 ```
 
-It should report 16 of 16. It catches missing web assets, broken entrypoints, the health check
+It should report 17 of 17. It catches missing web assets, broken entrypoints, the health check
 and fail-closed auth. It cannot catch OS-level problems in the images themselves (system
 libraries, Chromium, file permissions) — that is what CI is for.
 
@@ -128,12 +128,19 @@ curl https://<your-api>.onrender.com/health
 ```
 
 ```json
-{"status":"ok","queue":"rq","database":"postgres","authenticated":true}
+{"status":"ok","version":"0.8.0","queue":"rq","database":"postgres",
+ "authenticated":true,"warnings":[]}
 ```
 
-All four fields matter. `"queue":"thread"` means Redis did not connect and jobs will die with
-the web process; `"authenticated":false` means `FOCI_API_KEYS` did not take and every
+Every field matters. `"queue":"thread"` means Redis did not connect and jobs will die with
+the web process; `"database":"sqlite"` means `DATABASE_URL` did not take and the data is on a
+disk Render discards; `"authenticated":false` means `FOCI_API_KEYS` did not take and every
 authenticated route is returning 503.
+
+`warnings` is the same three checks in plain English, and an empty list is the only good
+answer. The web UI shows anything in it as a banner across the top of every page, so a
+deployment that is quietly throwing its data away says so on screen rather than waiting to be
+asked.
 
 ---
 
@@ -228,7 +235,42 @@ CLI, which writes as that tenant.
 
 **No data yet.** A key opens the API, but a fresh database is empty. Run a screen
 (`foci-screen screen --agency ...`, or `POST /v1/screens`) before expecting the dashboard to
-show anything. An empty database and a closed API are different problems with the same symptom.
+show anything. An empty database and a closed API are different problems with the same symptom,
+so the overview now says which one it is instead of drawing eight charts of zeros.
+
+## Deployed as a single web service instead of the blueprint
+
+**New → Web Service** on the repository gets you a running site and none of its backing
+resources. It looks fine. `/health` reports what is actually missing:
+
+```json
+{"queue":"thread","database":"sqlite","authenticated":true,"warnings":["…"]}
+```
+
+That deployment keeps its database in the container's filesystem, which Render replaces on
+every deploy, every restart and every scale event. Snapshots are the baseline the change
+detection compares against — losing them means the next run sees every document as new, which
+is both a wave of false findings and the loss of the only thing that would have caught a real
+change. The banner in the UI says so now, but the fix is the point:
+
+**Either** re-create it as a Blueprint (**New → Blueprint** on the same repository), which
+brings up Postgres, Key Value, the API, the worker and the cron job with the connections
+already wired — then delete the standalone service.
+
+**Or** attach the pieces to the service you have:
+
+1. **New → Postgres** (`basic-256mb`), then on the web service set `DATABASE_URL` to its
+   *internal* connection string.
+2. **New → Key Value**, then set `REDIS_URL` to its internal URL.
+3. **New → Background Worker** from the same repository, runtime Docker, dockerfile path
+   `./Dockerfile.worker`, plan `standard` (Chromium OOMs on `starter`), with the same
+   `DATABASE_URL`, `REDIS_URL` and `FOCI_USER_AGENT`. Without it, `queue: rq` is worse than
+   `thread`: screens queue and nothing ever runs them.
+
+Confirm with `curl https://<your-api>.onrender.com/health` — `"database":"postgres"`,
+`"queue":"rq"` and `"warnings":[]`. Note that moving to Postgres starts the history over;
+anything screened into the SQLite copy is not carried across, and was going to be discarded
+anyway.
 
 ## Costs and gotchas
 

@@ -467,6 +467,10 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("FOCI_OUT", str(tmp_path / "out"))
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.delenv("REDIS_URL", raising=False)
+    # Otherwise a run *on* one of these platforms fails the "sound deployment"
+    # assertions for reasons that have nothing to do with the code under test.
+    for var in ("RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID"):
+        monkeypatch.delenv(var, raising=False)
 
     import importlib
 
@@ -535,6 +539,75 @@ def test_health_needs_no_key(client):
     # Present so a deploy can be confirmed as the intended build without a key.
     assert "version" in body
     assert body["authenticated"] is True
+
+
+def test_health_is_quiet_when_nothing_is_misconfigured(client):
+    """A warning that fires on a correct local install is a warning nobody
+    reads by the third time they see it."""
+    c, _ = client
+    assert c.get("/health").json()["warnings"] == []
+
+
+def _reloaded_app(tmp_path, monkeypatch, **env):
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("FOCI_DB", str(tmp_path / "health.db"))
+    monkeypatch.setenv("FOCI_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("FOCI_OUT", str(tmp_path / "out"))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    for var in ("RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID"):
+        monkeypatch.delenv(var, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    from foci_screen.api import app as app_module
+    importlib.reload(app_module)
+    return TestClient(app_module.app)
+
+
+def test_health_warns_that_a_managed_host_discards_a_sqlite_database(tmp_path, monkeypatch):
+    """The failure this tool cannot survive, and the one nothing reveals.
+
+    Snapshots *are* the change-detection baseline. On an ephemeral filesystem
+    every restart throws them away, so the next run reads every document as
+    new — the alert storm the whole design exists to prevent. From outside,
+    that deployment is indistinguishable from a healthy one: it answers, it
+    renders, and the data quietly goes.
+    """
+    c = _reloaded_app(tmp_path, monkeypatch, RENDER="true",
+                      FOCI_API_KEYS="acme:secret-key")
+    warnings = c.get("/health").json()["warnings"]
+
+    assert any("DATABASE_URL" in w and "Render" in w for w in warnings), warnings
+    # No Redis either: a screen would run in the web process and die with it.
+    assert any("REDIS_URL" in w for w in warnings), warnings
+
+
+def test_health_reports_a_closed_api_as_a_warning(tmp_path, monkeypatch):
+    c = _reloaded_app(tmp_path, monkeypatch, FOCI_API_KEYS="")
+    warnings = c.get("/health").json()["warnings"]
+    assert any("FOCI_API_KEYS" in w for w in warnings), warnings
+
+
+def test_sqlite_alone_is_not_a_warning(tmp_path, monkeypatch):
+    """SQLite is the right answer for the CLI and for local development. It is
+    only wrong where the disk does not survive a restart."""
+    c = _reloaded_app(tmp_path, monkeypatch, FOCI_API_KEYS="acme:secret-key")
+    assert c.get("/health").json()["warnings"] == []
+
+
+def test_managed_host_is_named_so_a_warning_can_say_where(monkeypatch):
+    from foci_screen.config import Config
+
+    for var in ("RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID"):
+        monkeypatch.delenv(var, raising=False)
+    assert Config().managed_host == ""
+
+    monkeypatch.setenv("FLY_APP_NAME", "foci")
+    assert Config().managed_host == "Fly.io"
 
 
 def test_authenticated_routes_reject_missing_and_wrong_keys(client):
