@@ -480,6 +480,10 @@ secrets, personal email addresses and home paths, but it keeps government contac
 and it quotes draft notices naming real contractors. In a public repository that combination is
 a liability rather than a record. Generate it locally, read it, and decide per destination.
 
+Every tool in `tools/` is Python, so the repository runs the same way on Windows, macOS and
+Linux. The only non-Python code is the web interface's HTML, CSS and JavaScript, which a
+browser requires.
+
 ### Deploying to Render
 
 `render.yaml` is a Blueprint: in Render, **New → Blueprint** against the repository. It defines
