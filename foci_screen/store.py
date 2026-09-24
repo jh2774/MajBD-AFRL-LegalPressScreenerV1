@@ -290,6 +290,22 @@ def postgres_driver_available() -> bool:
     return True
 
 
+# SQLite has no default LIKE escape character, so it has to be named in the
+# statement. Postgres defaults to backslash and accepts the clause as written.
+ESC = "ESCAPE '\\'"
+
+
+def _like(q: str) -> str:
+    r"""A LIKE pattern that matches `q` literally.
+
+    `%` and `_` are wildcards, so an unescaped search term quietly means
+    something other than what was typed. The backslash is escaped first, or it
+    would escape the escapes. Pair every pattern with `ESC`.
+    """
+    escaped = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
 def _statements(ddl: str) -> list[str]:
     """Split DDL into statements, ignoring `--` comments.
 
@@ -1048,12 +1064,37 @@ class Store:
                 " ko_email, ko_source, ko_confidence, ip_clauses, source_url,"
                 " is_subaward, prime_award_id, prime_recipient_name, updated_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                # Every column except the identity of the row. The update list
+                # used to carry entity_name but not entity_key, uei or
+                # country_of_incorporation, so an award that changed hands kept
+                # the old contractor's key under the new contractor's name, and
+                # an entity whose incorporation country moved to a covered
+                # nation went on reading as it did the first time it was seen.
+                # Those are the fields a FOCI screen exists to watch; holding
+                # the reassuring first value is the worst available answer.
                 " ON CONFLICT (tenant_id, contract_key) DO UPDATE SET"
-                " run_id=excluded.run_id, amount=excluded.amount,"
-                " entity_name=excluded.entity_name, ko_name=excluded.ko_name,"
+                " run_id=excluded.run_id, piid=excluded.piid,"
+                " award_id=excluded.award_id, entity_key=excluded.entity_key,"
+                " entity_name=excluded.entity_name, agency=excluded.agency,"
+                " sub_agency=excluded.sub_agency, amount=excluded.amount,"
+                " start_date=excluded.start_date, end_date=excluded.end_date,"
+                " naics_description=excluded.naics_description,"
+                " psc_description=excluded.psc_description,"
+                " description=excluded.description,"
+                " solicitation_id=excluded.solicitation_id,"
+                " recipient_uei=excluded.recipient_uei,"
+                " recipient_country=excluded.recipient_country,"
+                " country_of_incorporation=excluded.country_of_incorporation,"
+                " foreign_owned=excluded.foreign_owned,"
+                " foreign_funding=excluded.foreign_funding,"
+                " ko_name=excluded.ko_name,"
                 " ko_email=excluded.ko_email, ko_source=excluded.ko_source,"
                 " ko_confidence=excluded.ko_confidence,"
-                " ip_clauses=excluded.ip_clauses, updated_at=excluded.updated_at",
+                " ip_clauses=excluded.ip_clauses, source_url=excluded.source_url,"
+                " is_subaward=excluded.is_subaward,"
+                " prime_award_id=excluded.prime_award_id,"
+                " prime_recipient_name=excluded.prime_recipient_name,"
+                " updated_at=excluded.updated_at",
                 (self.tenant_id, key, run_id, contract.piid, contract.award_id,
                  entity_key, contract.recipient_name, contract.awarding_agency,
                  contract.awarding_sub_agency, float(contract.award_amount or 0),
@@ -1072,26 +1113,53 @@ class Store:
                         (self.tenant_id, contract_key))
         return _decode_contract(row) if row else None
 
+    FILTERABLE = {"entity_key", "ko_email", "agency", "sub_agency", "run_id"}
+
     def contracts_where(self, column: str, value: str, limit: int = 200) -> list[dict]:
         """Contracts filtered on one indexed column. `column` is never user input."""
-        if column not in {"entity_key", "ko_email", "agency", "sub_agency", "run_id"}:
+        if column not in self.FILTERABLE:
             raise ValueError(f"not a filterable column: {column}")
         rows = self._query(
             f"SELECT * FROM contracts WHERE tenant_id=? AND {column}=?"
             " ORDER BY amount DESC LIMIT ?", (self.tenant_id, value, limit))
         return [_decode_contract(r) for r in rows]
 
+    def contract_totals(self, column: str, value: str) -> dict:
+        """COUNT and SUM over *every* matching row, not the page that was read.
+
+        `contracts_where` returns the top 200 by amount. Summing that list and
+        calling the result an entity's obligated total is wrong the moment a
+        contractor has more than 200 awards, and wrong quietly — a dollar
+        figure that looks authoritative and understates by however much the
+        tail holds. The totals come from the database; the list stays capped.
+        """
+        if column not in self.FILTERABLE:
+            raise ValueError(f"not a filterable column: {column}")
+        row = self._one(
+            f"SELECT COUNT(*) AS contract_count, COALESCE(SUM(amount), 0) AS obligated"
+            f" FROM contracts WHERE tenant_id=? AND {column}=?",
+            (self.tenant_id, value))
+        return {"contract_count": int(row["contract_count"] or 0),
+                "obligated": float(row["obligated"] or 0.0)}
+
     # ----------------------------------------------------------------- search
     # LOWER(col) LIKE ? rather than ILIKE: Postgres LIKE is case-sensitive and
     # SQLite has no ILIKE, so this is the one form that means the same thing in
     # both. At this row count the lost index is not worth two code paths.
+    #
+    # Every pattern goes through `_like`, and every clause carries {ESC}. The
+    # query is parameterised, so a wildcard in the search box was never an
+    # injection — it was a wrong answer: "SPACE_SYSTEMS" matched
+    # "SPACEXSYSTEMS", and a search for "%" returned the whole table as though
+    # everything in it matched.
     def search_contracts(self, q: str, limit: int = 25) -> list[dict]:
-        like = f"%{q.lower()}%"
+        like = _like(q)
         rows = self._query(
             "SELECT * FROM contracts WHERE tenant_id=? AND ("
-            " LOWER(piid) LIKE ? OR LOWER(award_id) LIKE ?"
-            " OR LOWER(solicitation_id) LIKE ? OR LOWER(description) LIKE ?"
-            " OR LOWER(psc_description) LIKE ? OR LOWER(naics_description) LIKE ?)"
+            f" LOWER(piid) LIKE ? {ESC} OR LOWER(award_id) LIKE ? {ESC}"
+            f" OR LOWER(solicitation_id) LIKE ? {ESC} OR LOWER(description) LIKE ? {ESC}"
+            f" OR LOWER(psc_description) LIKE ? {ESC}"
+            f" OR LOWER(naics_description) LIKE ? {ESC})"
             " ORDER BY amount DESC LIMIT ?",
             (self.tenant_id, like, like, like, like, like, like, limit))
         return [_decode_contract(r) for r in rows]
@@ -1106,8 +1174,8 @@ class Store:
                " MAX(foreign_owned) AS foreign_owned"
                " FROM contracts WHERE tenant_id=?")
         if q:
-            sql += " AND (LOWER(entity_name) LIKE ? OR LOWER(entity_key) LIKE ?)"
-            like = f"%{q.lower()}%"
+            sql += f" AND (LOWER(entity_name) LIKE ? {ESC} OR LOWER(entity_key) LIKE ? {ESC})"
+            like = _like(q)
             params += [like, like]
         sql += " GROUP BY entity_key ORDER BY SUM(amount) DESC LIMIT ?"
         params.append(limit)
@@ -1133,8 +1201,8 @@ class Store:
                " FROM contracts WHERE tenant_id=? AND ko_email IS NOT NULL"
                " AND ko_email != ''")
         if q:
-            sql += " AND (LOWER(ko_email) LIKE ? OR LOWER(ko_name) LIKE ?)"
-            like = f"%{q.lower()}%"
+            sql += f" AND (LOWER(ko_email) LIKE ? {ESC} OR LOWER(ko_name) LIKE ? {ESC})"
+            like = _like(q)
             params += [like, like]
         sql += " GROUP BY ko_email ORDER BY SUM(amount) DESC LIMIT ?"
         params.append(limit)
@@ -1147,12 +1215,54 @@ class Store:
                " COUNT(DISTINCT ko_email) AS officer_count"
                " FROM contracts WHERE tenant_id=? AND agency IS NOT NULL AND agency != ''")
         if q:
-            sql += " AND (LOWER(agency) LIKE ? OR LOWER(sub_agency) LIKE ?)"
-            like = f"%{q.lower()}%"
+            sql += f" AND (LOWER(agency) LIKE ? {ESC} OR LOWER(sub_agency) LIKE ? {ESC})"
+            like = _like(q)
             params += [like, like]
         sql += " GROUP BY agency, sub_agency ORDER BY SUM(amount) DESC LIMIT ?"
         params.append(limit)
         return self._query(sql, tuple(params))
+
+    # An agency page is reached by either name, so both have to match. Doing
+    # this in Python over `search_officers("", limit=200)` had two faults: it
+    # saw only the 200 best-funded officers in the tenant, and it compared
+    # against `MAX(agency)`, which for an officer working across two agencies
+    # is whichever sorted higher. A sub-agency matched nothing at all.
+    def officers_for_agency(self, name: str, limit: int = 200) -> list[dict]:
+        return self._query(
+            "SELECT ko_email, MAX(ko_name) AS ko_name,"
+            " MAX(ko_confidence) AS ko_confidence, MAX(ko_source) AS ko_source,"
+            " COUNT(*) AS contract_count, SUM(amount) AS obligated,"
+            " COUNT(DISTINCT entity_key) AS entity_count,"
+            " MAX(agency) AS agency"
+            " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)"
+            " AND ko_email IS NOT NULL AND ko_email != ''"
+            " GROUP BY ko_email ORDER BY SUM(amount) DESC LIMIT ?",
+            (self.tenant_id, name, name, limit))
+
+    def entities_for_agency(self, name: str, limit: int = 200) -> list[dict]:
+        """Contractors under an agency, aggregated in SQL over every award."""
+        rows = self._query(
+            "SELECT entity_key, MAX(entity_name) AS entity_name,"
+            " COUNT(*) AS contract_count, SUM(amount) AS obligated"
+            " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)"
+            " GROUP BY entity_key ORDER BY SUM(amount) DESC LIMIT ?",
+            (self.tenant_id, name, name, limit))
+        for r in rows:
+            latest = self._one(
+                "SELECT severity FROM findings WHERE tenant_id=? AND entity_key=?"
+                " ORDER BY id DESC LIMIT 1", (self.tenant_id, r["entity_key"]))
+            r["severity"] = latest["severity"] if latest else None
+        return rows
+
+    def agency_totals(self, name: str) -> dict:
+        row = self._one(
+            "SELECT COUNT(*) AS contract_count, COALESCE(SUM(amount), 0) AS obligated,"
+            " COUNT(DISTINCT entity_key) AS entity_count"
+            " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)",
+            (self.tenant_id, name, name))
+        return {"contract_count": int(row["contract_count"] or 0),
+                "obligated": float(row["obligated"] or 0.0),
+                "entity_count": int(row["entity_count"] or 0)}
 
     def search_all(self, q: str, limit: int = 10) -> dict:
         return {

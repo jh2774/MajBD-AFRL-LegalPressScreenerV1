@@ -126,6 +126,26 @@ before acting.
 4. **Server-side pagination.** Search caps at 100 rows and the UI renders all of them. Fine at
    current volumes, wrong after a few thousand awards.
 
+   Partly addressed: entity, officer and agency pages no longer *aggregate* the page they
+   render. `contract_totals` and `agency_totals` count and sum in SQL over every matching row,
+   and the UI says "showing the 200 largest of N". Those pages used to sum a 200-row list and
+   publish the result as an obligated total, which understated silently. What remains is
+   paging through the rows themselves — an offset, a next link, and a decision about whether
+   search should report a total count or just a "more" flag.
+
+5. **Detect a novated award as an event, not just a new value.** The contracts index now
+   updates `entity_key`, `recipient_uei` and `country_of_incorporation` when a re-screen sees
+   them change; before, it updated the contractor's *name* alone, so an award that changed
+   hands kept the old contractor's key under the new contractor's name, and an entity that
+   re-registered in a covered nation read as it had the first time it was seen.
+
+   Storing the truth is the floor, not the goal. An award moving to a different UEI is a
+   **novation**, and a contractor's incorporation country moving to a covered nation is the
+   most direct structural FOCI signal this tool has access to. Both should raise a signal the
+   way a changed document does, with the old and new values as evidence. The snapshot
+   machinery does this for documents; contracts have no equivalent. This is the highest-value
+   item on the list that needs no API key.
+
 ## Phase 3 - Native program
 
 **Recommendation: don't**, unless a specific customer requires an air-gapped or

@@ -223,6 +223,16 @@ function statCard(label, value) {
           <div class="label">${esc(label)}</div></div>`;
 }
 
+/* The API returns the 200 best-funded awards and the true count alongside.
+ * Rendering the page without saying it is a page invites the reader to count
+ * the rows and believe the answer. */
+function truncationNote(shown, total) {
+  if (!total || !shown || shown >= total) return "";
+  return `<div class="muted" style="font-size:12px;margin-bottom:10px">
+    Showing the ${num(shown)} largest of ${num(total)} awards. The totals above
+    cover all ${num(total)}.</div>`;
+}
+
 function contractsTable(contracts) {
   if (!contracts.length) return `<div class="empty">No awards recorded.</div>`;
   const rows = contracts
@@ -573,7 +583,7 @@ async function viewEntity(key) {
 
     <div class="grid cols-3">
       ${statCard("Obligated", money(d.obligated))}
-      ${statCard("Awards", num((d.contracts || []).length))}
+      ${statCard("Awards", num(d.contract_count ?? (d.contracts || []).length))}
       ${statCard("Screens", num((d.history || []).length))}
     </div>
 
@@ -609,6 +619,7 @@ async function viewEntity(key) {
 
     <div class="card">
       <h2>Awards</h2>
+      ${truncationNote(d.contracts_shown, d.contract_count)}
       ${contractsTable(d.contracts || [])}
     </div>`;
 
@@ -951,7 +962,7 @@ async function viewOfficer(email) {
 
     <div class="grid cols-3">
       ${statCard("Obligated", money(d.obligated))}
-      ${statCard("Awards", num(d.contracts.length))}
+      ${statCard("Awards", num(d.contract_count ?? d.contracts.length))}
       ${statCard("Flagged contractors", num(d.findings.length))}
     </div>
 
@@ -973,6 +984,7 @@ async function viewOfficer(email) {
 
     <div class="card">
       <h2>Awards</h2>
+      ${truncationNote(d.contracts_shown, d.contract_count)}
       ${contractsTable(d.contracts)}
     </div>`;
 }
@@ -990,7 +1002,7 @@ async function viewAgency(name) {
 
     <div class="grid cols-3">
       ${statCard("Obligated", money(d.obligated))}
-      ${statCard("Contractors", num(d.entities.length))}
+      ${statCard("Contractors", num(d.entity_count ?? d.entities.length))}
       ${statCard("Officers", num(d.officers.length))}
     </div>
 

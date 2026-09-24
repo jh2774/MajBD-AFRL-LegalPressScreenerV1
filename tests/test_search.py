@@ -308,6 +308,196 @@ def test_entity_detail_uses_the_contracts_table(client):
     assert body["latest_finding"] is None
 
 
+# ------------------------------------------------- totals over the whole set
+#
+# `contracts_where` returns the 200 best-funded awards. Three routes used to
+# sum that list and publish the result as a total. A dollar figure that
+# silently understates is worse than one that is missing: nothing on the page
+# says it is a subtotal, and the number it produces is plausible.
+
+BULK = 205          # > the 200-row page
+BULK_AMOUNT = 1_000.0
+
+
+def _load_many(store, run_id="rbulk", entity="UEI777", agency="Department of the Interior"):
+    store.start_run("bulk", {}, run_id=run_id)
+    for i in range(BULK):
+        store.save_contract(
+            make_contract(piid=f"BULK{i:04d}", award_id=f"B{i}",
+                          recipient_name="BULK INDUSTRIES", recipient_uei=entity,
+                          awarding_agency=agency, awarding_sub_agency="Bureau of Widgets",
+                          award_amount=BULK_AMOUNT,
+                          ko_email="bulk.officer@mail.mil", ko_name="Bulk Officer"),
+            run_id, entity)
+
+
+def test_entity_totals_count_every_award_not_just_the_page(client):
+    c, app_module = client
+    _load_many(app_module.store_for("acme"))
+
+    body = c.get("/v1/entities/UEI777", headers=AUTH).json()
+    assert body["contract_count"] == BULK
+    assert body["obligated"] == BULK * BULK_AMOUNT
+    # The list itself stays capped, and says so rather than implying it is all.
+    assert body["contracts_shown"] == 200
+    assert len(body["contracts"]) == 200
+
+
+def test_officer_totals_count_every_award(client):
+    c, app_module = client
+    _load_many(app_module.store_for("acme"))
+
+    body = c.get("/v1/officers/bulk.officer@mail.mil", headers=AUTH).json()
+    assert body["contract_count"] == BULK
+    assert body["obligated"] == BULK * BULK_AMOUNT
+
+
+def test_agency_totals_count_every_award(client):
+    c, app_module = client
+    _load_many(app_module.store_for("acme"))
+
+    body = c.get("/v1/agencies/Department of the Interior", headers=AUTH).json()
+    assert body["contract_count"] == BULK
+    assert body["obligated"] == BULK * BULK_AMOUNT
+    assert body["entity_count"] == 1
+    # And the contractor roll-up is aggregated in SQL, so it agrees.
+    assert sum(e["contract_count"] for e in body["entities"]) == BULK
+    assert body["entities"][0]["obligated"] == BULK * BULK_AMOUNT
+
+
+def test_an_agency_page_lists_officers_reached_by_sub_agency(client):
+    """The page is reachable by either name, so both have to find officers.
+
+    Filtering in Python compared the requested name against `MAX(agency)`,
+    which is never a sub-agency — so every sub-agency page showed no officers
+    at all, as though nobody had awarded anything.
+    """
+    c, app_module = client
+    _load_many(app_module.store_for("acme"))
+
+    body = c.get("/v1/agencies/Bureau of Widgets", headers=AUTH).json()
+    assert [o["ko_email"] for o in body["officers"]] == ["bulk.officer@mail.mil"]
+    assert body["contract_count"] == BULK
+
+
+def test_a_small_agency_is_not_crowded_out_by_a_larger_one(client):
+    """The old filter took the tenant's 200 best-funded officers *globally* and
+    then kept the ones whose agency matched. A small agency behind 200
+    better-funded officers elsewhere showed none of its own."""
+    c, app_module = client
+    store = app_module.store_for("acme")
+    store.start_run("many", {}, run_id="rmany")
+    for i in range(205):
+        store.save_contract(
+            make_contract(piid=f"RICH{i:04d}", award_id=f"R{i}",
+                          awarding_agency="Department of Commerce",
+                          awarding_sub_agency="",
+                          award_amount=9_000_000.0 + i,
+                          ko_email=f"rich.officer{i}@mail.mil"),
+            "rmany", "UEI123")
+    # One poorly funded officer at a different, smaller agency.
+    store.save_contract(
+        make_contract(piid="POOR0001", award_id="P1",
+                      awarding_agency="Department of the Treasury",
+                      awarding_sub_agency="", award_amount=1.0,
+                      ko_email="quiet.officer@mail.mil"),
+        "rmany", "UEI123")
+
+    body = c.get("/v1/agencies/Department of the Treasury", headers=AUTH).json()
+    assert [o["ko_email"] for o in body["officers"]] == ["quiet.officer@mail.mil"]
+
+
+# --------------------------------------------------- re-screening an award
+
+
+def test_a_novated_award_moves_to_the_new_contractor(store):
+    """An award changing hands is the event this tool exists to notice.
+
+    The upsert updated `entity_name` but not `entity_key` or `recipient_uei`,
+    so a re-screen after a novation left the award filed under the old
+    contractor while displaying the new contractor's name — a row that is
+    internally inconsistent and attributes the work to the wrong company.
+    """
+    store.start_run("DoD", {}, run_id="r1")
+    store.save_contract(make_contract(recipient_name="ACME DYNAMICS LLC",
+                                      recipient_uei="UEI123"), "r1", "UEI123")
+
+    store.start_run("DoD", {}, run_id="r2")
+    store.save_contract(make_contract(recipient_name="NEWCO HOLDINGS LLC",
+                                      recipient_uei="UEI555"), "r2", "UEI555")
+
+    row = store.get_contract("N0001925C0001")
+    assert row["entity_name"] == "NEWCO HOLDINGS LLC"
+    assert row["entity_key"] == "UEI555", "the award did not move with the name"
+    assert row["recipient_uei"] == "UEI555"
+    # And it is reachable under the new contractor, not the old one.
+    assert len(store.contracts_where("entity_key", "UEI555")) == 1
+    assert store.contracts_where("entity_key", "UEI123") == []
+
+
+def test_a_change_of_incorporation_country_is_not_held_at_its_first_value(store):
+    """The most direct structural FOCI signal in this table.
+
+    `country_of_incorporation` and `foreign_owned` were absent from the update
+    list, so an entity that re-registered in a covered nation went on reading
+    as it did the day it was first seen — and `search_entities` reports
+    MAX(...) of exactly those columns.
+    """
+    store.start_run("DoD", {}, run_id="r1")
+    store.save_contract(make_contract(country_of_incorporation="USA"), "r1", "UEI123")
+
+    store.start_run("DoD", {}, run_id="r2")
+    store.save_contract(make_contract(country_of_incorporation="CHN",
+                                      foreign_owned_and_located=True), "r2", "UEI123")
+
+    row = store.get_contract("N0001925C0001")
+    assert row["country_of_incorporation"] == "CHN"
+    assert row["foreign_owned"] == 1
+
+    listed = store.search_entities("acme")[0]
+    assert listed["country_of_incorporation"] == "CHN"
+
+
+def test_a_reassigned_contracting_officer_replaces_the_old_one(store):
+    """Already worked; asserted so the widened update list keeps it that way.
+    Notices go to whoever holds the award now."""
+    store.start_run("DoD", {}, run_id="r1")
+    store.save_contract(make_contract(ko_email="jane.doe@mail.mil"), "r1", "UEI123")
+    store.start_run("DoD", {}, run_id="r2")
+    store.save_contract(make_contract(ko_email="new.officer@mail.mil"), "r2", "UEI123")
+
+    assert store.get_contract("N0001925C0001")["ko_email"] == "new.officer@mail.mil"
+
+
+# ------------------------------------------------------- literal search terms
+
+def test_an_underscore_in_a_search_term_is_not_a_wildcard(store):
+    store.start_run("DoD", {}, run_id="r1")
+    # Distinct PIIDs: the contract key is the award, so reusing one would
+    # update a single row rather than index two contractors.
+    store.save_contract(make_contract(piid="P001", award_id="W1",
+                                      recipient_name="SPACE_SYSTEMS CORP",
+                                      recipient_uei="UEI001"), "r1", "UEI001")
+    store.save_contract(make_contract(piid="P002", award_id="W2",
+                                      recipient_name="SPACEXSYSTEMS CORP",
+                                      recipient_uei="UEI002"), "r1", "UEI002")
+
+    names = {r["entity_name"] for r in store.search_entities("space_systems")}
+    assert names == {"SPACE_SYSTEMS CORP"}
+
+
+def test_a_percent_sign_does_not_match_everything(store):
+    store.start_run("DoD", {}, run_id="r1")
+    store.save_contract(make_contract(), "r1", "UEI123")
+    store.save_contract(make_contract(piid="X2", award_id="A2",
+                                      description="Contract for 50% of the fleet"),
+                        "r1", "UEI123")
+
+    assert store.search_entities("%") == []
+    # But a percent sign that really is in the text still matches.
+    assert len(store.search_contracts("50%")) == 1
+
+
 def test_search_endpoints_need_a_key(client):
     c, _ = client
     assert c.get("/v1/search?q=acme").status_code == 401

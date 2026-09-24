@@ -211,6 +211,7 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
         raise HTTPException(404, "Nothing recorded for that entity.")
 
     latest = findings[0] if findings else None
+    totals = store.contract_totals("entity_key", key)
     return {
         "entity": (latest or {}).get("entity", {"name": contracts[0]["entity_name"],
                                                 "uei": contracts[0]["recipient_uei"]}
@@ -218,7 +219,10 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
         # From the contracts table, not the finding payload: an entity screened
         # again with no new signal still has its awards.
         "contracts": contracts,
-        "obligated": sum(c["amount"] or 0 for c in contracts),
+        # Over every award, not over the page above — see `contract_totals`.
+        "obligated": totals["obligated"],
+        "contract_count": totals["contract_count"],
+        "contracts_shown": len(contracts),
         "latest_finding": latest,
         "history": store.entity_history(key),
     }
@@ -308,8 +312,9 @@ def officer_profile(email: str, store: Store = Depends(tenant_store)) -> dict:
             "source": contracts[0].get("ko_source"),
             "agency": contracts[0].get("agency"),
         },
-        "obligated": sum(c["amount"] or 0 for c in contracts),
+        **store.contract_totals("ko_email", email),
         "contracts": contracts,
+        "contracts_shown": len(contracts),
         "findings": sorted(findings, key=lambda f: -(f.get("total_score") or 0)),
     }
 
@@ -328,25 +333,16 @@ def agency_profile(name: str, store: Store = Depends(tenant_store)) -> dict:
     if not contracts:
         raise HTTPException(404, "No contracts recorded for that agency.")
 
-    by_entity: dict[str, dict] = {}
-    for c in contracts:
-        row = by_entity.setdefault(c["entity_key"],
-                                   {"entity_key": c["entity_key"],
-                                    "entity_name": c["entity_name"],
-                                    "obligated": 0.0, "contract_count": 0})
-        row["obligated"] += c["amount"] or 0
-        row["contract_count"] += 1
-    for row in by_entity.values():
-        latest = store.search_findings(entity_key=row["entity_key"], limit=1)
-        row["severity"] = latest[0].get("severity") if latest else None
-
+    # Totals, contractors and officers all come from SQL over the whole agency.
+    # Aggregating the 200-row page above understated every figure on the page,
+    # and the officer list was filtered from the tenant's 200 best-funded
+    # officers on a column that holds only one of an officer's agencies.
     return {
         "agency": name,
-        "obligated": sum(c["amount"] or 0 for c in contracts),
-        "contract_count": len(contracts),
-        "entities": sorted(by_entity.values(), key=lambda r: -r["obligated"]),
-        "officers": [o for o in store.search_officers("", limit=200)
-                     if o.get("agency") == name],
+        **store.agency_totals(name),
+        "contracts_shown": len(contracts),
+        "entities": store.entities_for_agency(name),
+        "officers": store.officers_for_agency(name),
     }
 
 
