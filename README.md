@@ -442,8 +442,27 @@ A signal is identified by a hash of its rule and its evidence, not by the render
 rewording a rule's rationale does not orphan the verdicts already recorded against it. Findings
 written before this existed get an id computed on read, so old findings can still be marked.
 
-This is the input that the two open ranking problems need: retiring rules that do not earn
-their place, and ordering contractors by risk rather than by obligated dollars.
+### Acting on it
+
+Seeing that a rule does not earn its place is only useful if you can do something about it
+without a deploy. The same page carries a weight and an on/off switch per rule:
+
+| | |
+|---|---|
+| `GET /v1/rules` | Every rule seen here, with its precision and its settings |
+| `PUT /v1/rules/{rule_id}` | Disable it, or scale its weight (0–5) |
+| `DELETE /v1/rules/{rule_id}` | Drop the override, back to the engine default |
+
+- **Weight rescales the score and the severity band is recomputed from the result.** A rule
+  scored down to 2.0 does not keep a "critical" label it no longer earns.
+- **A disabled rule is removed before anything compounds**, so a rule you retired cannot
+  escalate a contractor by pairing with another through the compound rule.
+- **Reset deletes the override rather than writing 1.0**, so a later change to the engine
+  default takes effect for you.
+- Settings are per tenant and apply to the **next** screen, not to findings already recorded.
+
+This is also the input the remaining ranking problem needs: ordering contractors by risk
+rather than by obligated dollars.
 
 ## Session log
 

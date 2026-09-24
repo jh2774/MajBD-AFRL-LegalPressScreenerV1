@@ -354,6 +354,14 @@ class Screener:
         signals = engine.evaluate_documents(pairs, entity, contracts)
         signals += engine.evaluate_contracts(contracts, entity)
 
+        # Tenant overrides, applied before anything compounds: a retired rule
+        # must not be able to escalate something by pairing with another.
+        settings = self.store.rule_settings()
+        before = len(signals)
+        signals = engine.apply_rule_settings(signals, settings)
+        if before != len(signals):
+            progress(f"  {before - len(signals)} signal(s) dropped by rule settings.")
+
         # First time we see an entity everything looks "new"; that would mark a
         # baseline scan as urgent. Damp it unless the evidence is independently strong.
         seen_before = self.store.previous_signal_ids(entity.key(), exclude_run=run_id)

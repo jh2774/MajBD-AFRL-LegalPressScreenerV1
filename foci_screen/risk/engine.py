@@ -8,7 +8,7 @@ quotable basis — a KO will not act on "the model said so".
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..models import SEVERITY_ORDER, Change, Contract, Document, Entity, Finding, Signal
 from . import lexicon as lex
@@ -576,6 +576,39 @@ def dedupe(signals: list[Signal]) -> list[Signal]:
         seen.add(key)
         out.append(s)
     return out
+
+
+MIN_RULE_WEIGHT = 0.0
+MAX_RULE_WEIGHT = 5.0
+
+
+def apply_rule_settings(signals: list[Signal],
+                        settings: dict[str, dict]) -> list[Signal]:
+    """Drop signals from disabled rules and rescale the rest.
+
+    Applied before `build_finding`, so a disabled rule cannot reach the
+    compound rule either: a rule an analyst has retired should not be able to
+    escalate something through the back door by pairing with another.
+
+    Rescaling recomputes the severity band from the new score rather than
+    keeping the old label. A signal scored down to 2.0 that still reads
+    "critical" would be worse than not rescaling at all.
+    """
+    if not settings:
+        return signals
+
+    kept: list[Signal] = []
+    for signal in signals:
+        cfg = settings.get(signal.rule_id)
+        if cfg and not cfg.get("enabled", True):
+            continue
+        weight = float((cfg or {}).get("weight", 1.0))
+        if cfg and weight != 1.0:
+            weight = max(MIN_RULE_WEIGHT, min(MAX_RULE_WEIGHT, weight))
+            score = round(signal.score * weight, 2)
+            signal = replace(signal, score=score, severity=band(score))
+        kept.append(signal)
+    return kept
 
 
 def build_finding(entity: Entity, contracts: list[Contract], signals: list[Signal],

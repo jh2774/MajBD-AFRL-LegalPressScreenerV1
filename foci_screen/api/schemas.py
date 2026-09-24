@@ -43,6 +43,18 @@ class NoticeDecision(BaseModel):
     decided_by: str = ""
 
 
+class RuleSetting(BaseModel):
+    """A tenant's override for one rule.
+
+    `weight` scales the rule's score; the severity band is recomputed from the
+    result, so a rule scored down cannot keep a label it no longer earns.
+    """
+    enabled: bool = True
+    weight: float = Field(1.0, ge=0.0, le=5.0)
+    note: str = ""
+    decided_by: str = ""
+
+
 class IdentityDecision(BaseModel):
     """A human verdict on which SEC registrant a contractor is.
 

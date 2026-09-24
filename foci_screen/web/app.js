@@ -89,6 +89,27 @@ async function api(path) {
   return res.json();
 }
 
+/* PUT and DELETE, which the rule settings need. Shares apiPost's error shape so
+ * callers handle failures the same way whatever the verb. */
+async function apiSend(method, path, body) {
+  const res = await fetch(path, {
+    method,
+    headers: {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch { /* not JSON */ }
+    throw { title: "Request failed", message: detail };
+  }
+  return res.status === 204 ? null : res.json();
+}
+
 async function apiPost(path, body) {
   const res = await fetch(path, {
     method: "POST",
@@ -651,18 +672,22 @@ function wireIdentity(root, key) {
 }
 
 async function viewRules() {
-  setBusy("Loading rule precision…");
-  const d = await api("/v1/rules/precision");
+  setBusy("Loading rules…");
+  const [d, catalogue] = await Promise.all([
+    api("/v1/rules/precision"),
+    api("/v1/rules"),
+  ]);
   const t = d.totals;
 
-  const rows = d.rules
+  const rows = catalogue.rules
     .map((r) => {
       const judged = r.true_positive + r.false_positive;
       const pct = r.precision === null ? null : Math.round(r.precision * 100);
       const colour = pct === null ? "var(--info)"
         : pct >= 80 ? "var(--low)" : pct >= 50 ? "var(--medium)" : "var(--critical)";
-      return `<tr>
-        <td class="mono">${esc(r.rule_id)}</td>
+      return `<tr data-rule="${esc(r.rule_id)}" ${r.enabled ? "" : 'class="rule-off"'}>
+        <td class="mono">${esc(r.rule_id)}
+          ${r.overridden ? '<span class="pill">tuned</span>' : ""}</td>
         <td>${esc(CATEGORY_LABEL[r.category] || r.category || "—")}</td>
         <td class="num">${esc(num(r.true_positive))}</td>
         <td class="num">${esc(num(r.false_positive))}</td>
@@ -671,6 +696,13 @@ async function viewRules() {
           ? '<span class="muted">not measured</span>'
           : `<strong style="color:${colour}">${pct}%</strong>
              <span class="muted">of ${judged}</span>`}</td>
+        <td class="num"><input class="rule-weight" type="number" min="0" max="5"
+             step="0.1" value="${esc(r.weight)}" aria-label="weight"></td>
+        <td>
+          <button class="rule-toggle ${r.enabled ? "" : "primary"}">
+            ${r.enabled ? "Disable" : "Enable"}</button>
+          ${r.overridden ? '<button class="ghost rule-reset">Reset</button>' : ""}
+        </td>
       </tr>`;
     })
     .join("");
@@ -690,21 +722,59 @@ async function viewRules() {
                    : Math.round(t.overall_precision * 100) + "%")}
     </div>
 
-    ${d.rules.length ? `<div class="card">
+    ${catalogue.rules.length ? `<div class="card">
       <div class="table-wrap"><table>
         <thead><tr><th>Rule</th><th>Category</th><th class="num">Confirmed</th>
         <th class="num">False positive</th><th class="num">Unclear</th>
-        <th class="num">Precision</th></tr></thead>
+        <th class="num">Precision</th><th class="num">Weight</th><th></th></tr></thead>
         <tbody>${rows}</tbody></table></div>
       <div class="muted" style="font-size:12px;margin-top:12px">
         "Unclear" is counted but kept out of the precision denominator: a reviewer
         who could not tell has not said the rule was wrong, and folding that in
         would punish rules that raise genuinely hard questions. A rule with no
         verdicts reads "not measured" rather than 100% — unmeasured is not the
-        same as perfect.</div>
+        same as perfect.<br>
+        Weight scales a rule's score and the severity band is recomputed from the
+        result, so a rule scored down cannot keep a label it no longer earns.
+        Changes apply to the next screen, not to findings already recorded.</div>
     </div>` : `<div class="card"><div class="empty">
-      No verdicts recorded yet. Open a contractor and mark its signals
+      No rules have fired here yet. Run a screen, then mark its signals
       confirmed or false positive; they collect here.</div></div>`}`;
+
+  view.querySelectorAll("tr[data-rule]").forEach((row) => {
+    const ruleId = row.dataset.rule;
+    const weightBox = row.querySelector(".rule-weight");
+
+    const save = async (enabled, weight) => {
+      try {
+        await apiSend("PUT", `/v1/rules/${encodeURIComponent(ruleId)}`,
+                      { enabled, weight: Number(weight) });
+        route();
+      } catch (e) {
+        showError(e);
+      }
+    };
+
+    const isOff = () => row.classList.contains("rule-off");
+    const toggle = row.querySelector(".rule-toggle");
+    if (toggle) {
+      toggle.onclick = () => save(isOff(), weightBox ? weightBox.value : 1);
+    }
+    if (weightBox) {
+      weightBox.onchange = () => save(!isOff(), weightBox.value);
+    }
+    const reset = row.querySelector(".rule-reset");
+    if (reset) {
+      reset.onclick = async () => {
+        try {
+          await apiSend("DELETE", `/v1/rules/${encodeURIComponent(ruleId)}`);
+          route();
+        } catch (e) {
+          showError(e);
+        }
+      };
+    }
+  });
 }
 
 function documentsTable(docs, entityKey) {

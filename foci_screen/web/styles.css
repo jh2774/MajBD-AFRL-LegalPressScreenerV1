@@ -317,6 +317,23 @@ td.num + td, th.num + th { padding-left: 18px; }
 
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
 
+/* A disabled rule stays listed rather than disappearing: knowing a rule is off
+   matters as much as knowing it exists. */
+tr.rule-off td { opacity: 0.45; }
+tr.rule-off .rule-toggle { opacity: 1; }
+
+.rule-weight {
+  width: 68px;
+  padding: 3px 6px;
+  text-align: right;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+}
+
 /* Verdict controls sit under a signal's evidence, where the reviewer is
    already looking, rather than on a separate screen. */
 .verdict {

@@ -201,6 +201,19 @@ CREATE TABLE IF NOT EXISTS entity_links (
     updated_at    TEXT NOT NULL,
     PRIMARY KEY (tenant_id, entity_key)
 );
+-- Per-tenant rule configuration. The weights in risk/engine.py are defaults,
+-- not law; an analyst who can see from the precision report that a rule does
+-- not earn its place should be able to retire it without a deploy.
+CREATE TABLE IF NOT EXISTS rule_settings (
+    tenant_id  TEXT NOT NULL DEFAULT 'default',
+    rule_id    TEXT NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    weight     REAL NOT NULL DEFAULT 1.0,
+    note       TEXT,
+    decided_by TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, rule_id)
+);
 CREATE TABLE IF NOT EXISTS watchlists (
     watchlist_id TEXT PRIMARY KEY,
     tenant_id    TEXT NOT NULL DEFAULT 'default',
@@ -823,6 +836,60 @@ class Store:
         # Worst first: the point of the page is finding rules to retire.
         return sorted(out, key=lambda e: (e["precision"] if e["precision"] is not None
                                           else 2, -e["reviewed"]))
+
+    # ------------------------------------------------------------ rule settings
+    def rule_settings(self) -> dict[str, dict]:
+        """Tenant overrides, keyed by rule id. Absent means engine defaults."""
+        rows = self._query("SELECT * FROM rule_settings WHERE tenant_id=?",
+                           (self.tenant_id,))
+        return {r["rule_id"]: {"enabled": bool(r["enabled"]),
+                               "weight": float(r["weight"]),
+                               "note": r["note"] or "",
+                               "decided_by": r["decided_by"] or "",
+                               "updated_at": r["updated_at"]} for r in rows}
+
+    def set_rule_setting(self, rule_id: str, *, enabled: bool = True,
+                         weight: float = 1.0, note: str = "",
+                         decided_by: str = "") -> dict:
+        weight = max(0.0, min(5.0, float(weight)))
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO rule_settings (tenant_id, rule_id, enabled, weight, note,"
+                " decided_by, updated_at) VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT (tenant_id, rule_id) DO UPDATE SET"
+                " enabled=excluded.enabled, weight=excluded.weight, note=excluded.note,"
+                " decided_by=excluded.decided_by, updated_at=excluded.updated_at",
+                (self.tenant_id, rule_id, 1 if enabled else 0, weight, note,
+                 decided_by, _now()))
+        return self.rule_settings().get(rule_id, {})
+
+    def clear_rule_setting(self, rule_id: str) -> None:
+        """Back to the engine default, which is not the same as weight 1.0 —
+        it removes the row, so a later change to the default takes effect."""
+        with self._tx() as c:
+            c.execute("DELETE FROM rule_settings WHERE tenant_id=? AND rule_id=?",
+                      (self.tenant_id, rule_id))
+
+    def rules_seen(self, limit_findings: int = 300) -> dict[str, str]:
+        """Rule ids that have actually fired here, mapped to their category.
+
+        The engine's rule ids are string literals inside the rule functions and
+        cannot be enumerated reliably, so the catalogue is built from what has
+        been observed rather than from a hand-maintained list that would drift.
+        """
+        rows = self._query("SELECT payload FROM findings WHERE tenant_id=?"
+                           " ORDER BY id DESC LIMIT ?", (self.tenant_id, limit_findings))
+        seen: dict[str, str] = {}
+        for r in rows:
+            try:
+                payload = json.loads(r["payload"])
+            except (ValueError, TypeError):
+                continue
+            for s in payload.get("signals", []):
+                rule_id = s.get("rule_id")
+                if rule_id:
+                    seen.setdefault(rule_id, s.get("category") or "")
+        return seen
 
     # --------------------------------------------------------- entity identity
     LINK_STATUSES = ("auto", "confirmed", "rejected")

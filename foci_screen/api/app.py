@@ -29,6 +29,7 @@ from . import auth
 from .schemas import (
     IdentityDecision,
     NoticeDecision,
+    RuleSetting,
     ScreenRequest,
     SignalDisposition,
     WatchlistRequest,
@@ -365,6 +366,54 @@ def record_disposition(body: SignalDisposition,
         note=body.note, decided_by=body.decided_by.strip() or f"api-key:{tenant}",
         run_id=body.run_id)
     return {"signal_id": body.signal_id, "verdict": body.verdict}
+
+
+@app.get("/v1/rules", tags=["rules"])
+def list_rules(store: Store = Depends(tenant_store)) -> dict:
+    """Every rule seen here, with its precision and its tenant settings.
+
+    One view rather than two, because the decision is one decision: a rule's
+    measured precision is the reason to change its weight or switch it off.
+    """
+    precision = {r["rule_id"]: r for r in store.rule_precision()}
+    settings = store.rule_settings()
+    catalogue = store.rules_seen()
+
+    rows = []
+    for rule_id in sorted(set(catalogue) | set(precision) | set(settings)):
+        measured = precision.get(rule_id, {})
+        override = settings.get(rule_id)
+        rows.append({
+            "rule_id": rule_id,
+            "category": measured.get("category") or catalogue.get(rule_id, ""),
+            "enabled": override["enabled"] if override else True,
+            "weight": override["weight"] if override else 1.0,
+            "overridden": override is not None,
+            "note": (override or {}).get("note", ""),
+            "true_positive": measured.get("true_positive", 0),
+            "false_positive": measured.get("false_positive", 0),
+            "unclear": measured.get("unclear", 0),
+            "precision": measured.get("precision"),
+        })
+    return {"rules": rows}
+
+
+@app.put("/v1/rules/{rule_id}", tags=["rules"])
+def set_rule(rule_id: str, body: RuleSetting,
+             tenant: str = Depends(require_tenant)) -> dict:
+    """Override a rule for this tenant. Takes effect on the next screen."""
+    store = store_for(tenant)
+    store.set_rule_setting(
+        rule_id, enabled=body.enabled, weight=body.weight, note=body.note,
+        decided_by=body.decided_by.strip() or f"api-key:{tenant}")
+    return {"rule_id": rule_id, **store.rule_settings().get(rule_id, {})}
+
+
+@app.delete("/v1/rules/{rule_id}", status_code=204, tags=["rules"])
+def clear_rule(rule_id: str, tenant: str = Depends(require_tenant)) -> Response:
+    """Drop the override and go back to the engine default."""
+    store_for(tenant).clear_rule_setting(rule_id)
+    return Response(status_code=204)
 
 
 @app.get("/v1/rules/precision", tags=["dispositions"])

@@ -114,9 +114,15 @@ before acting.
    Remaining here: **per-person attribution.** Decisions record `api-key:<tenant>` because keys
    are shared. For an approval trail on notices to federal officials, that should become the
    signed-in reviewer — which is the SSO item under Phase 1 auth, not a UI change.
-3. **Rule tuning.** Expose `BASE_WEIGHTS`, jurisdiction multipliers and damping factors as
-   per-tenant configuration. Analysts will want to tune them without a deploy — and rejection
-   reasons are now being captured, which is the data that makes tuning more than guesswork.
+3. ~~**Rule tuning.**~~ **Done at rule granularity.** Per-tenant enable/disable and a weight
+   multiplier, on the same page as the precision that justifies changing them. Disabled rules
+   are removed before `correlate`, so a retired rule cannot compound; rescaling rebands, so a
+   rule scored down cannot keep a severity it no longer earns.
+
+   Still open: **tuning below rule granularity** — individual jurisdiction multipliers and the
+   evidence-damping factors are still engine constants. They are shared across rules, so
+   exposing them per tenant means deciding what happens when two tenants disagree about what
+   "China" is worth, which is a product question rather than a plumbing one.
 4. **Server-side pagination.** Search caps at 100 rows and the UI renders all of them. Fine at
    current volumes, wrong after a few thousand awards.
 
