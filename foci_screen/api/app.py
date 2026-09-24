@@ -24,7 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from ..config import get_config
 from ..jobs import JobQueue
 from ..notify import render as render_notice
-from ..store import Store, annotate_diff
+from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_available
 from . import auth
 from .schemas import (
     IdentityDecision,
@@ -115,6 +115,8 @@ def deployment_warnings() -> list[str]:
         warnings.append(
             f"No REDIS_URL on {host}: screens would run inside the web process and "
             f"die with it mid-run. Add a Redis instance and a worker service.")
+    if not on_sqlite and not postgres_driver_available():
+        warnings.append(DRIVER_MISSING)
     return warnings
 
 

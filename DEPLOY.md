@@ -238,7 +238,7 @@ CLI, which writes as that tenant.
 show anything. An empty database and a closed API are different problems with the same symptom,
 so the overview now says which one it is instead of drawing eight charts of zeros.
 
-## Deployed as a single web service instead of the blueprint
+## Fixing a single web service, without the blueprint
 
 **New → Web Service** on the repository gets you a running site and none of its backing
 resources. It looks fine. `/health` reports what is actually missing:
@@ -251,26 +251,72 @@ That deployment keeps its database in the container's filesystem, which Render r
 every deploy, every restart and every scale event. Snapshots are the baseline the change
 detection compares against — losing them means the next run sees every document as new, which
 is both a wave of false findings and the loss of the only thing that would have caught a real
-change. The banner in the UI says so now, but the fix is the point:
+change.
 
-**Either** re-create it as a Blueprint (**New → Blueprint** on the same repository), which
-brings up Postgres, Key Value, the API, the worker and the cron job with the connections
-already wired — then delete the standalone service.
+The blueprint is not the only way out, and the three steps below are worth doing in order.
+**Step 1 is the one that matters.** Stopping after it leaves a deployment that keeps its data
+and screens correctly; steps 2 and 3 buy robustness, and cost money.
 
-**Or** attach the pieces to the service you have:
+### 1. Postgres, so the data survives a restart
 
-1. **New → Postgres** (`basic-256mb`), then on the web service set `DATABASE_URL` to its
-   *internal* connection string.
-2. **New → Key Value**, then set `REDIS_URL` to its internal URL.
-3. **New → Background Worker** from the same repository, runtime Docker, dockerfile path
+1. **New → Postgres**. Plan `basic-256mb` — the free tier expires at 30 days, and losing the
+   database is the failure this step exists to prevent. Same region as the web service.
+2. Copy its **Internal Database URL**.
+3. On the web service: **Environment → Add Environment Variable**, `DATABASE_URL` = that URL.
+4. **Save changes.** The service restarts by itself.
+
+`curl https://<your-api>.onrender.com/health` should now say `"database":"postgres"`, and the
+SQLite warning should be gone from `warnings`.
+
+If instead you see a warning about `psycopg`, the service was built without the Postgres
+extra. It is a build-command problem, not a database problem: `Dockerfile` installs
+`.[api,queue,postgres]`, so a Docker service already has the driver. A native Python service
+needs its build command set to `pip install ".[api,queue,postgres]"`.
+
+Nothing from the SQLite copy carries across. That costs nothing if no screen has run, and the
+data was going to be discarded anyway.
+
+### 2. A queue, so a screen survives the web process
+
+With `queue: thread`, `POST /v1/screens` runs the screen inside the web service in a
+background thread. It works, and it is how the CLI has always run. What it cannot do is
+survive a restart, a redeploy or an instance being recycled mid-run — and a screen takes
+minutes.
+
+1. **New → Key Value**, then set `REDIS_URL` on the web service to its internal URL.
+2. **New → Background Worker**, same repository, runtime Docker, dockerfile path
    `./Dockerfile.worker`, plan `standard` (Chromium OOMs on `starter`), with the same
-   `DATABASE_URL`, `REDIS_URL` and `FOCI_USER_AGENT`. Without it, `queue: rq` is worse than
-   `thread`: screens queue and nothing ever runs them.
+   `DATABASE_URL`, `REDIS_URL` and `FOCI_USER_AGENT`.
 
-Confirm with `curl https://<your-api>.onrender.com/health` — `"database":"postgres"`,
-`"queue":"rq"` and `"warnings":[]`. Note that moving to Postgres starts the history over;
-anything screened into the SQLite copy is not carried across, and was going to be discarded
-anyway.
+Do both or neither. `REDIS_URL` without a worker is worse than no queue at all: screens are
+accepted, queue up, and nothing ever runs them — `/health` says `queue: rq` and looks
+healthier than the state it replaced.
+
+### 3. The nightly sweep
+
+**New → Cron Job**, same repository and Dockerfile as the API, command
+`python -m foci_screen.scheduler`, schedule `0 7 * * *`, with `DATABASE_URL`, `REDIS_URL` and
+`FOCI_USER_AGENT`. It exits 2 when it cannot reach a queue, so a failed run shows as failed
+rather than green-while-screening-nothing.
+
+### Or: screen from your own machine, and let Render display it
+
+If the worker's cost is not worth it yet, point the CLI at the same Postgres and run screens
+locally. Render then serves the results and nothing needs a queue at all:
+
+```bash
+pip install ".[postgres]"
+export DATABASE_URL="<the EXTERNAL connection string from Render>"
+foci-screen screen --agency "Department of Defense" --months 6 --entities 5
+```
+
+Three things to know. The **external** URL is the one that works from outside Render, and it
+carries a password — keep it out of the repository and out of your shell history. Your
+network has to allow outbound 5432. And the CLI writes as tenant `default`, so the key you
+use in the browser must be `default:<key>` or the site will not show what you just screened.
+
+A screen run this way is identical to one the worker would have run; the only difference is
+which machine spends the minutes.
 
 ## Costs and gotchas
 

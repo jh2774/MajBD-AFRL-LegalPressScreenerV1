@@ -599,6 +599,49 @@ def test_sqlite_alone_is_not_a_warning(tmp_path, monkeypatch):
     assert c.get("/health").json()["warnings"] == []
 
 
+def test_health_warns_when_the_postgres_driver_is_missing(tmp_path, monkeypatch):
+    """A build that installed the package without the `postgres` extra boots,
+    serves the web UI, and 500s on the first query. `/health` is the only place
+    that can say so before a request goes wrong."""
+    c = _reloaded_app(tmp_path, monkeypatch, FOCI_API_KEYS="acme:secret-key",
+                      DATABASE_URL="postgres://u:p@example.invalid:5432/foci")
+    from foci_screen.api import app as app_module
+    monkeypatch.setattr(app_module, "postgres_driver_available", lambda: False)
+
+    warnings = c.get("/health").json()["warnings"]
+    assert any("psycopg" in w and "postgres" in w for w in warnings), warnings
+    # And the warning is about the driver, not about the database being wrong:
+    # Postgres is the configuration we have been asking for.
+    assert c.get("/health").json()["database"] == "postgres"
+
+
+def test_no_driver_warning_when_psycopg_is_present(tmp_path, monkeypatch):
+    c = _reloaded_app(tmp_path, monkeypatch, FOCI_API_KEYS="acme:secret-key",
+                      DATABASE_URL="postgres://u:p@example.invalid:5432/foci")
+    from foci_screen.api import app as app_module
+    monkeypatch.setattr(app_module, "postgres_driver_available", lambda: True)
+
+    assert c.get("/health").json()["warnings"] == []
+
+
+def test_a_missing_driver_names_the_extra_rather_than_the_module(monkeypatch):
+    """"No module named 'psycopg'" in a 500 tells you nothing about the fix."""
+    import sys
+
+    from foci_screen.store import Store
+
+    # None in sys.modules makes `import psycopg` raise ImportError, whether or
+    # not the real driver is installed on the machine running the tests.
+    monkeypatch.setitem(sys.modules, "psycopg", None)
+
+    with pytest.raises(RuntimeError) as err:
+        Store("postgres://u:p@example.invalid:5432/foci")
+    message = str(err.value)
+    assert "psycopg" in message
+    assert "postgres" in message, "name the extra to install"
+    assert "DATABASE_URL" in message, "name the variable that put it in this state"
+
+
 def test_managed_host_is_named_so_a_warning_can_say_where(monkeypatch):
     from foci_screen.config import Config
 

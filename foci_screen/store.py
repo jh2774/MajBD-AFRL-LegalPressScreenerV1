@@ -268,6 +268,28 @@ def _is_postgres(dsn: str) -> bool:
     return dsn.startswith("postgres://") or dsn.startswith("postgresql://")
 
 
+DRIVER_MISSING = (
+    "DATABASE_URL points at Postgres but the psycopg driver is not installed. "
+    "Install the extra — pip install \".[api,queue,postgres]\" — and redeploy. "
+    "Without it the service starts and then fails every request that touches "
+    "the database."
+)
+
+
+def postgres_driver_available() -> bool:
+    """Whether a Postgres DSN can actually be opened.
+
+    Worth asking before anything tries: a build command that installed the
+    package without the `postgres` extra produces a service that boots, serves
+    the web UI, and then 500s on the first query.
+    """
+    try:
+        import psycopg  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _statements(ddl: str) -> list[str]:
     """Split DDL into statements, ignoring `--` comments.
 
@@ -301,8 +323,11 @@ class Store:
     # ------------------------------------------------------------- dialect
     def _connect(self):
         if self.is_postgres:
-            import psycopg
-            from psycopg.rows import dict_row
+            try:
+                import psycopg
+                from psycopg.rows import dict_row
+            except ImportError as exc:      # say which extra, not "no module named"
+                raise RuntimeError(DRIVER_MISSING) from exc
 
             # Render hands out postgres:// ; psycopg wants postgresql://
             dsn = self.path.replace("postgres://", "postgresql://", 1)
