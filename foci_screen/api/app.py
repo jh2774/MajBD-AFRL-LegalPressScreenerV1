@@ -134,6 +134,38 @@ def deployment_warnings() -> list[str]:
     return warnings
 
 
+INTERRUPTED_NOTE = (
+    "The process running this screen stopped before it finished — a deploy, a "
+    "restart, or an instance spinning down while idle. Nothing was recorded "
+    "beyond the point it reached. Start another screen.")
+
+
+def reap_interrupted_runs() -> int:
+    """Close out runs left `running` by a process that no longer exists.
+
+    Only when screening happens in this process. With a queue, a run marked
+    running may be owned by a worker that is alive and working, and closing it
+    from here would report a screen as interrupted while it is still going.
+    """
+    if queue.backend != "thread":
+        return 0
+    reaped = 0
+    for tenant in sorted(set(keymap.values()) | {auth.DEFAULT_TENANT}):
+        reaped += store_for(tenant).reap_interrupted_runs(INTERRUPTED_NOTE)
+    return reaped
+
+
+try:
+    _reaped = reap_interrupted_runs()
+    if _reaped:
+        log.warning("Closed %d screen(s) left running by a previous process.", _reaped)
+except Exception as exc:   # noqa: BLE001 - never let tidying up stop the boot
+    # This is the first thing that touches the database, so a bad DATABASE_URL
+    # or a missing driver surfaces here. Crashing would take down the health
+    # endpoint and the banner that explain exactly that, leaving an operator
+    # with a service that will not start and no page to read.
+    log.error("Could not sweep interrupted screens: %s", exc)
+
 for _warning in deployment_warnings():
     # logging may not be configured yet under some servers, so print as well.
     log.error(_warning)

@@ -507,6 +507,32 @@ class Store:
         with self._tx() as c:
             c.execute("UPDATE runs SET status=? WHERE run_id=?", ("running", run_id))
 
+    def reap_interrupted_runs(self, note: str) -> int:
+        """Close out runs whose process is gone, and say why.
+
+        A screen marked `running` is only running while something is running
+        it. When the process dies mid-screen — a free instance spinning down
+        after its idle window, a deploy, an OOM — nothing ever writes the
+        closing row, and the run sits at `running` for good. A client polling
+        it waits on a screen that ended hours ago, which is a worse answer than
+        "this was interrupted, start another".
+
+        Only safe to call where no *other* process could own the run. The
+        caller decides that; see the startup sweep in the API, which runs it
+        only when screening happens in-process.
+        """
+        stuck = self._query(
+            "SELECT run_id FROM runs WHERE tenant_id=? AND status='running'",
+            (self.tenant_id,))
+        if not stuck:
+            return 0
+        with self._tx() as c:
+            c.execute(
+                "UPDATE runs SET status='interrupted', finished_at=?, error=?"
+                " WHERE tenant_id=? AND status='running'",
+                (_now(), note, self.tenant_id))
+        return len(stuck)
+
     def finish_run(self, run_id: str, status: str = "complete",
                    stats: dict | None = None, error: str = "") -> None:
         with self._tx() as c:

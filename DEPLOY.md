@@ -257,12 +257,29 @@ The blueprint is not the only way out, and the three steps below are worth doing
 **Step 1 is the one that matters.** Stopping after it leaves a deployment that keeps its data
 and screens correctly; steps 2 and 3 buy robustness, and cost money.
 
+### On the free plan, read this first
+
+The free instance type decides most of it:
+
+* **No disks.** Route A below is not available. Use Postgres.
+* **It spins down after about 15 minutes with no inbound request.** A screen running in the
+  web process goes with it, mid-run. Keep screens small (`max_entities` of 3–5), or better,
+  use the CLI route at the end of this section, which does not depend on the instance staying
+  up at all.
+* **A free Postgres instance expires after 30 days.** Render deletes it. Put a reminder in
+  your calendar now: when it goes, the snapshot baseline goes with it, and the next screen
+  reads every document as new.
+
+A screen that dies with its instance used to sit at `running` for good, because nothing was
+left alive to write the closing row. The API now closes those out on startup — they read
+`interrupted`, with the reason — so a stuck screen is distinguishable from a slow one.
+
 ### 1. Somewhere the data survives a restart
 
 Two routes. Both fix the same thing; pick on what your service can do.
 
 **Route A — a persistent disk.** One service, no new resource, two settings. This is the
-shortest path if the blueprint is not available to you.
+shortest path if the blueprint is not available to you, **and it needs a paid instance type.**
 
 1. The service → **Settings** → **Disks** → **Add Disk**
 2. Mount path `/var/data`, size 1 GB
@@ -281,8 +298,9 @@ have no disks, and they also spin down when idle, which is its own wipe. Use Rou
 **Route B — Postgres.** More moving parts, works on any plan, and the one to pick if you will
 ever add a worker: two processes cannot share a SQLite file, but they can share a database.
 
-1. **New → Postgres**. Plan `basic-256mb` — the free tier expires at 30 days, and losing the
-   database is the failure this step exists to prevent. Same region as the web service.
+1. **New → Postgres**. `basic-256mb` if you can; the free tier works and expires at 30 days,
+   which is a date to diarise rather than a reason not to start. Same region as the web
+   service.
 2. Copy its **Internal Database URL**.
 3. On the web service: **Environment → Add Environment Variable**, `DATABASE_URL` = that URL.
 4. **Save changes.** The service restarts by itself.
@@ -323,8 +341,10 @@ rather than green-while-screening-nothing.
 
 ### Or: screen from your own machine, and let Render display it
 
-If the worker's cost is not worth it yet, point the CLI at the same Postgres and run screens
-locally. Render then serves the results and nothing needs a queue at all:
+**On the free plan this is the recommended way to run screens**, not a fallback. The web
+instance spins down while idle and takes any in-process screen with it; your own machine does
+not. Point the CLI at the same Postgres and Render becomes purely the place the results are
+read — no worker, no queue, and nothing that has to stay awake for minutes at a time:
 
 ```bash
 pip install ".[postgres]"
