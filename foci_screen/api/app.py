@@ -90,6 +90,16 @@ except metadata.PackageNotFoundError:   # running from a source tree, not instal
     VERSION = "unknown"
 
 
+def storage_is_ephemeral() -> bool:
+    """True when what is written here does not survive a restart.
+
+    A caller cannot tell an empty database from a discarded one, and the
+    difference decides whether the answer is "run a screen" or "this will
+    happen again every time".
+    """
+    return not cfg.dsn.startswith("postgres") and bool(cfg.managed_host)
+
+
 def deployment_warnings() -> list[str]:
     """Configuration that will lose data or silently do nothing.
 
@@ -105,12 +115,16 @@ def deployment_warnings() -> list[str]:
         warnings.append(
             "FOCI_API_KEYS is not set: every authenticated route returns 503 and "
             "the web interface will show nothing.")
-    if on_sqlite and host:
+    if storage_is_ephemeral():
         warnings.append(
-            f"Using SQLite on {host}, where the filesystem is ephemeral. Every "
-            f"restart and deploy discards the database — and the stored snapshots "
-            f"are the baseline for change detection, so each wipe makes every "
-            f"document read as new. Set DATABASE_URL to a Postgres instance.")
+            f"This database will not survive a restart. It is SQLite on {host}'s "
+            f"own filesystem, which is replaced on every deploy — and on an idle "
+            f"instance that spins down and back up. Anything screened into it is "
+            f"gone, including the snapshots change detection compares against. "
+            f"Two fixes: attach a persistent disk and point FOCI_DB at it "
+            f"(simplest — one service, needs a paid instance type), or create a "
+            f"Postgres instance and set DATABASE_URL (works on any plan). "
+            f"DEPLOY.md has both.")
     if queue.backend == "thread" and host:
         warnings.append(
             f"No REDIS_URL on {host}: screens would run inside the web process and "
@@ -141,6 +155,7 @@ def health() -> dict:
     return {"status": "ok", "version": VERSION, "queue": queue.backend,
             "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
             "authenticated": bool(keymap),
+            "ephemeral_storage": storage_is_ephemeral(),
             "warnings": deployment_warnings()}
 
 

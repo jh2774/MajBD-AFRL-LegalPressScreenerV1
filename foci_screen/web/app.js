@@ -447,8 +447,24 @@ function firstRunPanel() {
   return `
     <div class="page-head">
       <h1>Overview</h1>
-      <div class="sub">Nothing has been screened into this database yet.</div>
+      <div class="sub">There is nothing in this database${
+        storageIsEphemeral ? " right now" : " yet"}.</div>
     </div>
+
+    ${storageIsEphemeral ? `
+    <div class="card" style="border-left:3px solid var(--high)">
+      <h2>If you screened something and it is not here, this is why</h2>
+      <p class="muted">This deployment keeps its database on a filesystem that
+      is replaced on every deploy — and on an idle instance that spins down and
+      comes back up. A screen that ran and finished is discarded along with it,
+      which looks from here exactly like a screen that never ran.</p>
+      <p class="muted">Running another one will work, and will be lost the same
+      way. <strong>Fix the storage first</strong> — see
+      <span class="mono">DEPLOY.md</span>: attach a persistent disk and point
+      <span class="mono">FOCI_DB</span> at it (one service, needs a paid
+      instance type), or create a Postgres instance and set
+      <span class="mono">DATABASE_URL</span> (works on any plan).</p>
+    </div>` : ""}
 
     <div class="card">
       <h2>No screens have run</h2>
@@ -476,6 +492,9 @@ async function viewOverview() {
   const t = d.totals;
 
   if (!t.contracts && !t.entities && !t.notices_pending) {
+    // The panel's wording depends on whether this deployment keeps anything,
+    // and the boot-time health call may not have landed yet.
+    await refreshHealth();
     view.innerHTML = firstRunPanel();
     return;
   }
@@ -1342,6 +1361,11 @@ async function route() {
 /* Configuration that loses data is silent by design: the service answers, the
  * dashboard renders, and nothing on it says the disk is about to be discarded.
  * /health needs no key, so this shows even while the API is closed. */
+/* Whether this deployment can keep what it is given. Read by the empty state:
+ * "nothing has been screened" and "what was screened has been thrown away"
+ * look identical from here, and only one of them is the reader's fault. */
+let storageIsEphemeral = false;
+
 async function refreshHealth() {
   const banner = document.getElementById("config-banner");
   if (!banner) return;
@@ -1353,6 +1377,7 @@ async function refreshHealth() {
   } catch {
     return;   // unreachable server; the view's own error already says so
   }
+  storageIsEphemeral = health.ephemeral_storage === true;
   const warnings = health.warnings || [];
   if (!warnings.length) {
     banner.hidden = true;

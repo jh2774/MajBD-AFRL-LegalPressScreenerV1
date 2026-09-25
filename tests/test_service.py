@@ -586,6 +586,29 @@ def test_health_warns_that_a_managed_host_discards_a_sqlite_database(tmp_path, m
     assert any("REDIS_URL" in w for w in warnings), warnings
 
 
+def test_health_states_plainly_whether_storage_survives_a_restart(tmp_path, monkeypatch):
+    """A flag, not prose to match on.
+
+    The web interface changes what it says on an empty dashboard depending on
+    this: "nothing has been screened" and "what was screened has been thrown
+    away" look identical from the browser, and only one of them means the
+    reader should go and fix something. Grepping the warning text for a phrase
+    would break the page the next time the wording improved.
+    """
+    ephemeral = _reloaded_app(tmp_path, monkeypatch, RENDER="true",
+                              FOCI_API_KEYS="acme:secret-key")
+    assert ephemeral.get("/health").json()["ephemeral_storage"] is True
+
+    # A disk mounted at FOCI_DB is still SQLite; what changes is the platform.
+    local = _reloaded_app(tmp_path, monkeypatch, FOCI_API_KEYS="acme:secret-key")
+    assert local.get("/health").json()["ephemeral_storage"] is False
+
+    on_postgres = _reloaded_app(tmp_path, monkeypatch, RENDER="true",
+                                FOCI_API_KEYS="acme:secret-key",
+                                DATABASE_URL="postgres://u:p@example.invalid:5432/f")
+    assert on_postgres.get("/health").json()["ephemeral_storage"] is False
+
+
 def test_health_reports_a_closed_api_as_a_warning(tmp_path, monkeypatch):
     c = _reloaded_app(tmp_path, monkeypatch, FOCI_API_KEYS="")
     warnings = c.get("/health").json()["warnings"]

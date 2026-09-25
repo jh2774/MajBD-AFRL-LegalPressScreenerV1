@@ -257,7 +257,29 @@ The blueprint is not the only way out, and the three steps below are worth doing
 **Step 1 is the one that matters.** Stopping after it leaves a deployment that keeps its data
 and screens correctly; steps 2 and 3 buy robustness, and cost money.
 
-### 1. Postgres, so the data survives a restart
+### 1. Somewhere the data survives a restart
+
+Two routes. Both fix the same thing; pick on what your service can do.
+
+**Route A — a persistent disk.** One service, no new resource, two settings. This is the
+shortest path if the blueprint is not available to you.
+
+1. The service → **Settings** → **Disks** → **Add Disk**
+2. Mount path `/var/data`, size 1 GB
+3. **Environment** → add `FOCI_DB` = `/var/data/foci_screen.db`
+4. **Save changes**; the service restarts on its own
+
+Render requires a paid instance type for a disk, and a service with one runs a single instance
+and loses zero-downtime deploys. Neither matters here: the store holds one connection per
+process by design, and a screening tool has no traffic to speak of.
+
+**If the service is on the free instance type, this route is not available** — free instances
+have no disks, and they also spin down when idle, which is its own wipe. Use Route B.
+
+`/health` should then report `"ephemeral_storage": false`.
+
+**Route B — Postgres.** More moving parts, works on any plan, and the one to pick if you will
+ever add a worker: two processes cannot share a SQLite file, but they can share a database.
 
 1. **New → Postgres**. Plan `basic-256mb` — the free tier expires at 30 days, and losing the
    database is the failure this step exists to prevent. Same region as the web service.
