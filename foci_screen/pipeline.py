@@ -24,7 +24,11 @@ log = logging.getLogger("foci.pipeline")
 
 @dataclass
 class ScreenOptions:
-    agency: str
+    # One of `agency` or `recipient` is required. Naming a recipient screens
+    # that contractor wherever its awards come from, which is how a company
+    # somebody already has in mind gets into the database at all.
+    agency: str = ""
+    recipient: str = ""
     sub_agency: str = ""
     months_back: int = 12
     max_awards: int = 25
@@ -71,19 +75,27 @@ class Screener:
         # return an id before the work started. When it did, the caller owns the
         # run's lifecycle and this method must not close it out.
         owns_run = not run_id
+        subject = opts.recipient or opts.agency
         if owns_run:
-            run_id = self.store.start_run(opts.agency, opts.__dict__)
+            run_id = self.store.start_run(subject, opts.__dict__)
         result = ScreenResult(run_id=run_id, options=opts)
 
         # --- step 1: contracts ------------------------------------------
-        progress(f"Searching USAspending for {opts.agency} awards "
+        progress(f"Searching USAspending for {subject} awards "
                  f"(last {opts.months_back} months)...")
         contracts = self.usaspending.search_awards(
             opts.agency, months_back=opts.months_back, limit=opts.max_awards,
             sub_agency=opts.sub_agency, include_idv=opts.include_idv,
-            keyword=opts.keyword)
+            keyword=opts.keyword, recipient=opts.recipient)
         if not contracts:
+            # The two dead ends need different advice: a misspelled agency is
+            # looked up against a list, a contractor with no awards in the
+            # window is a fact about the window.
             result.notes.append(
+                f"No awards returned for contractor '{opts.recipient}' in the last "
+                f"{opts.months_back} months. Check the spelling as it appears on an "
+                f"award, or widen the window."
+                if opts.recipient else
                 f"No awards returned for '{opts.agency}'. Check the agency name "
                 f"against `foci-screen agencies`.")
             if owns_run:

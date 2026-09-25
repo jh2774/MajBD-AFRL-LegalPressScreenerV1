@@ -310,6 +310,7 @@ every night on a deploy that was screening nothing.
 | `GET /v1/contracts/{piid}` | One award, with its data-rights clauses |
 | `GET /v1/documents?entity_key=` | Source documents read while screening a contractor |
 | `GET /v1/documents/diff?source=&key=` | **What changed between two revisions** |
+| `DELETE /v1/screens/{id}` | Remove a screen and its data — reports first, deletes on `confirm=true` |
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
 | `POST /v1/portfolio` | Open a key into a dashboard of those companies |
 | `POST /v1/watchlists` | Agencies to re-screen on a schedule |
@@ -406,6 +407,36 @@ the source stopped returning is missing data, not a contractor acting — and it
 overwrites the stored value either, since a connector outage should not be able to erase a
 country of incorporation. A withdrawn certification, or a contracting officer being reassigned,
 is recorded in the log without becoming a finding.
+
+## Screening a company you already have in mind
+
+Search covers what has been screened, so a firm this database has never looked at matches
+nothing — correctly, but it used to be a dead end. `agency` was required, so the only way into
+the database was to screen a whole department and take whoever turned up in it.
+
+A screen can now name a contractor instead:
+
+```bash
+foci-screen screen --recipient "RAYTHEON COMPANY" --months 12 --entities 3
+```
+
+```bash
+curl -X POST $API/v1/screens -H "Authorization: Bearer $FOCI_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"recipient":"RAYTHEON COMPANY","months_back":12,"max_entities":3}'
+```
+
+Naming both narrows to one contractor's work for one department. USAspending matches the text
+against recipient name *and* UEI, so a pasted UEI works as well as a typed name.
+
+In the web interface this is where a fruitless search leads: searching for a contractor that
+has not been screened offers to screen it, and the run page then shows progress while it works.
+
+**Removing a screen.** One run against the wrong agency puts contractors on the dashboard that
+nobody chose to watch. `DELETE /v1/screens/{id}` reports what would go and deletes nothing;
+repeating it with `confirm=true` removes the run, its awards, findings and pending notices.
+Stored document revisions are shared between tenants — a hash is a fact about the world, not
+about who was watching — so they are never touched.
 
 ## Portfolio keys
 

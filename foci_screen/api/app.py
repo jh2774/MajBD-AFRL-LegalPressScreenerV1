@@ -226,7 +226,11 @@ def configuration(tenant: str = Depends(require_tenant)) -> dict:
 def create_screen(body: ScreenRequest, tenant: str = Depends(require_tenant)) -> dict:
     store = store_for(tenant)
     options = body.model_dump()
-    run_id = store.start_run(body.agency, options, status="queued")
+    # The run row's subject is what identifies it in the history and in the
+    # page heading. A recipient screen has no agency, and labelling it with a
+    # blank would leave a run nobody can tell apart from the next one.
+    subject = body.recipient or body.agency
+    run_id = store.start_run(subject, options, status="queued")
     queue.enqueue(tenant, run_id, options)
     return {"run_id": run_id, "status": "queued", "backend": queue.backend}
 
@@ -235,6 +239,33 @@ def create_screen(body: ScreenRequest, tenant: str = Depends(require_tenant)) ->
 def list_screens(limit: int = Query(25, ge=1, le=200),
                  store: Store = Depends(tenant_store)) -> dict:
     return {"runs": store.recent_runs(limit=limit)}
+
+
+@app.delete("/v1/screens/{run_id}", tags=["screens"])
+def delete_screen(run_id: str, confirm: bool = Query(False),
+                  store: Store = Depends(tenant_store)) -> dict:
+    """Remove a screen and everything it recorded.
+
+    Without `confirm=true` this reports what would go and deletes nothing,
+    because the counts are the only way to tell a stray screen from the run
+    holding a quarter's work. Snapshots are not touched: a document's hash is
+    shared between tenants, and dropping it would take the change-detection
+    baseline away from everyone else watching that company.
+    """
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "No such run.")
+
+    footprint = store.run_footprint(run_id)
+    if not confirm:
+        return {"run_id": run_id, "subject": run.get("agency"),
+                "would_remove": footprint, "deleted": False,
+                "detail": "Repeat with confirm=true to delete this run and the "
+                          "rows listed in would_remove. It cannot be undone."}
+
+    removed = store.delete_run(run_id)
+    log.warning("run %s deleted for tenant %s: %s", run_id, store.tenant_id, removed)
+    return {"run_id": run_id, "removed": removed, "deleted": True}
 
 
 @app.get("/v1/screens/{run_id}", tags=["screens"])

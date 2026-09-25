@@ -8,12 +8,19 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ScreenRequest(BaseModel):
-    agency: str = Field(..., min_length=2,
-                        examples=["Department of Defense"])
+    """Either an agency or a named contractor. Both is allowed and narrows.
+
+    `agency` was required, which meant the only way into the database was to
+    screen a department and take whoever turned up in it. A contractor
+    somebody already had in mind could not be reached at all.
+    """
+    agency: str = Field("", examples=["Department of Defense"])
+    recipient: str = Field("", max_length=200,
+                           examples=["LOCKHEED MARTIN CORPORATION"])
     sub_agency: str = ""
     months_back: int = Field(12, ge=1, le=60)
     max_awards: int = Field(25, ge=1, le=500)
@@ -29,6 +36,21 @@ class ScreenRequest(BaseModel):
     fetch_filing_bodies: bool = True
     min_severity: str = Field("low", pattern="^(info|low|medium|high|critical)$")
     skip_web: bool = False
+
+    @model_validator(mode="after")
+    def needs_a_subject(self) -> ScreenRequest:
+        agency = (self.agency or "").strip()
+        recipient = (self.recipient or "").strip()
+        if not agency and not recipient:
+            raise ValueError(
+                "Name an agency to screen its awards, or a recipient to screen "
+                "one contractor wherever its awards come from.")
+        if agency and len(agency) < 2:
+            raise ValueError("That agency name is too short to match anything.")
+        if recipient and len(recipient) < 2:
+            raise ValueError("That contractor name is too short to match anything.")
+        self.agency, self.recipient = agency, recipient
+        return self
 
 
 class WatchlistRequest(BaseModel):

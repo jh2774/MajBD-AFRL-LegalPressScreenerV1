@@ -86,21 +86,39 @@ class USASpendingConnector:
         self.http = http
 
     # ------------------------------------------------------------------ search
-    def search_awards(self, agency: str, *, months_back: int = 12, limit: int = 25,
+    def search_awards(self, agency: str = "", *, months_back: int = 12, limit: int = 25,
                       tier: str = "toptier", sub_agency: str = "",
-                      include_idv: bool = False, keyword: str = "") -> list[Contract]:
+                      include_idv: bool = False, keyword: str = "",
+                      recipient: str = "") -> list[Contract]:
+        """Awards by awarding agency, by recipient, or by both.
+
+        `recipient` is what lets somebody screen a company they have in mind
+        rather than a whole department and whoever happens to turn up in it.
+        Until it existed the only way in was to name an agency, so a
+        contractor nobody had screened was unreachable — and a search over the
+        screened population returned nothing, correctly, with no way to act.
+        """
+        if not agency and not recipient:
+            raise ValueError("search_awards needs an agency, a recipient, or both")
+
         end = date.today()
         start = end - timedelta(days=30 * months_back)
-        agencies = [{"type": "awarding", "tier": tier, "name": agency}]
-        if sub_agency:
-            agencies.append({"type": "awarding", "tier": "subtier", "name": sub_agency})
 
         codes = list(CONTRACT_TYPE_CODES) + (IDV_TYPE_CODES if include_idv else [])
         filters: dict = {
             "award_type_codes": codes,
-            "agencies": agencies,
             "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}],
         }
+        if agency:
+            agencies = [{"type": "awarding", "tier": tier, "name": agency}]
+            if sub_agency:
+                agencies.append({"type": "awarding", "tier": "subtier",
+                                 "name": sub_agency})
+            filters["agencies"] = agencies
+        if recipient:
+            # USAspending matches this against recipient name and UEI, so a
+            # pasted UEI works as well as a typed name.
+            filters["recipient_search_text"] = [recipient]
         if keyword:
             filters["keywords"] = [keyword]
 

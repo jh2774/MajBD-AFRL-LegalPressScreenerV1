@@ -59,8 +59,13 @@ def cmd_screen(args, cfg) -> int:
     store = Store(cfg.dsn)
     screener, browser = build_screener(cfg, store)
 
+    if not (args.agency or args.recipient):
+        print("Name --agency, --recipient, or both.")
+        return 2
+
     opts = ScreenOptions(
-        agency=args.agency, sub_agency=args.sub_agency or "",
+        agency=args.agency or "", recipient=args.recipient or "",
+        sub_agency=args.sub_agency or "",
         months_back=args.months, max_awards=args.awards,
         max_entities=args.entities, keyword=args.keyword or "",
         include_idv=args.include_idv, max_subaward_entities=args.subcontractors,
@@ -72,7 +77,11 @@ def cmd_screen(args, cfg) -> int:
         if not args.quiet:
             print(msg, flush=True)
 
-    print(f"Run configuration: agency={opts.agency!r} window={opts.months_back}mo "
+    subject = (f"recipient={opts.recipient!r}" if opts.recipient
+               else f"agency={opts.agency!r}")
+    if opts.recipient and opts.agency:
+        subject += f" agency={opts.agency!r}"
+    print(f"Run configuration: {subject} window={opts.months_back}mo "
           f"awards<={opts.max_awards} entities<={opts.max_entities}")
     avail = cfg.availability()
     off = [k for k, v in avail.items() if not v]
@@ -206,7 +215,10 @@ def build_parser() -> argparse.ArgumentParser:
     a.set_defaults(func=cmd_agencies)
 
     s = sub.add_parser("screen", help="run a screen against one agency")
-    s.add_argument("--agency", required=True, help='e.g. "Department of Defense"')
+    s.add_argument("--agency", help='e.g. "Department of Defense"')
+    s.add_argument("--recipient", metavar="NAME",
+                   help='screen one contractor wherever its awards come from, '
+                        'e.g. "LOCKHEED MARTIN CORPORATION" or its UEI')
     s.add_argument("--sub-agency", help='e.g. "Department of the Navy"')
     s.add_argument("--months", type=int, default=12, help="lookback window (default 12)")
     s.add_argument("--awards", type=int, default=25, help="max awards to pull (default 25)")

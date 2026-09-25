@@ -544,6 +544,14 @@ async function viewOverview() {
     </div>
 
     <div class="card">
+      <h2>Screens that produced this</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:10px">
+        Everything above came from these runs. Open one to see what it read, or
+        to remove it if it brought in contractors you did not mean to watch.</div>
+      <div id="recent-runs" class="muted">Loading…</div>
+    </div>
+
+    <div class="card">
       <h2>Most recent findings</h2>
       ${entitiesTable(
         d.recent_findings.map((f) => ({
@@ -556,6 +564,70 @@ async function viewOverview() {
         }))
       )}
     </div>`;
+
+  // Loaded after the page so a slow history call cannot hold up the dashboard.
+  api("/v1/screens?limit=10").then((r) => {
+    const box = document.getElementById("recent-runs");
+    if (!box) return;
+    const runs = r.runs || [];
+    box.innerHTML = runs.length
+      ? `<table><thead><tr><th>Subject</th><th>Status</th><th>Started</th></tr></thead>
+         <tbody>${runs.map((run) => `
+           <tr>
+             <td><a href="#/screens/${encodeURIComponent(run.run_id)}">${esc(run.agency || run.run_id)}</a></td>
+             <td>${esc(run.status || "")}</td>
+             <td>${day(run.started_at)}</td>
+           </tr>`).join("")}</tbody></table>`
+      : "No screens recorded.";
+  }).catch(() => {
+    const box = document.getElementById("recent-runs");
+    if (box) box.textContent = "Could not load the run history.";
+  });
+}
+
+/* Search reads the screened population, so a firm nobody has screened
+ * correctly matches nothing. Saying only that is a dead end: the honest reply
+ * is that this database has not looked at the firm yet, and an offer to go and
+ * look. Without it the only route in was to screen a whole department and take
+ * whoever turned up. */
+function screenThisFirm(q) {
+  if (!q) {
+    return `<div class="card"><div class="empty">Type a contractor, award,
+      officer or agency to search what has been screened.</div></div>`;
+  }
+  return `
+    <div class="card">
+      <h2>Nothing screened here matches “${esc(q)}”</h2>
+      <p class="muted">Search covers what this database has already screened,
+      so a firm it has never looked at will not appear. If “${esc(q)}” is a
+      contractor, screen it now — this pulls its federal awards from
+      USAspending and runs the full check.</p>
+      <div class="actions">
+        <button class="primary" id="screen-firm">Screen “${esc(q)}”</button>
+      </div>
+      <p class="muted" id="screen-firm-status" style="margin-top:10px"></p>
+    </div>`;
+}
+
+function wireScreenFirm(q) {
+  const button = document.getElementById("screen-firm");
+  if (!button) return;
+  const status = document.getElementById("screen-firm-status");
+  button.onclick = async () => {
+    button.disabled = true;
+    status.textContent = "Starting…";
+    try {
+      const d = await apiPost("/v1/screens", {
+        recipient: q, months_back: 12, max_awards: 25, max_entities: 3,
+      });
+      status.innerHTML = `Screening started (run <span class="mono">${esc(d.run_id)}</span>).
+        This takes minutes — the contractor appears in search once it finishes.
+        <a href="#/screens/${encodeURIComponent(d.run_id)}">Watch it</a>.`;
+    } catch (e) {
+      button.disabled = false;
+      status.textContent = e.message || String(e);
+    }
+  };
 }
 
 async function viewSearch(q, kind) {
@@ -591,7 +663,7 @@ async function viewSearch(q, kind) {
       <div class="sub">${total} match${total === 1 ? "" : "es"}${q ? "" : " — showing the largest of each"}</div>
     </div>
     <div class="tabs">${tabs}</div>
-    ${total === 0 ? '<div class="card"><div class="empty">Nothing matched. Only screened awards are searchable — run a screen first.</div></div>' : ""}
+    ${total === 0 ? screenThisFirm(q) : ""}
     ${section("Contractors", entitiesTable(d.entities || []), d.entities)}
     ${section("Awards", contractsTable(d.contracts || []), d.contracts)}
     ${section("Contracting officers", officersTable(d.officers || []), d.officers)}
@@ -602,6 +674,103 @@ async function viewSearch(q, kind) {
       location.hash = `#/search/${encodeURIComponent(q)}/${b.dataset.kind}`;
     };
   });
+  wireScreenFirm(q);
+}
+
+/* A screen takes minutes, so starting one from the search page and being given
+ * nothing to look at is its own dead end. */
+let screenPollTimer = null;
+
+async function viewScreen(runId) {
+  if (screenPollTimer) clearTimeout(screenPollTimer);
+  const d = await api(`/v1/screens/${encodeURIComponent(runId)}`);
+  const running = d.status === "running" || d.status === "queued";
+  const stats = d.stats || {};
+
+  view.innerHTML = `
+    <div class="breadcrumb"><a href="#/">Overview</a> › Screen</div>
+    <div class="page-head">
+      <h1>${esc(d.agency || "Screen")}</h1>
+      <div class="sub"><span class="mono">${esc(runId)}</span> · started ${day(d.started_at)}</div>
+    </div>
+
+    <div class="card">
+      <h2>${esc(d.status || "unknown")}</h2>
+      ${running
+        ? `<p class="muted">Running. This page refreshes itself; a screen
+           usually takes a few minutes.</p>
+           <div class="code">${esc(d.progress || "starting…")}</div>`
+        : ""}
+      ${d.error ? `<div class="error"><strong>${esc(d.status)}</strong>
+        <div class="muted" style="margin-top:6px">${esc(d.error)}</div></div>` : ""}
+      ${!running && !d.error ? `<p class="muted">Finished ${day(d.finished_at)}.</p>` : ""}
+    </div>
+
+    ${Object.keys(stats).length ? `
+    <div class="grid cols-4">
+      ${statCard("Awards examined", num(stats.awards_examined))}
+      ${statCard("Contractors", num(stats.entities_screened))}
+      ${statCard("Findings", num(stats.findings))}
+      ${statCard("Notices pending", num(stats.notices_pending))}
+    </div>` : ""}
+
+    ${(stats.notes || []).length ? `
+    <div class="card">
+      <h2>What the run could not read</h2>
+      <ul class="muted" style="font-size:13px">
+        ${stats.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>
+    </div>` : ""}
+
+    ${!running ? `
+    <div class="card">
+      <h2>Remove this screen</h2>
+      <p class="muted">Everything this run put on the dashboard — its awards,
+      findings and pending notices — goes with it. Useful when a screen brought
+      in contractors you did not mean to watch. Stored document revisions are
+      shared between screens and are left alone.</p>
+      <div class="actions">
+        <button class="ghost" id="screen-remove">Remove this screen's data</button>
+      </div>
+      <p class="muted" id="screen-remove-status" style="margin-top:10px"></p>
+    </div>` : ""}
+
+    ${!running ? `<div class="actions">
+      <a class="linkish" href="#/">Back to the overview</a></div>` : ""}`;
+
+  wireScreenRemove(runId);
+  if (running) screenPollTimer = setTimeout(() => viewScreen(runId), 5000);
+}
+
+/* Two steps on purpose: the first shows what would go, the second does it.
+ * The counts are the only way to tell a stray screen from the run holding a
+ * quarter's work, and this cannot be undone. */
+function wireScreenRemove(runId) {
+  const button = document.getElementById("screen-remove");
+  if (!button) return;
+  const status = document.getElementById("screen-remove-status");
+  let confirmed = false;
+
+  button.onclick = async () => {
+    try {
+      if (!confirmed) {
+        const d = await apiSend("DELETE", `/v1/screens/${encodeURIComponent(runId)}`);
+        const counts = d.would_remove || {};
+        const parts = Object.entries(counts)
+          .filter(([, n]) => n > 0)
+          .map(([k, n]) => `${num(n)} ${k.replace(/_/g, " ")}`);
+        status.textContent = parts.length
+          ? `This will delete ${parts.join(", ")}. It cannot be undone — click again to confirm.`
+          : "This run recorded nothing. Click again to remove the run itself.";
+        button.textContent = "Confirm removal";
+        confirmed = true;
+        return;
+      }
+      await apiSend("DELETE", `/v1/screens/${encodeURIComponent(runId)}?confirm=true`);
+      location.hash = "#/";
+    } catch (e) {
+      status.textContent = e.message || String(e);
+    }
+  };
 }
 
 async function viewEntity(key) {
@@ -1554,9 +1723,16 @@ const ROUTES = [
   [/^\/notices$/, () => viewNotices()],
   [/^\/rules$/, () => viewRules()],
   [/^\/portfolio$/, () => viewPortfolio()],
+  [/^\/screens\/(.+)$/, (id) => viewScreen(decodeURIComponent(id))],
 ];
 
 async function route() {
+  // The screen view polls itself. Left running, it would redraw its own page
+  // over whatever the reader navigated to.
+  if (screenPollTimer) {
+    clearTimeout(screenPollTimer);
+    screenPollTimer = null;
+  }
   const raw = location.hash.replace(/^#/, "") || "/";
   // Split the query off before matching: otherwise `?entity=…` lands inside
   // the last path segment and every key gains a suffix.

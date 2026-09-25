@@ -549,6 +549,38 @@ class Store:
         return self._one("SELECT * FROM runs WHERE run_id=? AND tenant_id=?",
                          (run_id, self.tenant_id))
 
+    # Tables that carry a run_id and belong to the tenant that made the run.
+    # `snapshots` is deliberately absent: a document's hash is a fact about the
+    # world, shared between tenants, and deleting it would take the change
+    # baseline away from everyone else watching the same company.
+    _RUN_OWNED = ("notices", "contract_changes", "contracts", "findings")
+
+    def run_footprint(self, run_id: str) -> dict:
+        """What deleting this run would remove, counted before anything goes."""
+        out: dict[str, int] = {}
+        for table in self._RUN_OWNED:
+            row = self._one(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE tenant_id=? AND run_id=?",
+                (self.tenant_id, run_id))
+            out[table] = int((row or {}).get("n") or 0)
+        return out
+
+    def delete_run(self, run_id: str) -> dict:
+        """Remove a run and everything it recorded. Not reversible.
+
+        For undoing a screen somebody did not want — one run against the wrong
+        agency puts contractors on the dashboard that nobody chose to watch,
+        and there was no way to take them off.
+        """
+        removed = self.run_footprint(run_id)
+        with self._tx() as c:
+            for table in self._RUN_OWNED:
+                c.execute(f"DELETE FROM {table} WHERE tenant_id=? AND run_id=?",
+                          (self.tenant_id, run_id))
+            c.execute("DELETE FROM runs WHERE tenant_id=? AND run_id=?",
+                      (self.tenant_id, run_id))
+        return removed
+
     def recent_runs(self, limit: int = 25) -> list[dict]:
         return self._query("SELECT run_id, status, started_at, finished_at, agency"
                            " FROM runs WHERE tenant_id=? ORDER BY started_at DESC"
