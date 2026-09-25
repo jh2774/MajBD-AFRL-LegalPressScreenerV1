@@ -11,6 +11,7 @@ reviewer, and never implied by anything else.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import threading
@@ -19,6 +20,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import portfolio as portfolio_keys
@@ -822,7 +824,47 @@ def _delivery_state() -> dict:
 # Mounted last: FastAPI matches routes in declaration order, so every /v1 route
 # above wins before this catch-all sees the request.
 _WEB_DIR = Path(__file__).resolve().parent.parent / "web"
+
+
+def _asset_fingerprint(*names: str) -> str:
+    """A short hash of the web assets as they are on disk right now.
+
+    Appended to the script and stylesheet URLs so that a deploy changes the
+    URLs and a browser cannot keep serving the previous build. The version
+    number will not do: two deploys usually share one, and the failure is
+    silent — a page that looks like it is up to date while missing whatever
+    was just shipped.
+    """
+    digest = hashlib.sha256()
+    for name in names:
+        path = _WEB_DIR / name
+        if path.is_file():
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
 if _WEB_DIR.is_dir():
+    ASSET_VERSION = _asset_fingerprint("app.js", "styles.css")
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/index.html", include_in_schema=False)
+    def web_index() -> Response:
+        """The shell, always revalidated, with fingerprinted asset URLs.
+
+        Serving this through StaticFiles let a browser hold a cached copy
+        indefinitely, so a deploy could land and a returning visitor would go
+        on running the previous build — missing a whole feature with nothing
+        on the page to say why. The shell is tiny; revalidating it is cheap,
+        and it is what makes the fingerprints below reachable.
+        """
+        html = (_WEB_DIR / "index.html").read_text(encoding="utf-8")
+        html = (html.replace("./app.js", f"./app.js?v={ASSET_VERSION}")
+                    .replace("./styles.css", f"./styles.css?v={ASSET_VERSION}"))
+        return HTMLResponse(html, headers={
+            "Cache-Control": "no-cache, must-revalidate",
+        })
+
     app.mount("/", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
 else:  # pragma: no cover - only if the package was built without web assets
+    ASSET_VERSION = ""
     log.warning("web assets missing at %s; API only", _WEB_DIR)

@@ -515,6 +515,52 @@ def test_web_ui_is_served(client):
     assert c.get("/styles.css").status_code == 200
 
 
+def test_the_shell_is_always_revalidated(client):
+    """A deploy that a browser never notices is a deploy that did not happen.
+
+    Served straight from StaticFiles, index.html could sit in a browser cache
+    indefinitely: a returning visitor kept running the previous build, missing
+    whatever had just shipped, with nothing on the page to say why. This is
+    not hypothetical — it is how a shipped feature came to be reported as
+    missing.
+    """
+    c, _ = client
+    r = c.get("/")
+    assert "no-cache" in r.headers.get("cache-control", "")
+
+
+def test_asset_urls_carry_a_fingerprint(client):
+    c, _ = client
+    html = c.get("/").text
+    assert "./app.js?v=" in html
+    assert "./styles.css?v=" in html
+    # Same fingerprint for both: one build, one version of the pair.
+    assert html.count("?v=") == 2
+
+
+def test_the_fingerprint_follows_the_asset_contents(client, tmp_path):
+    """The version number will not do — two deploys usually share one."""
+    c, app_module = client
+    before = app_module._asset_fingerprint("app.js", "styles.css")
+
+    web = tmp_path / "web"
+    web.mkdir()
+    (web / "app.js").write_text("// something new", encoding="utf-8")
+    app_module._WEB_DIR = web
+    after = app_module._asset_fingerprint("app.js", "styles.css")
+
+    assert before != after
+    assert len(after) == 12
+
+
+def test_a_fingerprinted_asset_still_resolves(client):
+    """The query string is a cache key for the browser, not part of the path."""
+    c, _ = client
+    r = c.get("/app.js?v=whatever")
+    assert r.status_code == 200
+    assert len(r.text) > 1000
+
+
 def test_static_mount_does_not_shadow_the_api(client):
     """The catch-all mount is last; /v1 must still route."""
     c, _ = client
