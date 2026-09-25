@@ -130,10 +130,25 @@ def deployment_warnings() -> list[str]:
             f"(simplest — one service, needs a paid instance type), or create a "
             f"Postgres instance and set DATABASE_URL (works on any plan). "
             f"DEPLOY.md has both.")
-    if queue.backend == "thread" and host:
+    # A queue with nothing listening is the failure worth shouting about: the
+    # service looks healthier than the arrangement it replaced, and screens
+    # are accepted and never run. It outranks having no queue at all.
+    if queue.backend == "rq" and queue.worker_count() == 0:
         warnings.append(
-            f"No REDIS_URL on {host}: screens would run inside the web process and "
-            f"die with it mid-run. Add a Redis instance and a worker service.")
+            "REDIS_URL is set but no worker is listening on the queue. Screens "
+            "will be accepted, queued, and never run. Start the worker service, "
+            "or unset REDIS_URL to run them in this process instead.")
+    elif queue.backend == "thread" and host and not cfg.inprocess_screens_ok:
+        warnings.append(
+            f"Screens run inside the web process on {host}, because no REDIS_URL "
+            f"is set. Each one keeps whatever it has finished — contractors are "
+            f"saved as they are screened — but a screen still in progress ends "
+            f"if the instance restarts or spins down while idle, and is marked "
+            f"interrupted. A worker service is the durable answer; where one is "
+            f"not available, keep screens small enough to finish, or run them "
+            f"from the command line against this database. Set "
+            f"FOCI_INPROCESS_SCREENS=true to record that as a decision and "
+            f"retire this notice.")
     if not on_sqlite and not postgres_driver_available():
         warnings.append(DRIVER_MISSING)
     return warnings

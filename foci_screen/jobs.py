@@ -137,6 +137,27 @@ class JobQueue:
     def backend(self) -> str:
         return "rq" if self._queue is not None else "thread"
 
+    def worker_count(self) -> int | None:
+        """Workers listening on this queue, or None when it cannot be asked.
+
+        A queue with no worker is the one arrangement that is strictly worse
+        than having no queue at all: screens are accepted, they queue, and
+        nothing ever runs them — while the service reports a real queue and
+        looks healthier than the state it replaced.
+
+        None means the question could not be answered (no queue configured, or
+        Redis did not respond) and is deliberately not reported as zero.
+        """
+        if self._queue is None:
+            return None
+        try:
+            from rq import Worker
+
+            return Worker.count(queue=self._queue)
+        except Exception as exc:       # noqa: BLE001 - diagnostics must not raise
+            log.debug("could not count workers: %s", exc)
+            return None
+
     def enqueue(self, tenant_id: str, run_id: str, options: dict) -> None:
         if self._queue is not None:
             self._queue.enqueue(run_screen_job, tenant_id, run_id, options,

@@ -61,6 +61,13 @@ class Config:
     # survive a web process restart.
     redis_url: str = field(default_factory=lambda: _env("REDIS_URL"))
     job_timeout: int = field(default_factory=lambda: int(_env("FOCI_JOB_TIMEOUT", "3600")))
+    # Set where a queue is not available — a single free-tier service, say —
+    # to record that running screens in the web process is a decision rather
+    # than an oversight. It changes nothing about how they run; it stops the
+    # banner reporting a known trade-off as a fault. The risk does not go
+    # away, so keep screens small enough to finish.
+    inprocess_screens_ok: bool = field(
+        default_factory=lambda: _flag("FOCI_INPROCESS_SCREENS", False))
 
     # --- headless browser (investor-relations pages) ---
     browser_enabled: bool = field(default_factory=lambda: _flag("FOCI_BROWSER", True))

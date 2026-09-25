@@ -124,12 +124,19 @@ class Screener:
             finding = self._screen_entity(entity, ent_contracts, run_id, opts,
                                           progress, record_changes)
             if finding:
+                # Saved here rather than after the loop. A screen takes minutes
+                # and, where there is no queue, runs inside a web process that
+                # can be restarted or spun down under it. Holding every finding
+                # until the end meant an interruption threw away contractors
+                # that had been screened completely — the awards were already
+                # in the contracts table, so the run lost precisely the part
+                # that took the work. Suppression is unaffected: it reads other
+                # runs, never this one.
+                self.store.save_finding(finding)
                 result.findings.append(finding)
             result.contracts.extend(ent_contracts)
 
         result.findings.sort(key=lambda f: -f.total_score)
-        for f in result.findings:
-            self.store.save_finding(f)
         result.stats = dict(self.http.stats)
         result.stats["entities_screened"] = len(selected)
         result.stats["awards_examined"] = len(contracts)

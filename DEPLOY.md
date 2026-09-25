@@ -318,10 +318,31 @@ data was going to be discarded anyway.
 
 ### 2. A queue, so a screen survives the web process
 
+**On the free plan there is no background worker to add, so this step is not available.** Skip
+to what to do instead, below.
+
 With `queue: thread`, `POST /v1/screens` runs the screen inside the web service in a
 background thread. It works, and it is how the CLI has always run. What it cannot do is
 survive a restart, a redeploy or an instance being recycled mid-run — and a screen takes
 minutes.
+
+The cost of that is smaller than it looks. Contractors are saved as they are screened: awards
+go into the contracts table as each entity is enriched, and its finding is written as soon as
+the entity is done. A screen that dies at the third contractor keeps the first two, and the
+run reads `interrupted` rather than sitting at `running` for good. What is lost is the
+contractor in progress and the notices for the run, which are raised at the end.
+
+**Where no worker is available**, one of these:
+
+* Keep screens small — `max_entities` of 3 to 5 finishes in a couple of minutes, well inside
+  a free instance's idle window.
+* Run larger screens from your own machine against the same database (see the CLI route at
+  the end of this section). Nothing about that depends on the instance staying awake.
+
+Then set `FOCI_INPROCESS_SCREENS=true` on the service. It changes nothing about how screens
+run; it records that running them in the web process is a decision rather than an oversight,
+and retires the banner that says so. Leave it unset if you intend to add a worker, so the
+reminder stays.
 
 1. **New → Key Value**, then set `REDIS_URL` on the web service to its internal URL.
 2. **New → Background Worker**, same repository, runtime Docker, dockerfile path
@@ -330,7 +351,9 @@ minutes.
 
 Do both or neither. `REDIS_URL` without a worker is worse than no queue at all: screens are
 accepted, queue up, and nothing ever runs them — `/health` says `queue: rq` and looks
-healthier than the state it replaced.
+healthier than the state it replaced. That arrangement now reports itself: the API counts the
+workers listening on the queue and warns when there are none. A count it cannot obtain is not
+reported as zero, so Redis being slow to answer a diagnostic does not raise a false alarm.
 
 ### 3. The nightly sweep
 
