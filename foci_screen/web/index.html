@@ -17,7 +17,9 @@
   <form class="searchbar" id="search-form" role="search">
     <input id="search-input" type="search" autocomplete="off" spellcheck="false"
            placeholder="Search contractors, awards, contracting officers, agencies…"
-           aria-label="Search">
+           aria-label="Search" role="combobox" aria-expanded="false"
+           aria-controls="suggest-box">
+    <div id="suggest-box" class="suggest" role="listbox" hidden></div>
     <button type="submit">Search</button>
   </form>
 

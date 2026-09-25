@@ -486,7 +486,46 @@ function firstRunPanel() {
     </div>`;
 }
 
+/* The overview used to open on everything in the database, which is whoever
+ * the last departmental screen happened to surface — a dashboard nobody chose,
+ * presented as though they had. It now opens on the portfolio, and on nothing
+ * at all until there is one. */
+function noPortfolioPanel() {
+  return `
+    <div class="page-head">
+      <h1>Overview</h1>
+      <div class="sub">Nothing is being watched yet.</div>
+    </div>
+
+    <div class="card">
+      <h2>Start with the companies you care about</h2>
+      <p class="muted">This dashboard shows a portfolio — the contractors you
+      have chosen to watch — rather than everything that has ever been screened
+      here. Until you pick some, there is nothing it should be showing you.</p>
+      <p class="muted">Two ways in: search for a company above and use
+      <strong>Add to portfolio</strong> on its page, or build one from a list
+      on the Portfolio page. If you already have a key saved in a file, paste
+      it there and this fills in.</p>
+      <div class="actions">
+        <a class="linkish" href="#/portfolio">Open the Portfolio page</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>What has been screened here</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:10px">
+        For reference — a portfolio can draw on any of it.</div>
+      <div id="recent-runs" class="muted">Loading…</div>
+    </div>`;
+}
+
 async function viewOverview() {
+  const portfolioKey = savedPortfolioKey();
+  if (portfolioKey) {
+    // The portfolio *is* the dashboard now.
+    return viewPortfolio();
+  }
+
   setBusy("Loading overview…");
   const d = await api("/v1/overview");
   const t = d.totals;
@@ -498,6 +537,17 @@ async function viewOverview() {
     view.innerHTML = firstRunPanel();
     return;
   }
+
+  view.innerHTML = noPortfolioPanel();
+  loadRecentRuns();
+  return;
+}
+
+/* Kept for the run history, which both empty states show. */
+async function viewFullDatabase() {
+  setBusy("Loading overview…");
+  const d = await api("/v1/overview");
+  const t = d.totals;
 
   view.innerHTML = `
     <div class="page-head">
@@ -565,7 +615,11 @@ async function viewOverview() {
       )}
     </div>`;
 
-  // Loaded after the page so a slow history call cannot hold up the dashboard.
+  loadRecentRuns();
+}
+
+/* Loaded after the page so a slow history call cannot hold up the dashboard. */
+function loadRecentRuns() {
   api("/v1/screens?limit=10").then((r) => {
     const box = document.getElementById("recent-runs");
     if (!box) return;
@@ -840,6 +894,8 @@ async function viewEntity(key) {
       ${documentsTable(d.documents || [], key)}
     </div>
 
+    ${addToPortfolioButton([key], "Watch this contractor on your dashboard.")}
+
     ${recordChanges(d.record_changes || [])}
 
     <div class="card">
@@ -850,6 +906,7 @@ async function viewEntity(key) {
 
   wireVerdicts(view, key, f ? f.run_id : "");
   wireIdentity(view, key);
+  wireAddToPortfolio();
 }
 
 /* Which SEC registrant this contractor is. Shown prominently because EDGAR
@@ -1207,11 +1264,17 @@ async function viewOfficer(email) {
         : '<div class="empty">No findings on this officer’s contractors.</div>'}
     </div>
 
+    ${addToPortfolioButton(
+        [...new Set(d.contracts.map((c) => c.entity_key).filter(Boolean))],
+        "Watch the contractors this officer holds awards with.")}
+
     <div class="card">
       <h2>Awards</h2>
       ${truncationNote(d.contracts_shown, d.contract_count)}
       ${contractsTable(d.contracts)}
     </div>`;
+
+  wireAddToPortfolio();
 }
 
 async function viewAgency(name) {
@@ -1244,7 +1307,13 @@ async function viewAgency(name) {
     <div class="card"><h2>Contractors</h2>
       ${entitiesTable(d.entities, { showScreened: false })}</div>
 
-    <div class="card"><h2>Contracting officers</h2>${officersTable(d.officers)}</div>`;
+    <div class="card"><h2>Contracting officers</h2>${officersTable(d.officers)}</div>
+
+    ${addToPortfolioButton(
+        d.entities.map((e) => e.entity_key).filter(Boolean),
+        "Watch this agency's contractors on your dashboard.")}`;
+
+  wireAddToPortfolio();
 }
 
 async function viewContract(key) {
@@ -1510,6 +1579,46 @@ function rememberPortfolioKey(key) {
     if (key) localStorage.setItem(PORTFOLIO_STORAGE, key);
     else localStorage.removeItem(PORTFOLIO_STORAGE);
   } catch { /* private mode: the file is the copy that counts anyway */ }
+}
+
+/* Adding to the portfolio is a button on the page for the thing being added,
+ * never a side effect of looking at it. Searching for a company, or reading
+ * its page, does not start watching it — that is a decision, and it is made
+ * here. */
+function addToPortfolioButton(keys, label) {
+  if (!keys.length) return "";
+  const many = keys.length > 1;
+  return `
+    <div class="actions">
+      <button id="pf-add" data-keys="${esc(keys.join("|"))}">
+        ${many ? `Add ${num(keys.length)} contractors to portfolio` : "Add to portfolio"}
+      </button>
+      <span class="muted" id="pf-add-status" style="font-size:12.5px;align-self:center">
+        ${esc(label || "")}</span>
+    </div>`;
+}
+
+function wireAddToPortfolio() {
+  const button = document.getElementById("pf-add");
+  if (!button) return;
+  const status = document.getElementById("pf-add-status");
+  button.onclick = async () => {
+    const keys = button.dataset.keys.split("|").filter(Boolean);
+    button.disabled = true;
+    try {
+      const d = await apiPost("/v1/portfolio/edit", {
+        key: savedPortfolioKey(), add: keys,
+      });
+      rememberPortfolioKey(d.key);
+      status.innerHTML = `Added. Portfolio now holds ${num(d.companies)}
+        compan${d.companies === 1 ? "y" : "ies"} —
+        <a href="#/portfolio">open it</a>. Save the key to a file from there.`;
+      button.textContent = "Added";
+    } catch (e) {
+      button.disabled = false;
+      status.textContent = e.message || String(e);
+    }
+  };
 }
 
 function portfolioTable(companies) {
@@ -1799,8 +1908,130 @@ async function refreshBadge() {
 
 /* ------------------------------------------------------------------- wiring */
 
+/* ------------------------------------------------------------- type-ahead */
+
+/* Suggestions while typing, from two places that mean different things: what
+ * this database has screened, and contractors that exist in federal
+ * contracting but have never been screened here.
+ *
+ * Nothing here screens anything. A screen takes minutes and walks half a dozen
+ * government APIs; firing one per keystroke would be absurd and rude. Picking
+ * an unscreened name offers a screen — it does not start one.
+ *
+ * The remote half is best effort by necessity. USAspending's autocomplete is
+ * fast on a long prefix and times out on a short one, which is the opposite of
+ * what a type-ahead wants, so it is debounced, capped, cached per prefix on
+ * the server, and allowed to come back empty. The box never waits on it. */
+const SUGGEST_DEBOUNCE_MS = 220;
+
+let suggestTimer = null;
+let suggestSeq = 0;
+let suggestItems = [];
+let suggestActive = -1;
+
+const searchInput = document.getElementById("search-input");
+const suggestBox = document.getElementById("suggest-box");
+
+function hideSuggestions() {
+  suggestItems = [];
+  suggestActive = -1;
+  if (suggestBox) {
+    suggestBox.hidden = true;
+    suggestBox.innerHTML = "";
+  }
+}
+
+function renderSuggestions(items, query) {
+  suggestItems = items;
+  suggestActive = -1;
+  if (!items.length) {
+    hideSuggestions();
+    return;
+  }
+  const icon = { entity: "contractor", officer: "officer", agency: "agency",
+                 unscreened: "screen this" };
+  suggestBox.innerHTML = items.map((item, i) => `
+    <div class="suggest-row" data-i="${i}" role="option">
+      <span class="suggest-label">${esc(item.label)}</span>
+      <span class="suggest-kind">${esc(icon[item.kind] || item.kind)}</span>
+      <span class="suggest-detail">${esc(item.detail || "")}</span>
+    </div>`).join("") +
+    `<div class="suggest-foot muted">Enter to search “${esc(query)}”</div>`;
+  suggestBox.hidden = false;
+
+  suggestBox.querySelectorAll(".suggest-row").forEach((row) => {
+    row.onmousedown = (e) => {      // mousedown: blur would close it first
+      e.preventDefault();
+      chooseSuggestion(Number(row.dataset.i));
+    };
+  });
+}
+
+function highlightSuggestion(next) {
+  const rows = suggestBox.querySelectorAll(".suggest-row");
+  if (!rows.length) return;
+  suggestActive = (next + rows.length) % rows.length;
+  rows.forEach((r, i) => r.classList.toggle("active", i === suggestActive));
+}
+
+function chooseSuggestion(index) {
+  const item = suggestItems[index];
+  if (!item) return;
+  hideSuggestions();
+  searchInput.value = item.label;
+  if (item.kind === "entity") location.hash = `#/entity/${encodeURIComponent(item.key)}`;
+  else if (item.kind === "officer") location.hash = `#/officer/${encodeURIComponent(item.key)}`;
+  else if (item.kind === "agency") location.hash = `#/agency/${encodeURIComponent(item.key)}`;
+  // An unscreened contractor goes to the search page, which is where the
+  // offer to screen it lives. Still a choice, not a screen.
+  else location.hash = `#/search/${encodeURIComponent(item.key)}`;
+}
+
+async function fetchSuggestions(q) {
+  const seq = ++suggestSeq;
+  try {
+    const d = await api(`/v1/suggest?q=${encodeURIComponent(q)}`);
+    // A slower earlier request must not overwrite a newer answer.
+    if (seq !== suggestSeq) return;
+    renderSuggestions([...(d.local || []), ...(d.remote || [])], q);
+  } catch {
+    if (seq === suggestSeq) hideSuggestions();
+  }
+}
+
+if (searchInput && suggestBox) {
+  searchInput.setAttribute("autocomplete", "off");
+  searchInput.oninput = () => {
+    const q = searchInput.value.trim();
+    if (suggestTimer) clearTimeout(suggestTimer);
+    if (q.length < 2) {
+      hideSuggestions();
+      return;
+    }
+    suggestTimer = setTimeout(() => fetchSuggestions(q), SUGGEST_DEBOUNCE_MS);
+  };
+
+  searchInput.onkeydown = (e) => {
+    if (suggestBox.hidden) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); highlightSuggestion(suggestActive + 1); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); highlightSuggestion(suggestActive - 1); }
+    else if (e.key === "Escape") hideSuggestions();
+    else if (e.key === "Enter" && suggestActive >= 0) {
+      e.preventDefault();
+      chooseSuggestion(suggestActive);
+    }
+  };
+
+  searchInput.onblur = () => setTimeout(hideSuggestions, 120);
+}
+
 document.getElementById("search-form").onsubmit = (e) => {
   e.preventDefault();
+  if (suggestActive >= 0 && !suggestBox.hidden) {
+    chooseSuggestion(suggestActive);
+    return;
+  }
+  hideSuggestions();
   const q = document.getElementById("search-input").value.trim();
   location.hash = `#/search/${encodeURIComponent(q)}`;
 };

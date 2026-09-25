@@ -311,7 +311,9 @@ every night on a deploy that was screening nothing.
 | `GET /v1/documents?entity_key=` | Source documents read while screening a contractor |
 | `GET /v1/documents/diff?source=&key=` | **What changed between two revisions** |
 | `DELETE /v1/screens/{id}` | Remove a screen and its data — reports first, deletes on `confirm=true` |
+| `GET /v1/suggest?q=` | Type-ahead: screened matches, plus contractors not screened here |
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
+| `POST /v1/portfolio/edit` | Add or drop companies, returning a new key |
 | `POST /v1/portfolio` | Open a key into a dashboard of those companies |
 | `POST /v1/watchlists` | Agencies to re-screen on a schedule |
 | `GET /v1/notices` | The review queue |
@@ -437,6 +439,40 @@ nobody chose to watch. `DELETE /v1/screens/{id}` reports what would go and delet
 repeating it with `confirm=true` removes the run, its awards, findings and pending notices.
 Stored document revisions are shared between tenants — a hash is a fact about the world, not
 about who was watching — so they are never touched.
+
+## The dashboard is a portfolio
+
+The overview opens empty. It used to open on everything in the database, which is whoever the
+last departmental screen happened to surface — a dashboard nobody chose, presented as though
+they had. Now it shows the companies you picked, and until you pick some it says so and gets
+out of the way.
+
+Picking is always a button. Searching for a company does not start watching it, and neither
+does reading its page: **Add to portfolio** sits on the contractor, officer and agency pages,
+and on an officer or agency it adds the contractors listed there. The first add starts a
+portfolio, so nothing has to be set up first.
+
+## Type-ahead
+
+The search box suggests as you type, from two places that mean different things:
+
+* **Screened here** — contractors, officers and agencies this database can answer about now.
+  A SQL `LIKE` over the local tables; instant.
+* **Not screened here yet** — contractors that exist in federal contracting but have never
+  been screened on this deployment, from USAspending's recipient autocomplete. Choosing one
+  offers to screen it.
+
+**Typing never screens anything.** A screen takes minutes and walks half a dozen government
+APIs; one per keystroke would be both absurd and a rude way to treat a public service.
+Suggesting is reading. Screening stays an explicit action behind a button.
+
+The remote half is best effort, and deliberately so. Measured against the live endpoint, a
+long prefix like `huntington ing` answers in about a second while short ones such as `rayth`
+have been seen to time out at twenty — the cost is in how many recipients the prefix matches,
+so the short prefixes a type-ahead sends first are the expensive ones. It is therefore
+debounced, floored at four characters, capped at a four-second timeout, cached per prefix, and
+allowed to come back with nothing. The box never waits on it, and local suggestions appear
+regardless.
 
 ## Portfolio keys
 

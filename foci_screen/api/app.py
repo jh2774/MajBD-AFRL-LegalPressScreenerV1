@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .. import portfolio as portfolio_keys
 from ..config import get_config
+from ..connectors.usaspending import USASpendingConnector
 from ..jobs import JobQueue
 from ..notify import render as render_notice
 from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_available
@@ -32,6 +33,7 @@ from . import auth
 from .schemas import (
     IdentityDecision,
     NoticeDecision,
+    PortfolioEdit,
     PortfolioKey,
     PortfolioRequest,
     RuleSetting,
@@ -367,6 +369,46 @@ def mint_portfolio_key(req: PortfolioRequest,
     return {"key": key, "portfolio": built.to_dict(), "companies": len(built.companies)}
 
 
+@app.post("/v1/portfolio/edit", tags=["portfolio"])
+def edit_portfolio(req: PortfolioEdit, store: Store = Depends(tenant_store)) -> dict:
+    """Add or drop companies and get the new key back.
+
+    The key is the portfolio, so every edit mints a new one and the old one
+    still opens the old list. That is a property worth keeping rather than an
+    inconvenience: a key you saved last month shows the portfolio you had last
+    month.
+    """
+    if req.key.strip():
+        try:
+            current = portfolio_keys.decode(req.key)
+        except portfolio_keys.PortfolioKeyError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    else:
+        current = portfolio_keys.Portfolio(name=req.name)
+
+    dropping = {k.strip().upper() for k in req.remove if k.strip()}
+    keys = [c.key for c in current.companies if c.key.upper() not in dropping]
+    names = {c.key: c.name for c in current.companies}
+
+    for raw in req.add:
+        key = (raw or "").strip().upper()
+        if not key or key in {k.upper() for k in keys}:
+            continue
+        keys.append(key)
+        row = store.search_entities(key, limit=1)
+        if row and (row[0].get("entity_key") or "").upper() == key:
+            names[key] = row[0].get("entity_name") or ""
+
+    if not keys:
+        return {"key": "", "companies": 0,
+                "detail": "That leaves no companies, so there is no key."}
+
+    built = portfolio_keys.from_entity_keys(
+        req.name or current.name, keys, {k.upper(): v for k, v in names.items()})
+    return {"key": portfolio_keys.encode(built), "companies": len(built.companies),
+            "name": built.name}
+
+
 @app.post("/v1/portfolio", tags=["portfolio"])
 def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> dict:
     """Resolve a key into a dashboard of what is known about those companies.
@@ -418,6 +460,82 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
         },
         "severity": by_severity,
     }
+
+
+# -------------------------------------------------------------- type-ahead
+
+USASPENDING_SUGGEST_MIN = USASpendingConnector.SUGGEST_MIN_CHARS
+
+_suggest_cache: dict[str, list[str]] = {}
+_suggest_lock = threading.Lock()
+
+
+def _remote_suggestions(q: str) -> list[str]:
+    """Contractor names from USAspending, cached and best effort.
+
+    Cached per prefix because backspacing over a word would otherwise re-ask
+    for something just answered, and because the slow prefixes are the short
+    ones everybody types through on the way to a longer one.
+    """
+    key = q.lower()
+    with _suggest_lock:
+        if key in _suggest_cache:
+            return _suggest_cache[key]
+
+    from ..httpclient import HttpClient
+
+    try:
+        names = USASpendingConnector(HttpClient(cfg)).suggest_recipients(q)
+    except Exception as exc:          # noqa: BLE001 - a suggestion is optional
+        log.debug("suggestion lookup failed for %r: %s", q, exc)
+        names = []
+
+    with _suggest_lock:
+        if len(_suggest_cache) > 500:
+            _suggest_cache.clear()
+        _suggest_cache[key] = names
+    return names
+
+
+@app.get("/v1/suggest", tags=["search"])
+def suggest(q: str = Query("", max_length=120),
+            store: Store = Depends(tenant_store)) -> dict:
+    """What the search box offers while somebody is typing.
+
+    Two kinds, kept apart because they mean different things. `local` is what
+    this database has screened and can answer about now. `remote` is a
+    contractor that exists in federal contracting but has never been screened
+    here — offering it is the difference between a search box that only knows
+    what you have already looked at and one you can start from.
+
+    Nothing here screens anything. A screen takes minutes and hits half a
+    dozen government APIs; it stays an explicit action.
+    """
+    q = q.strip()
+    if len(q) < 2:
+        return {"query": q, "local": [], "remote": [], "remote_checked": False}
+
+    local: list[dict] = []
+    for row in store.search_entities(q, limit=5):
+        local.append({"kind": "entity", "label": row["entity_name"],
+                      "key": row["entity_key"], "severity": row.get("severity"),
+                      "detail": f"{row.get('contract_count') or 0} award(s)"})
+    for row in store.search_officers(q, limit=3):
+        local.append({"kind": "officer", "label": row.get("ko_name") or row["ko_email"],
+                      "key": row["ko_email"], "detail": row.get("agency") or ""})
+    for row in store.search_agencies(q, limit=3):
+        label = row.get("sub_agency") or row.get("agency") or ""
+        local.append({"kind": "agency", "label": label, "key": label,
+                      "detail": f"{row.get('entity_count') or 0} contractor(s)"})
+
+    known = {(item["label"] or "").upper() for item in local}
+    remote = [{"kind": "unscreened", "label": name, "key": name,
+               "detail": "not screened here yet"}
+              for name in _remote_suggestions(q)
+              if name.upper() not in known]
+
+    return {"query": q, "local": local, "remote": remote[:6],
+            "remote_checked": len(q) >= USASPENDING_SUGGEST_MIN}
 
 
 # ----------------------------------------------------------------- search

@@ -90,6 +90,49 @@ a:hover { text-decoration: underline; }
   flex: 1 1 380px;
   gap: 8px;
   min-width: 260px;
+  position: relative;      /* anchors the suggestion list */
+}
+
+/* Suggestions while typing. Anchored to the input, above everything, and
+   never tall enough to cover the page it is helping you search. */
+.suggest {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 76px;             /* clear of the Search button */
+  z-index: 50;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 4px;
+}
+.suggest-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 13.5px;
+}
+.suggest-row:hover, .suggest-row.active { background: var(--surface-2); }
+.suggest-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                 white-space: nowrap; }
+.suggest-kind {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+  white-space: nowrap;
+}
+.suggest-detail { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.suggest-foot { padding: 6px 10px; font-size: 11.5px; border-top: 1px solid var(--border); }
+
+@media (max-width: 720px) {
+  .suggest { right: 0; }
 }
 
 .searchbar input {

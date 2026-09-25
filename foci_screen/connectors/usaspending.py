@@ -85,6 +85,41 @@ class USASpendingConnector:
     def __init__(self, http) -> None:
         self.http = http
 
+    # ------------------------------------------------------------- type-ahead
+    # Measured against the live endpoint: "huntington ing" answers in about a
+    # second, while "rayth" and "lockhe" both time out at twenty. The cost is
+    # in how many recipients the prefix matches, so short prefixes are the
+    # expensive ones — exactly the ones a type-ahead sends first.
+    #
+    # Hence: a floor on length, a short timeout, and failure treated as "no
+    # suggestions yet" rather than as an error. The box must never wait on
+    # this, and a slow government API must never be able to stop somebody
+    # typing.
+    SUGGEST_MIN_CHARS = 4
+    SUGGEST_TIMEOUT = 4
+
+    def suggest_recipients(self, text: str, limit: int = 6) -> list[str]:
+        """Contractor names starting from what has been typed. Best effort."""
+        text = (text or "").strip()
+        if len(text) < self.SUGGEST_MIN_CHARS:
+            return []
+
+        resp = self.http.post(
+            f"{BASE}/autocomplete/recipient/",
+            json_body={"search_text": text, "limit": min(limit, 10)},
+            timeout=self.SUGGEST_TIMEOUT, max_retries=1)
+        if resp.get("status") != 200:
+            log.debug("recipient autocomplete unavailable for %r (%s)",
+                      text, resp.get("status"))
+            return []
+
+        seen: list[str] = []
+        for row in (resp.get("json") or {}).get("results", []):
+            name = (row.get("recipient_name") or "").strip()
+            if name and name not in seen:
+                seen.append(name)
+        return seen[:limit]
+
     # ------------------------------------------------------------------ search
     def search_awards(self, agency: str = "", *, months_back: int = 12, limit: int = 25,
                       tier: str = "toptier", sub_agency: str = "",

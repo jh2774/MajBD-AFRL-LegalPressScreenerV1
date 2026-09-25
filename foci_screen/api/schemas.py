@@ -68,6 +68,18 @@ class PortfolioKey(BaseModel):
     key: str = Field(..., min_length=1, max_length=64_000)
 
 
+class PortfolioEdit(BaseModel):
+    """Add or drop companies, returning a new key.
+
+    An empty `key` starts a portfolio, so the first "add to portfolio" on a
+    contractor page does not need the reader to have built one first.
+    """
+    key: str = Field("", max_length=64_000)
+    name: str = Field("Portfolio", max_length=120)
+    add: list[str] = Field(default_factory=list, max_length=500)
+    remove: list[str] = Field(default_factory=list, max_length=500)
+
+
 class NoticeDecision(BaseModel):
     """An approve or reject. `body_text` lets a reviewer correct wording first."""
     note: str = ""
