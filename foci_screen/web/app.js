@@ -1319,6 +1319,225 @@ async function downloadNotice(id) {
   URL.revokeObjectURL(url);
 }
 
+/* --------------------------------------------------------------- portfolio */
+
+/* The key is the portfolio. It is kept here only so the page reopens without
+ * being re-pasted; the copy that matters is the one saved in a file, because
+ * browser storage is per-browser, is cleared by the things that clear browser
+ * storage, and is gone on the next machine. The UI says so rather than
+ * letting someone discover it. */
+const PORTFOLIO_STORAGE = "foci.portfolio";
+
+function savedPortfolioKey() {
+  try {
+    return localStorage.getItem(PORTFOLIO_STORAGE) || "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberPortfolioKey(key) {
+  try {
+    if (key) localStorage.setItem(PORTFOLIO_STORAGE, key);
+    else localStorage.removeItem(PORTFOLIO_STORAGE);
+  } catch { /* private mode: the file is the copy that counts anyway */ }
+}
+
+function portfolioTable(companies) {
+  const rows = companies.map((r) => `
+    <tr>
+      <td>${linkEntity(r.entity_key, r.entity_name)}</td>
+      <td>${r.screened_here ? sevTag(r.severity) : '<span class="pill">not screened here</span>'}</td>
+      <td class="num">${r.contract_count ? num(r.contract_count) : "—"}</td>
+      <td class="num">${r.obligated ? money(r.obligated) : "—"}</td>
+      <td>${r.last_screened ? day(r.last_screened) : "—"}</td>
+    </tr>`).join("");
+  return `<table>
+    <thead><tr><th>Company</th><th>Latest severity</th><th class="num">Awards</th>
+      <th class="num">Obligated</th><th>Screened</th></tr></thead>
+    <tbody>${rows}</tbody></table>`;
+}
+
+async function viewPortfolio() {
+  const key = savedPortfolioKey();
+  if (!key) {
+    view.innerHTML = portfolioEmpty();
+    wirePortfolio(null);
+    return;
+  }
+  setBusy("Opening portfolio…");
+  let d;
+  try {
+    d = await apiPost("/v1/portfolio", { key });
+  } catch (e) {
+    // A stored key that no longer loads must not trap the page: show the
+    // reason and the form, with the key still in the box to be corrected.
+    view.innerHTML = portfolioEmpty(key, e.message || String(e));
+    wirePortfolio(null);
+    return;
+  }
+
+  const unscreened = d.companies.filter((c) => !c.screened_here).length;
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${esc(d.name)}</h1>
+      <div class="sub">${num(d.totals.companies)} compan${d.totals.companies === 1 ? "y" : "ies"}
+        · saved ${day(d.created_at)}</div>
+    </div>
+
+    <div class="grid cols-4">
+      ${statCard("Obligated", money(d.totals.obligated))}
+      ${statCard("Awards", num(d.totals.contracts))}
+      ${statCard("Companies", num(d.totals.companies))}
+      ${statCard("Screened here", num(d.totals.screened_here))}
+    </div>
+
+    ${Object.keys(d.severity || {}).length ? `
+    <div class="card">
+      <h2>By latest severity</h2>
+      ${severityChart(d.severity)}
+    </div>` : ""}
+
+    <div class="card">
+      <h2>Companies</h2>
+      ${unscreened ? `<div class="muted" style="font-size:12px;margin-bottom:10px">
+        ${num(unscreened)} of these ${unscreened === 1 ? "has" : "have"} not been
+        screened on this deployment. They are listed because that is the useful
+        half of the answer — it is what to screen next, and leaving them out
+        would make the portfolio look complete when it is not.</div>` : ""}
+      ${portfolioTable(d.companies)}
+    </div>
+
+    <div class="card">
+      <h2>Your key</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:10px">
+        This portfolio <strong>is</strong> this text. Keep it in a file: it opens
+        the same dashboard in another browser, on another machine, or against a
+        database that has been rebuilt from nothing. It is not a password — it
+        holds the company names and nothing else — but anyone you send it to can
+        open the same list.</div>
+      <div class="code" id="portfolio-key" style="white-space:pre-wrap;word-break:break-all">${esc(key)}</div>
+      <div class="actions">
+        <button class="primary" id="pf-save">Save to a file</button>
+        <button id="pf-copy">Copy</button>
+        <button class="ghost" id="pf-forget">Forget on this browser</button>
+      </div>
+    </div>`;
+  wirePortfolio(d.name);
+}
+
+function portfolioEmpty(key = "", error = "") {
+  return `
+    <div class="page-head">
+      <h1>Portfolio</h1>
+      <div class="sub">A saved dashboard of the companies you watch.</div>
+    </div>
+
+    ${error ? `<div class="error"><strong>That key did not open</strong>
+      <div class="muted" style="margin-top:6px">${esc(error)}</div></div>` : ""}
+
+    <div class="card">
+      <h2>Open a saved portfolio</h2>
+      <p class="muted">Paste the key you saved. Line breaks from a text file are
+      fine.</p>
+      <textarea id="pf-key-input" rows="4" placeholder="FOCI-PORTFOLIO-1.…"
+        style="width:100%;font-family:var(--mono);font-size:12.5px">${esc(key)}</textarea>
+      <div class="actions"><button class="primary" id="pf-open">Open</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Or build one</h2>
+      <p class="muted">One company per line — a UEI, or the name as it appears on
+      an award. You will get a key back to save.</p>
+      <input id="pf-name" placeholder="Name this portfolio" style="width:100%;
+        padding:8px;border:1px solid var(--border);border-radius:8px;
+        background:var(--surface-2);color:var(--text);margin-bottom:8px">
+      <textarea id="pf-companies" rows="6" placeholder="UEI123456789&#10;LOCKHEED MARTIN CORPORATION"
+        style="width:100%;font-family:var(--mono);font-size:12.5px"></textarea>
+      <div class="actions">
+        <button class="primary" id="pf-build">Build key</button>
+        <button id="pf-build-screened">Use everything screened here</button>
+      </div>
+    </div>`;
+}
+
+function downloadPortfolioKey(key, name) {
+  const safe = (name || "portfolio").replace(/[^a-z0-9]+/gi, "-").toLowerCase();
+  const body =
+    `# foci-screen portfolio key\n` +
+    `# Keep this file. Paste the line below into the Portfolio page to reopen\n` +
+    `# this dashboard — on any machine, against any deployment.\n\n${key}\n`;
+  const url = URL.createObjectURL(new Blob([body], { type: "text/plain" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${safe}.foci-key.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function wirePortfolio(loadedName) {
+  const open = document.getElementById("pf-open");
+  if (open) {
+    open.onclick = () => {
+      const typed = document.getElementById("pf-key-input").value.trim();
+      if (!typed) return;
+      rememberPortfolioKey(typed);
+      viewPortfolio();
+    };
+  }
+
+  const build = document.getElementById("pf-build");
+  if (build) {
+    const mint = async (companies) => {
+      if (!companies.length) {
+        showError({ title: "Nothing to build",
+                    message: "Add at least one company, one per line." });
+        return;
+      }
+      try {
+        const d = await apiPost("/v1/portfolio/key", {
+          name: document.getElementById("pf-name").value.trim() || "Portfolio",
+          companies,
+        });
+        rememberPortfolioKey(d.key);
+        viewPortfolio();
+      } catch (e) {
+        showError(e);
+      }
+    };
+    build.onclick = () => mint(
+      document.getElementById("pf-companies").value
+        .split("\n").map((s) => s.trim()).filter(Boolean));
+
+    document.getElementById("pf-build-screened").onclick = async () => {
+      const d = await api("/v1/search?q=&kind=entity&limit=100");
+      await mint((d.entities || []).map((e) => e.entity_key));
+    };
+  }
+
+  const save = document.getElementById("pf-save");
+  if (save) {
+    save.onclick = () => downloadPortfolioKey(savedPortfolioKey(), loadedName);
+    document.getElementById("pf-copy").onclick = async () => {
+      const button = document.getElementById("pf-copy");
+      try {
+        await navigator.clipboard.writeText(savedPortfolioKey());
+        button.textContent = "Copied";
+      } catch {
+        // Clipboard access is refused in plenty of ordinary situations.
+        button.textContent = "Select the key above to copy";
+      }
+      setTimeout(() => { button.textContent = "Copy"; }, 2500);
+    };
+    document.getElementById("pf-forget").onclick = () => {
+      rememberPortfolioKey("");
+      viewPortfolio();
+    };
+  }
+}
+
 /* ------------------------------------------------------------------ router */
 
 const ROUTES = [
@@ -1334,6 +1553,7 @@ const ROUTES = [
                                     (params && params.get("entity")) || "")],
   [/^\/notices$/, () => viewNotices()],
   [/^\/rules$/, () => viewRules()],
+  [/^\/portfolio$/, () => viewPortfolio()],
 ];
 
 async function route() {

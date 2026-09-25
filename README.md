@@ -310,6 +310,8 @@ every night on a deploy that was screening nothing.
 | `GET /v1/contracts/{piid}` | One award, with its data-rights clauses |
 | `GET /v1/documents?entity_key=` | Source documents read while screening a contractor |
 | `GET /v1/documents/diff?source=&key=` | **What changed between two revisions** |
+| `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
+| `POST /v1/portfolio` | Open a key into a dashboard of those companies |
 | `POST /v1/watchlists` | Agencies to re-screen on a schedule |
 | `GET /v1/notices` | The review queue |
 | `POST /v1/notices/{id}/approve` | The human gate. Records a decision — does not send |
@@ -404,6 +406,38 @@ the source stopped returning is missing data, not a contractor acting — and it
 overwrites the stored value either, since a connector outage should not be able to erase a
 country of incorporation. A withdrawn certification, or a contracting officer being reassigned,
 is recorded in the log without becoming a finding.
+
+## Portfolio keys
+
+A portfolio is a named list of companies you watch, and the key is **that list encoded into one
+line of text** — not a pointer to a row in a database:
+
+```
+FOCI-PORTFOLIO-1.eNpljk1rhDAURf9KyKKbOiV-zphd1GeMMYkkURllVoVCoVQoQzel_70Zt10-zrn33R_8ium2Y…c33f6f44
+```
+
+Save it in a file. Paste it into **Portfolio** and the dashboard opens: obligated value across
+the portfolio, a severity breakdown, and every company with its latest finding.
+
+Carrying the list inside the key rather than storing it server-side is the whole point, and it
+follows from how this gets deployed. On a free instance whose database has already been
+discarded once, a saved dashboard that lives on the server is a saved dashboard that
+disappears. This one opens on another browser, on another machine, against a different
+deployment, and against a database rebuilt from nothing — because the only thing it needs is
+the text you kept.
+
+Two consequences worth stating plainly:
+
+* **A key is not a credential.** It holds company names and nothing else, and anyone you send
+  it to can open the same list. You still need an API key to reach the deployment at all.
+* **A truncated key is refused, not partly loaded.** Keys carry a checksum because the
+  realistic failure is a line cut short on its way out of an email. A portfolio that quietly
+  loaded eight of its ten companies would leave two companies unwatched by someone who believed
+  they were watching them.
+
+A company in the key that this deployment has never screened is listed as *not screened here*
+rather than dropped. That is the useful half of the answer — it is the list of what to screen
+next.
 
 ## Who this contractor is
 

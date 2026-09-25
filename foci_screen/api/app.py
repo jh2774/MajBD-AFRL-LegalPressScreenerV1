@@ -21,6 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
+from .. import portfolio as portfolio_keys
 from ..config import get_config
 from ..jobs import JobQueue
 from ..notify import render as render_notice
@@ -29,6 +30,8 @@ from . import auth
 from .schemas import (
     IdentityDecision,
     NoticeDecision,
+    PortfolioKey,
+    PortfolioRequest,
     RuleSetting,
     ScreenRequest,
     SignalDisposition,
@@ -284,6 +287,89 @@ def entity_timeline(entity_key: str, limit: int = Query(50, ge=1, le=200),
     """Severity over time — what changed, and when."""
     return {"entity_key": entity_key.upper(),
             "timeline": store.entity_history(entity_key, limit=limit)}
+
+
+# -------------------------------------------------------------- portfolios
+#
+# A portfolio key carries its own company list, so these routes hold no state
+# between calls: minting is pure encoding, and loading is the key plus whatever
+# this database happens to know about the companies in it. Nothing here is
+# stored, which is why a key still works after the database has been rebuilt.
+
+@app.post("/v1/portfolio/key", tags=["portfolio"])
+def mint_portfolio_key(req: PortfolioRequest,
+                       store: Store = Depends(tenant_store)) -> dict:
+    """Turn a list of companies into one line of text to keep in a file."""
+    names: dict[str, str] = {}
+    for raw in req.companies:
+        key = (raw or "").strip().upper()
+        if not key:
+            continue
+        # Carry the display name into the key so a portfolio still reads as
+        # company names on a deployment that has never screened them.
+        row = store.search_entities(key, limit=1)
+        if row and row[0].get("entity_key", "").upper() == key:
+            names[key] = row[0].get("entity_name") or ""
+
+    built = portfolio_keys.from_entity_keys(req.name, req.companies, names)
+    try:
+        key = portfolio_keys.encode(built)
+    except portfolio_keys.PortfolioKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"key": key, "portfolio": built.to_dict(), "companies": len(built.companies)}
+
+
+@app.post("/v1/portfolio", tags=["portfolio"])
+def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> dict:
+    """Resolve a key into a dashboard of what is known about those companies.
+
+    A company the key names but this database has never screened is reported
+    as such rather than left out. That is the useful half of the answer: it is
+    the list of what to screen next, and dropping it silently would make a
+    portfolio look complete when it is not.
+    """
+    try:
+        loaded = portfolio_keys.decode(req.key)
+    except portfolio_keys.PortfolioKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    rows: list[dict] = []
+    for company in loaded.companies:
+        totals = store.contract_totals("entity_key", company.key)
+        findings = store.search_findings(entity_key=company.key, limit=1)
+        latest = findings[0] if findings else None
+        screened = bool(totals["contract_count"]) or bool(latest)
+        rows.append({
+            "entity_key": company.key,
+            # The database's name wins when it has one: it is the name the
+            # awards were made under, and the key may carry an older one.
+            "entity_name": (latest or {}).get("entity", {}).get("name")
+                           or company.name or company.key,
+            "severity": (latest or {}).get("severity"),
+            "score": (latest or {}).get("total_score"),
+            "last_screened": (latest or {}).get("generated_at"),
+            "obligated": totals["obligated"],
+            "contract_count": totals["contract_count"],
+            "screened_here": screened,
+        })
+
+    by_severity: dict[str, int] = {}
+    for r in rows:
+        if r["severity"]:
+            by_severity[r["severity"]] = by_severity.get(r["severity"], 0) + 1
+
+    return {
+        "name": loaded.name,
+        "created_at": loaded.created_at,
+        "companies": rows,
+        "totals": {
+            "companies": len(rows),
+            "screened_here": sum(1 for r in rows if r["screened_here"]),
+            "obligated": sum(r["obligated"] for r in rows),
+            "contracts": sum(r["contract_count"] for r in rows),
+        },
+        "severity": by_severity,
+    }
 
 
 # ----------------------------------------------------------------- search

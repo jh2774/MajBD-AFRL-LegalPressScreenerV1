@@ -36,6 +36,16 @@ class WatchlistRequest(BaseModel):
     screen: ScreenRequest
 
 
+class PortfolioRequest(BaseModel):
+    """Companies to mint a portfolio key for. Entity keys, or bare names."""
+    name: str = Field("Portfolio", max_length=120)
+    companies: list[str] = Field(..., min_length=1, max_length=500)
+
+
+class PortfolioKey(BaseModel):
+    key: str = Field(..., min_length=1, max_length=64_000)
+
+
 class NoticeDecision(BaseModel):
     """An approve or reject. `body_text` lets a reviewer correct wording first."""
     note: str = ""
