@@ -115,9 +115,14 @@ class Screener:
             # Indexed for search regardless of whether a finding results — an
             # award with no risk signal is still the record that answers "what
             # else does this contracting officer hold?"
+            record_changes: list[dict] = []
             for c in ent_contracts:
-                self.store.save_contract(c, run_id, entity.key())
-            finding = self._screen_entity(entity, ent_contracts, run_id, opts, progress)
+                record_changes += self.store.save_contract(c, run_id, entity.key())
+            if record_changes:
+                progress(f"  {len(record_changes)} change(s) to the award record "
+                         f"since the last screen.")
+            finding = self._screen_entity(entity, ent_contracts, run_id, opts,
+                                          progress, record_changes)
             if finding:
                 result.findings.append(finding)
             result.contracts.extend(ent_contracts)
@@ -337,7 +342,8 @@ class Screener:
 
     # ------------------------------------------------------------ screening
     def _screen_entity(self, entity: Entity, contracts: list[Contract], run_id: str,
-                       opts: ScreenOptions, progress) -> Finding | None:
+                       opts: ScreenOptions, progress,
+                       record_changes: list[dict] | None = None) -> Finding | None:
         docs = self._gather(entity, opts, progress)
         progress(f"  {len(docs)} document(s) collected; diffing against store...")
 
@@ -353,6 +359,11 @@ class Screener:
 
         signals = engine.evaluate_documents(pairs, entity, contracts)
         signals += engine.evaluate_contracts(contracts, entity)
+        # The award record moving is evidence in its own right, and unlike a
+        # document it cannot be re-read later: the previous value is gone from
+        # the contracts row the moment it is written over.
+        signals += engine.evaluate_contract_changes(
+            record_changes or [], entity, contracts)
 
         # Tenant overrides, applied before anything compounds: a retired rule
         # must not be able to escalate something by pairing with another.

@@ -133,18 +133,31 @@ before acting.
    paging through the rows themselves — an offset, a next link, and a decision about whether
    search should report a total count or just a "more" flag.
 
-5. **Detect a novated award as an event, not just a new value.** The contracts index now
-   updates `entity_key`, `recipient_uei` and `country_of_incorporation` when a re-screen sees
-   them change; before, it updated the contractor's *name* alone, so an award that changed
-   hands kept the old contractor's key under the new contractor's name, and an entity that
-   re-registered in a covered nation read as it had the first time it was seen.
+5. ~~**Detect a novated award as an event, not just a new value.**~~ **Done.**
+   `contract_changes` records what moved on an award between screens, and three rules read it:
+   `CHANGE-NOVATION-01` (the award now sits against a different contractor),
+   `CHANGE-COUNTRY-01` (the registered seat moved — weighted by the destination
+   jurisdiction, so a move to a covered nation outscores a move to an ally), and
+   `CHANGE-FOREIGN-OWNED-01` (the FPDS self-certification newly reads true). Every one is
+   `is_new` by construction; there is no baseline case, because a first sighting records
+   nothing.
 
-   Storing the truth is the floor, not the goal. An award moving to a different UEI is a
-   **novation**, and a contractor's incorporation country moving to a covered nation is the
-   most direct structural FOCI signal this tool has access to. Both should raise a signal the
-   way a changed document does, with the old and new values as evidence. The snapshot
-   machinery does this for documents; contracts have no equivalent. This is the highest-value
-   item on the list that needs no API key.
+   Three judgement calls worth keeping:
+
+   * **A field the source stopped returning is not a change.** A connector outage that blanks
+     `country_of_incorporation` must not reach a reviewer dressed as a finding, and — the part
+     that bit during implementation — must not overwrite the stored value either. Blank
+     incoming values now leave the column alone (`_KEEP_IF_BLANK`), and so does a zero amount,
+     which would otherwise corrupt the totals above.
+   * **A withdrawn certification is logged, not signalled.** A flag being cleared is as likely
+     to be data cleanup as news.
+   * **An officer reassignment is logged, not signalled.** It changes who to notify, not
+     whether there is anything to notify about.
+
+   Still open here: a change is filed under the contractor that holds the award *now*, so a
+   novation does not appear on the losing contractor's page. And the audit trail is per-award;
+   an entity-level "this contractor re-registered" roll-up would read better than three
+   identical rows on three awards.
 
 ## Phase 3 - Native program
 

@@ -520,6 +520,100 @@ def evaluate_contracts(contracts: list[Contract], entity: Entity) -> list[Signal
     return out
 
 
+def _jurisdiction_of(value: str) -> str:
+    """Best name for a country code or country string, or "" if unflagged."""
+    name = lex.COUNTRY_CODE_TO_JURISDICTION.get((value or "").upper())
+    if name:
+        return name
+    hits = lex.find_jurisdictions(value or "")
+    return hits[0][0] if hits else ""
+
+
+def evaluate_contract_changes(changes: list[dict], entity: Entity,
+                              contracts: list[Contract]) -> list[Signal]:
+    """Signals from an award's record moving between screens.
+
+    The document side of this tool has always treated a change as worth more
+    than a standing fact — a clause that appeared last week is evidence in a
+    way the same clause sitting in a filing for nine years is not. The contract
+    record had no equivalent: an award that changed hands, or a contractor that
+    re-registered abroad, was written over in place and read afterwards as
+    though it had always been that way.
+
+    Every signal here is `is_new` by construction. There is no baseline case:
+    `save_contract` reports nothing for a first sighting.
+    """
+    ctx = RuleContext(entity=entity, contracts=contracts, is_new=True)
+    out: list[Signal] = []
+    seen_novation = False
+
+    for ch in changes:
+        field, old, new = ch.get("field"), ch.get("old", ""), ch.get("new", "")
+        piid = ch.get("piid") or ch.get("contract_key") or ""
+        url = contracts[0].usaspending_url if contracts else ""
+
+        # A novation shows up as the UEI and the entity key moving together.
+        # They are the same event, so it is reported once.
+        if field in ("entity_key", "recipient_uei"):
+            if seen_novation:
+                continue
+            seen_novation = True
+            score = _score("STRUCTURE", ctx, 1.5)
+            out.append(Signal(
+                rule_id="CHANGE-NOVATION-01", category="STRUCTURE", severity=_sev(score),
+                score=score, title="Award now recorded against a different contractor",
+                rationale=(
+                    f"Award {piid} was previously recorded against {old} and now "
+                    f"reads {new}. A transfer of an award between entities is a "
+                    f"novation, and the agreement behind it is where a change of "
+                    f"ownership would be documented. Confirm the novation package "
+                    f"(SF 30, successor-in-interest agreement) and whether a FOCI "
+                    f"review accompanied it."),
+                evidence=f"{field}: {old} -> {new} on {piid}",
+                source="usaspending/fpds", source_url=url, is_new=True))
+
+        elif field in ("country_of_incorporation", "recipient_country"):
+            name = _jurisdiction_of(new)
+            # An unflagged destination is still a structural change worth a
+            # line; it just does not carry a jurisdiction's weight.
+            mult = lex.jurisdiction_multiplier(name) if name else 0.8
+            score = _score("STRUCTURE", ctx, mult)
+            where = "country of incorporation" if field == "country_of_incorporation" \
+                else "registered address country"
+            tier = f", {lex.jurisdiction_tier(name)} tier" if name else ""
+            out.append(Signal(
+                rule_id="CHANGE-COUNTRY-01", category="STRUCTURE", severity=_sev(score),
+                score=score,
+                title=f"Contractor {where} changed: {old} → {new}",
+                rationale=(
+                    f"The {where} recorded for this contractor on award {piid} "
+                    f"moved from {old} to {new}"
+                    f"{f' ({name}{tier})' if name else ''}. A registered seat moving "
+                    f"is the most direct structural indicator available in the "
+                    f"contract record. Confirm the ownership chain and whether the "
+                    f"change was reported to the cognisant security office."),
+                evidence=f"{field}: {old} -> {new} on {piid}",
+                source="usaspending/fpds", source_url=url,
+                jurisdiction=name, is_new=True))
+
+        elif field == "foreign_owned" and str(new) == "1":
+            score = _score("STRUCTURE", ctx, 2.0)
+            out.append(Signal(
+                rule_id="CHANGE-FOREIGN-OWNED-01", category="STRUCTURE",
+                severity=_sev(score), score=score,
+                title="Contractor newly self-certifies as foreign owned and located",
+                rationale=(
+                    f"On award {piid} the FPDS foreign-owned-and-located flag was "
+                    f"previously absent and now reads true. The certification is the "
+                    f"contractor's own; it changing is a statement that something "
+                    f"about the ownership did. Verify the mitigation instrument on "
+                    f"file covers the award in its current form."),
+                evidence=f"foreign_owned: {old or '0'} -> 1 on {piid}",
+                source="fpds", source_url=url, is_new=True))
+
+    return out
+
+
 def correlate(signals: list[Signal], contracts: list[Contract]) -> list[Signal]:
     """Compound rule: foreign nexus AND an IP encumbrance is worse than either.
 

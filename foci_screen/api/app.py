@@ -225,6 +225,9 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
         "contracts_shown": len(contracts),
         "latest_finding": latest,
         "history": store.entity_history(key),
+        # What moved in the award record since the last screen. The contracts
+        # rows above hold only the present state.
+        "record_changes": store.contract_changes(entity_key=key, limit=50),
     }
 
 

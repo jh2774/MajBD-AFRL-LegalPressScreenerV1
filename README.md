@@ -384,6 +384,27 @@ revision that existed is still *known* to have existed after its text is gone, a
 Upgrading an existing database backfills bodies from the current snapshots, so the next change
 to each document is diffable rather than each needing to change twice first.
 
+### The award record changing
+
+Documents are not the only thing that moves. An award's own record can change hands, and when
+it does the contracts row is written over — so nothing afterwards says it happened. Three
+fields are watched for what they mean rather than for tidiness:
+
+| What moved | Rule | Why it matters |
+|---|---|---|
+| The award now sits against a different contractor or UEI | `CHANGE-NOVATION-01` | A **novation**. The agreement behind it is where a change of ownership would be documented |
+| Country of incorporation or registered address | `CHANGE-COUNTRY-01` | The most direct structural indicator in the contract record. Weighted by destination, so a move to a covered nation outscores a move to an ally |
+| FPDS foreign-owned-and-located newly reads true | `CHANGE-FOREIGN-OWNED-01` | The contractor's own certification changing is a statement that something about the ownership did |
+
+The transitions are kept in `contract_changes` and shown on the contractor page under
+**Changes to the award record**, which is the only place the previous value survives.
+
+Three things deliberately do *not* fire. A first sighting is a baseline, not a change. A field
+the source stopped returning is missing data, not a contractor acting — and it no longer
+overwrites the stored value either, since a connector outage should not be able to erase a
+country of incorporation. A withdrawn certification, or a contracting officer being reassigned,
+is recorded in the log without becoming a finding.
+
 ## Who this contractor is
 
 Name matching between USAspending, SEC, IAPD and USPTO is the weakest link in the chain, and

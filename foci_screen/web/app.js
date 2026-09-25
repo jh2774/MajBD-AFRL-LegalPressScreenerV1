@@ -233,6 +233,41 @@ function truncationNote(shown, total) {
     cover all ${num(total)}.</div>`;
 }
 
+/* The award record as it moved, not as it stands. The contracts table holds
+ * only the present value — once a novation is written over the old contractor,
+ * nothing on that row says an award changed hands. */
+const CHANGE_IS_RISK = new Set([
+  "entity_key", "recipient_uei", "country_of_incorporation",
+  "recipient_country", "foreign_owned",
+]);
+
+function recordChanges(changes) {
+  if (!changes.length) return "";
+  const rows = changes.map((ch) => `
+    <tr>
+      <td>${day(ch.observed_at)}</td>
+      <td>${esc(ch.label || ch.field)}</td>
+      <td class="mono">${esc(ch.old_value || "—")}</td>
+      <td class="mono">${esc(ch.new_value || "—")}</td>
+      <td>${CHANGE_IS_RISK.has(ch.field)
+             ? '<span class="pill warn">structural</span>'
+             : '<span class="pill">administrative</span>'}</td>
+    </tr>`).join("");
+  return `
+    <div class="card">
+      <h2>Changes to the award record</h2>
+      <div class="muted" style="font-size:12px;margin-bottom:10px">
+        What moved between screens. A contractor or UEI changing is a novation;
+        a country of incorporation changing is the most direct structural
+        indicator in the contract record. Both are written over in place, so
+        this is the only place the previous value survives.</div>
+      <table>
+        <thead><tr><th>Seen</th><th>Field</th><th>Was</th><th>Now</th><th></th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
 function contractsTable(contracts) {
   if (!contracts.length) return `<div class="empty">No awards recorded.</div>`;
   const rows = contracts
@@ -616,6 +651,8 @@ async function viewEntity(key) {
         diffed — that is where a change actually shows itself.</div>
       ${documentsTable(d.documents || [], key)}
     </div>
+
+    ${recordChanges(d.record_changes || [])}
 
     <div class="card">
       <h2>Awards</h2>

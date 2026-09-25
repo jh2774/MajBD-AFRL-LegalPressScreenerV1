@@ -163,6 +163,22 @@ CREATE TABLE IF NOT EXISTS contracts (
     updated_at    TEXT NOT NULL,
     UNIQUE (tenant_id, contract_key)
 );
+-- What changed about an award between one screen and the next. The contracts
+-- row holds the present state; this holds the transition, which is the part a
+-- reviewer needs to see. An award moving to a different UEI is a novation, and
+-- a contractor's incorporation country moving is the most direct structural
+-- FOCI signal in the record — neither is visible from the current value alone.
+CREATE TABLE IF NOT EXISTS contract_changes (
+    id            {pk},
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    contract_key  TEXT NOT NULL,
+    entity_key    TEXT NOT NULL,
+    run_id        TEXT NOT NULL,
+    field         TEXT NOT NULL,
+    old_value     TEXT,
+    new_value     TEXT,
+    observed_at   TEXT NOT NULL
+);
 -- One reviewer's verdict on one signal. The only labelled data the tool ever
 -- gets: without it, "is this rule earning its place?" is unanswerable and
 -- weight tuning is guesswork.
@@ -239,6 +255,8 @@ CREATE INDEX IF NOT EXISTS idx_contracts_agency ON contracts(tenant_id, agency);
 CREATE INDEX IF NOT EXISTS idx_entdocs ON entity_documents(tenant_id, entity_key);
 CREATE INDEX IF NOT EXISTS idx_disp_rule ON dispositions(tenant_id, rule_id);
 CREATE INDEX IF NOT EXISTS idx_disp_entity ON dispositions(tenant_id, entity_key);
+CREATE INDEX IF NOT EXISTS idx_cchanges ON contract_changes(tenant_id, entity_key);
+CREATE INDEX IF NOT EXISTS idx_cchanges_run ON contract_changes(tenant_id, run_id);
 """
 
 # Columns added after the first single-user release. `CREATE TABLE IF NOT
@@ -293,6 +311,40 @@ def postgres_driver_available() -> bool:
 # SQLite has no default LIKE escape character, so it has to be named in the
 # statement. Postgres defaults to backslash and accepts the clause as written.
 ESC = "ESCAPE '\\'"
+
+
+# Columns an award carries that a partial upstream response may simply omit.
+# Writing the blank over a known value loses data no later screen recovers, so
+# the stored value stands until something replaces it with a real one. The cost
+# is that a value genuinely cleared upstream persists here; for a screen, a
+# stale country of incorporation is a far better failure than a missing one.
+_KEEP_IF_BLANK = (
+    "piid", "award_id", "entity_name", "agency", "sub_agency", "start_date",
+    "end_date", "naics_description", "psc_description", "description",
+    "solicitation_id", "recipient_uei", "recipient_country",
+    "country_of_incorporation", "foreign_funding", "ko_name", "ko_email",
+    "ko_source", "ko_confidence", "source_url", "prime_award_id",
+    "prime_recipient_name",
+)
+# Written unconditionally. `entity_key` is always supplied by the caller;
+# `foreign_owned` and `is_subaward` are 0/1 with no "unknown" to protect, so a
+# correction has to be able to clear them.
+_ALWAYS_WRITE = ("run_id", "entity_key", "foreign_owned", "is_subaward",
+                 "ip_clauses", "updated_at")
+
+
+def _contract_update_clause() -> str:
+    """The DO UPDATE SET list: every column except the row's identity."""
+    parts = [f"{col}=excluded.{col}" for col in _ALWAYS_WRITE]
+    parts += [f"{col}=COALESCE(NULLIF(excluded.{col}, ''), contracts.{col})"
+              for col in _KEEP_IF_BLANK]
+    # Zero here means the detail call did not return a figure; a real award of
+    # nothing is rare, and silently zeroing one corrupts every total above it.
+    parts.append("amount=COALESCE(NULLIF(excluded.amount, 0), contracts.amount)")
+    return ", ".join(parts)
+
+
+CONTRACT_UPDATE_CLAUSE = _contract_update_clause()
 
 
 def _like(q: str) -> str:
@@ -1044,16 +1096,35 @@ class Store:
 
 
     # -------------------------------------------------------------- contracts
-    def save_contract(self, contract, run_id: str, entity_key: str) -> None:
-        """Index one award so it can be searched.
+    # Fields whose movement between screens is worth recording. Amounts and
+    # dates move on ordinary modifications and would drown the interesting
+    # ones; these describe *who* holds the award and *where they are*.
+    WATCHED_FIELDS = (
+        ("entity_key", "contractor"),
+        ("entity_name", "contractor name"),
+        ("recipient_uei", "UEI"),
+        ("country_of_incorporation", "country of incorporation"),
+        ("recipient_country", "registered address country"),
+        ("foreign_owned", "FPDS foreign-owned flag"),
+        ("ko_email", "contracting officer"),
+    )
+
+    def save_contract(self, contract, run_id: str, entity_key: str) -> list[dict]:
+        """Index one award so it can be searched, and report what moved.
 
         The finding payload already carries its contracts, but as JSON — you
         cannot search inside it, which is the whole reason this table exists.
+
+        Returns the changes observed against the stored row, oldest state to
+        newest. A first sighting returns nothing: there is no transition, and
+        calling a baseline a change is the mistake the document side of this
+        tool already takes care to avoid.
         """
         key = (contract.piid or contract.award_id or "").strip()
         if not key:
-            return
+            return []
         o = contract.officer
+        changes = self._contract_changes(key, contract, entity_key, run_id)
         with self._tx() as c:
             c.execute(
                 "INSERT INTO contracts (tenant_id, contract_key, run_id, piid, award_id,"
@@ -1064,37 +1135,16 @@ class Store:
                 " ko_email, ko_source, ko_confidence, ip_clauses, source_url,"
                 " is_subaward, prime_award_id, prime_recipient_name, updated_at)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                # Every column except the identity of the row. The update list
-                # used to carry entity_name but not entity_key, uei or
-                # country_of_incorporation, so an award that changed hands kept
-                # the old contractor's key under the new contractor's name, and
-                # an entity whose incorporation country moved to a covered
-                # nation went on reading as it did the first time it was seen.
-                # Those are the fields a FOCI screen exists to watch; holding
-                # the reassuring first value is the worst available answer.
-                " ON CONFLICT (tenant_id, contract_key) DO UPDATE SET"
-                " run_id=excluded.run_id, piid=excluded.piid,"
-                " award_id=excluded.award_id, entity_key=excluded.entity_key,"
-                " entity_name=excluded.entity_name, agency=excluded.agency,"
-                " sub_agency=excluded.sub_agency, amount=excluded.amount,"
-                " start_date=excluded.start_date, end_date=excluded.end_date,"
-                " naics_description=excluded.naics_description,"
-                " psc_description=excluded.psc_description,"
-                " description=excluded.description,"
-                " solicitation_id=excluded.solicitation_id,"
-                " recipient_uei=excluded.recipient_uei,"
-                " recipient_country=excluded.recipient_country,"
-                " country_of_incorporation=excluded.country_of_incorporation,"
-                " foreign_owned=excluded.foreign_owned,"
-                " foreign_funding=excluded.foreign_funding,"
-                " ko_name=excluded.ko_name,"
-                " ko_email=excluded.ko_email, ko_source=excluded.ko_source,"
-                " ko_confidence=excluded.ko_confidence,"
-                " ip_clauses=excluded.ip_clauses, source_url=excluded.source_url,"
-                " is_subaward=excluded.is_subaward,"
-                " prime_award_id=excluded.prime_award_id,"
-                " prime_recipient_name=excluded.prime_recipient_name,"
-                " updated_at=excluded.updated_at",
+                # Every column except the identity of the row — see
+                # CONTRACT_UPDATE_CLAUSE. The list used to carry entity_name
+                # but not entity_key, uei or country_of_incorporation, so an
+                # award that changed hands kept the old contractor's key under
+                # the new contractor's name, and an entity whose incorporation
+                # country moved to a covered nation went on reading as it did
+                # the first time it was seen. Those are the fields a FOCI
+                # screen exists to watch.
+                " ON CONFLICT (tenant_id, contract_key) DO UPDATE SET "
+                + CONTRACT_UPDATE_CLAUSE,
                 (self.tenant_id, key, run_id, contract.piid, contract.award_id,
                  entity_key, contract.recipient_name, contract.awarding_agency,
                  contract.awarding_sub_agency, float(contract.award_amount or 0),
@@ -1107,6 +1157,72 @@ class Store:
                  json.dumps(contract.ip_clause_hits or []), contract.source_url,
                  1 if contract.is_subaward else 0, contract.prime_award_id,
                  contract.prime_recipient_name, _now()))
+        return changes
+
+    def _contract_changes(self, key: str, contract, entity_key: str,
+                          run_id: str) -> list[dict]:
+        """Diff the incoming award against the stored one, and record it."""
+        existing = self._one(
+            "SELECT * FROM contracts WHERE tenant_id=? AND contract_key=?",
+            (self.tenant_id, key))
+        if not existing:
+            return []
+
+        incoming = {
+            "entity_key": entity_key,
+            "entity_name": contract.recipient_name,
+            "recipient_uei": contract.recipient_uei,
+            "country_of_incorporation": contract.country_of_incorporation,
+            "recipient_country": contract.recipient_country,
+            "foreign_owned": 1 if contract.foreign_owned_and_located else 0,
+            "ko_email": contract.officer.email,
+        }
+
+        changes: list[dict] = []
+        now = _now()
+        for field_name, label in self.WATCHED_FIELDS:
+            old, new = existing.get(field_name), incoming.get(field_name)
+            old_s = "" if old is None else str(old).strip()
+            new_s = "" if new is None else str(new).strip()
+            # A field the new record simply does not carry is missing data, not
+            # a change. Reporting "country of incorporation: USA → (blank)" as
+            # a movement would put a connector outage in front of a reviewer as
+            # though the contractor had done something.
+            if not new_s or old_s == new_s:
+                continue
+            changes.append({"contract_key": key, "field": field_name,
+                            "label": label, "old": old_s, "new": new_s,
+                            "piid": contract.piid or contract.award_id,
+                            "observed_at": now})
+
+        if changes:
+            with self._tx() as c:
+                for ch in changes:
+                    c.execute(
+                        "INSERT INTO contract_changes (tenant_id, contract_key,"
+                        " entity_key, run_id, field, old_value, new_value, observed_at)"
+                        " VALUES (?,?,?,?,?,?,?,?)",
+                        (self.tenant_id, key, entity_key, run_id, ch["field"],
+                         ch["old"], ch["new"], now))
+        return changes
+
+    def contract_changes(self, entity_key: str = "", run_id: str = "",
+                         limit: int = 100) -> list[dict]:
+        sql = "SELECT * FROM contract_changes WHERE tenant_id=?"
+        params: list = [self.tenant_id]
+        if entity_key:
+            sql += " AND entity_key=?"
+            params.append(entity_key)
+        if run_id:
+            sql += " AND run_id=?"
+            params.append(run_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        rows = self._query(sql, tuple(params))
+        labels = dict(self.WATCHED_FIELDS)
+        for r in rows:
+            r["label"] = labels.get(r["field"], r["field"])
+        return rows
 
     def get_contract(self, contract_key: str) -> dict | None:
         row = self._one("SELECT * FROM contracts WHERE tenant_id=? AND contract_key=?",
