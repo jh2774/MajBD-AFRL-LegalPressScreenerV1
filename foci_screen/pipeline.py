@@ -254,6 +254,12 @@ class Screener:
 
         by_host: dict[str, dict[str, int]] = {}
         for url, reason in self.web.skipped_robots.items():
+            # A subdomain that was only ever a guess and does not exist is not
+            # reduced coverage. Reporting it as "did not read" would put a
+            # wall of hosts nobody claimed existed into a run's notes, and
+            # bury the refusals that do mean something.
+            if reason == "host does not exist":
+                continue
             host = urlparse(url).netloc.lower()
             reasons = by_host.setdefault(host, {})
             reasons[reason] = reasons.get(reason, 0) + 1

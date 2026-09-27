@@ -45,6 +45,21 @@ class HostRules:
     last_fetch: float | None = None
 
 
+# What a DNS failure looks like coming back through requests/urllib3. Matched
+# on the text because the client flattens the exception to a string, and a
+# false negative here only costs the old, vaguer reason.
+_DNS_MARKERS = (
+    "nameresolutionerror", "failed to resolve", "getaddrinfo failed",
+    "name or service not known", "nodename nor servname",
+    "temporary failure in name resolution",
+)
+
+
+def _is_dns_failure(error: str) -> bool:
+    lowered = (error or "").lower()
+    return any(marker in lowered for marker in _DNS_MARKERS)
+
+
 class RobotsPolicy:
     """Answers "may we fetch this URL?", fetching each host's robots.txt once."""
 
@@ -76,17 +91,31 @@ class RobotsPolicy:
         if 400 <= status < 500:
             return HostRules("allow_all", reason=f"robots.txt returned {status}")
 
+        # A name that does not resolve is not a server declining to answer —
+        # there is no server. Both arrive here as status 0, and calling them
+        # the same thing puts "refused by robots.txt" in a run's coverage notes
+        # for a subdomain that was only ever a guess, which reads as a site
+        # shutting us out. The fetch is still refused; only the reason differs,
+        # and the reason is what a reader acts on.
+        if _is_dns_failure(resp.get("error") or ""):
+            return HostRules("no_such_host", reason="host does not exist")
+
         log.info("%s/robots.txt unreachable (status %s) — treating the host as "
                  "disallowed for this run", host, status or "no response")
         return HostRules("deny_all",
                          reason=f"robots.txt unreachable ({status or 'no response'})")
+
+    def host_exists(self, url: str) -> bool:
+        """False when the name does not resolve. Cached with the rules, so
+        asking costs one lookup however many paths are tried on it."""
+        return self.rules_for(url).verdict != "no_such_host"
 
     def allowed(self, url: str) -> tuple[bool, str]:
         """(may_fetch, reason). The reason is for the run notes when refused."""
         rules = self.rules_for(url)
         if rules.verdict == "allow_all":
             return True, ""
-        if rules.verdict == "deny_all":
+        if rules.verdict in ("deny_all", "no_such_host"):
             return False, rules.reason
         if rules.crawl_delay > MAX_CRAWL_DELAY:
             return False, (f"Crawl-delay of {rules.crawl_delay:g}s exceeds the "

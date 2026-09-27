@@ -64,14 +64,31 @@ HOME_WITH_FEED = """<html><head>
 </head><body>Corporate homepage.</body></html>"""
 
 
+class StubRobots:
+    """Only the question the feed connector asks: does this host exist?"""
+
+    def __init__(self, existing_hosts):
+        self.existing = set(existing_hosts)
+        self.asked: list[str] = []
+
+    def host_exists(self, url):
+        host = url.split("://", 1)[-1].split("/")[0]
+        self.asked.append(host)
+        return host in self.existing
+
+
 class StubWeb:
     """Stands in for WebWatchConnector, recording what was asked for."""
 
-    def __init__(self, pages=None, raw=None):
+    def __init__(self, pages=None, raw=None, hosts=None):
         self.pages = pages or {}
         self.raw = raw or {}
         self.raw_calls: list[str] = []
         self.fetch_calls: list[str] = []
+        # Every host mentioned in the fixtures resolves unless stated.
+        known = {u.split("://", 1)[-1].split("/")[0]
+                 for u in list(self.pages) + list(self.raw)}
+        self.robots = StubRobots(hosts if hosts is not None else known)
 
     class _Fetched:
         def __init__(self, html):
@@ -268,6 +285,49 @@ def test_everything_goes_through_the_compliance_layer():
     assert not hasattr(conn, "http")
     assert web.fetch_calls and web.raw_calls
     assert all(u.startswith("https://meridian.example") for u in web.raw_calls)
+
+
+# ------------------------------------------------------ newsroom subdomains
+
+def test_a_feed_on_the_newsroom_subdomain_is_found():
+    """Where an IR platform serves it, which is the common arrangement for
+    the smaller contractors that make up most of what this tool screens."""
+    web = StubWeb(
+        pages={"https://example.test": "<html>no feed here</html>",
+               "https://news.example.test": HOME_WITH_FEED},
+        raw={"https://news.example.test/news/rss.xml": RSS})
+    assert FeedConnector(web).discover_feeds("example.test") == [
+        "https://news.example.test/news/rss.xml"]
+
+
+def test_an_investors_subdomain_feed_is_found_by_probing():
+    web = StubWeb(
+        pages={"https://example.test": "<html></html>",
+               "https://investors.example.test": "<html></html>"},
+        raw={"https://investors.example.test/rss/news-releases.xml": RSS})
+    assert FeedConnector(web).discover_feeds("example.test") == [
+        "https://investors.example.test/rss/news-releases.xml"]
+
+
+def test_the_primary_domain_wins_and_subdomains_are_not_tried():
+    """Found on the domain itself, so nothing is guessed at."""
+    web = StubWeb(pages={"https://example.test": HOME_WITH_FEED},
+                  raw={"https://example.test/news/rss.xml": RSS})
+    conn = FeedConnector(web)
+    assert conn.discover_feeds("example.test") == ["https://example.test/news/rss.xml"]
+    assert web.robots.asked == [], "no subdomain should have been considered"
+
+
+def test_a_subdomain_that_does_not_resolve_costs_nothing():
+    """Guessing five names on a company that has none must not spend five
+    fetches, nor report five hosts as refusing us."""
+    web = StubWeb(pages={"https://example.test": "<html></html>"}, hosts=set())
+    conn = FeedConnector(web)
+
+    assert conn.discover_feeds("example.test") == []
+    assert web.robots.asked, "existence should be checked"
+    assert not any("news.example.test" in u for u in web.fetch_calls)
+    assert not any("news.example.test" in u for u in web.raw_calls)
 
 
 def test_a_refused_feed_is_simply_no_documents():

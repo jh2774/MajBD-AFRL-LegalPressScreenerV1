@@ -44,6 +44,23 @@ CANDIDATE_FEEDS = (
     "/feed/press-release", "/api/rss/news",
 )
 
+# Hosts a newsroom or investor-relations site is normally served from. Ordered
+# by how often they exist at all; `ir.` is last because it is the rarest of
+# the five on the companies measured.
+NEWSROOM_SUBDOMAINS = ("news", "investors", "media", "investor", "ir")
+
+# The same paths, reordered for a host that exists to serve news. An
+# off-the-shelf investor-relations site answers on a platform path, so those
+# go first — with a budget of six probes, leaving them at the end of the
+# general list meant they were never reached on the host most likely to have
+# one.
+IR_CANDIDATE_FEEDS = (
+    "/rss/news-releases.xml", "/rss/pressreleases.aspx",
+    "/rss/pressrelease.aspx", "/feed/press-release",
+    "/rss", "/rss.xml", "/feed", "/feed.xml", "/atom.xml",
+    "/api/rss/news", "/news/rss.xml", "/press-releases/rss",
+)
+
 FEED_LINK_RX = re.compile(
     r"""<link\b[^>]*?
         (?=[^>]*?\brel\s*=\s*["']?alternate)
@@ -207,9 +224,8 @@ class FeedConnector:
         self.feeds_found: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------ discovery
-    def discover_feeds(self, domain: str) -> list[str]:
-        """Feed URLs a site advertises, falling back to the usual paths."""
-        base = domain if domain.startswith("http") else f"https://{domain}"
+    def _feeds_on(self, base: str, paths=CANDIDATE_FEEDS) -> list[str]:
+        """Feeds one host advertises, else the usual paths tried on it."""
         found: list[str] = []
 
         home = self.web._fetch(base)
@@ -218,17 +234,49 @@ class FeedConnector:
                 url = urljoin(base, href.strip())
                 if url not in found and _same_host(base, url):
                     found.append(url)
+        if found:
+            return found
+
+        probes = 0
+        for path in paths:
+            if probes >= self.MAX_PROBES:
+                break
+            probes += 1
+            url = urljoin(base, path)
+            body, _ = self.web.fetch_raw(url)
+            if looks_like_releases(parse_feed(body)):
+                return [url]
+        return []
+
+    def discover_feeds(self, domain: str) -> list[str]:
+        """Feeds on the domain, then on the hosts a newsroom usually sits on.
+
+        The subdomains are tried because that is where an investor-relations
+        platform's feed normally lives — Q4 and Notified serve them from
+        `investors.` — not because the primes tested have one. Measured
+        against eight of them, none did: the newsroom subdomains that answer
+        advertise no feed, and the IR subdomains either do not resolve or
+        stall behind bot management. It is kept for the smaller contractors
+        that make up most of what this tool screens, where an off-the-shelf IR
+        site is the norm rather than a bespoke one.
+
+        A name that does not resolve costs one cached DNS failure and is then
+        skipped, so guessing five subdomains on a company that has none is
+        cheap and says nothing in the run notes.
+        """
+        base = domain if domain.startswith("http") else f"https://{domain}"
+        found = list(self._feeds_on(base))
 
         if not found:
-            probes = 0
-            for path in CANDIDATE_FEEDS:
-                if probes >= self.MAX_PROBES or found:
+            host = urlparse(base).netloc
+            for sub in NEWSROOM_SUBDOMAINS:
+                if len(found) >= self.MAX_FEEDS:
                     break
-                probes += 1
-                url = urljoin(base, path)
-                body, _ = self.web.fetch_raw(url)
-                if looks_like_releases(parse_feed(body)):
-                    found.append(url)
+                candidate = f"https://{sub}.{host}"
+                if not self.web.robots.host_exists(candidate):
+                    continue
+                found.extend(f for f in self._feeds_on(candidate, IR_CANDIDATE_FEEDS)
+                             if f not in found)
 
         self.feeds_found[domain] = found[:self.MAX_FEEDS]
         return self.feeds_found[domain]

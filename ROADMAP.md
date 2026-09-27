@@ -204,17 +204,24 @@ Ordered by how much they limit the tool today.
    layer as the page crawl. See the README for the shape and for the site-inventory feed that
    has to be rejected.
 
-   **What it recovered, measured rather than assumed: one prime in six.** General Dynamics
-   publishes a usable feed at a discoverable path. Lockheed, RTX, Northrop, Leidos and HII
-   advertise nothing the probe budget finds on their primary domain. So the feed route is a
-   real addition, not a replacement for the page crawl, and the IR-page gap is narrower than
-   it was but not closed.
+   ~~Worth trying next: newsroom and IR subdomains as separate discovery targets.~~ **Done,
+   and it paid off once.** Huntington Ingalls serves a feed from
+   `ir.hii.com/rss/pressrelease.aspx` — a Notified platform path on a subdomain, invisible
+   from the primary domain. Finding it needed two changes: trying the subdomains at all, and
+   probing the platform paths *first* on them, since a six-probe budget never reached
+   `/rss/pressrelease.aspx` at the end of the general list.
 
-   Worth trying next, in order of likely yield: newsroom subdomains (`news.*`, `media.*`) and
-   IR subdomains as separate discovery targets, since that is where a Q4 or Notified feed
-   usually lives; the platforms' own feed URL patterns once a host is known to run one; and
-   email alerts, which are offered to anyone and are the route the IR platforms actually
-   intend for this.
+   **What the feed route recovers, measured: two primes in six.** General Dynamics on its own
+   domain, Huntington Ingalls on `ir.`. Lockheed, RTX, Northrop and Leidos advertise nothing
+   the budget finds, and their IR hosts either do not resolve under the usual names or stall
+   behind bot management. A real addition to the page crawl, not a replacement.
+
+   Worth trying next, in order of likely yield: **email alerts**, which every IR platform
+   offers to anyone who asks and is the route they actually intend for this — it needs a
+   mailbox and a parser rather than a crawler, and it is the only option that works on the
+   hosts refusing automated clients. Then **wire services** (PR Newswire, Business Wire,
+   GlobeNewswire), which syndicate the same announcements under licence. Neither is a
+   scraping problem, which is the point.
 
    Chasing the IR problem did turn up a bug that stands: page normalisation trusted `<main>`,
    and Lockheed's newsroom keeps a nav rail there with the press releases outside it, so 150KB

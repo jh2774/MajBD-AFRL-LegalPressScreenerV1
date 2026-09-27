@@ -410,9 +410,23 @@ settles litigation over pricing" — the legal reading wins, because that is the
 Every request goes through `WebWatchConnector`, so robots.txt, crawl delay and the honest
 User-Agent are enforced in one place for feeds and pages alike. There is no second HTTP path.
 
+Discovery tries the company's own domain first, then the hosts a newsroom usually sits on —
+`news.`, `investors.`, `media.`, `investor.`, `ir.` — because that is where an off-the-shelf
+investor-relations site serves its feed. On those hosts the platform paths are tried first: Q4
+and Notified answer on `/rss/news-releases.xml` and `/rss/pressrelease.aspx`, and with a budget
+of six probes, leaving those at the end of a general list meant they were never reached on the
+host most likely to have one.
+
 **Coverage is patchy, and this is measured rather than assumed.** Of six primes checked live,
-one (General Dynamics) publishes a usable feed at a discoverable path; the rest advertise
-nothing our probe budget finds, and the page crawl remains their only route.
+two publish a usable feed: General Dynamics on its own domain, and Huntington Ingalls at
+`ir.hii.com/rss/pressrelease.aspx` — found only once subdomains were tried. Lockheed, RTX,
+Northrop and Leidos advertise nothing the probe budget finds; their investor-relations hosts
+either do not resolve under the usual names or stall behind bot management, and the page crawl
+remains their only route.
+
+A guessed subdomain that does not exist costs one cached DNS failure and is then skipped. It is
+not reported as reduced coverage either: a name nobody claimed existed is not a site refusing
+us, and listing five of them per company would bury the refusals that do mean something.
 
 **One trap, found live.** A content management system will serve `/rss.xml` listing every page
 on the site — "Homepage", "Insights", "Climate Solutions" — with real publication dates
