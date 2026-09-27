@@ -34,6 +34,18 @@ REDACTIONS: list[tuple[re.Pattern, str]] = [
     # Local development API keys created during the session.
     (re.compile(r"\bdev-local-key\b"), "<redacted-api-key>"),
     (re.compile(r"\b(?:sk|rnd)_[A-Za-z0-9_\-]{12,}"), "<redacted-secret>"),
+    # The deployed key. It is a long unpunctuated word with no prefix to match
+    # on, so it is listed literally — a pattern loose enough to catch it by
+    # shape would redact half the prose. The value in FOCI_API_KEYS, and
+    # anything that looks like a tenant-prefixed key.
+    (re.compile(r"jh6dagger\w*", re.I), "<redacted-api-key>"),
+    (re.compile(r"(FOCI_API_KEYS\s*=\s*)\S+"), r"\1<redacted-api-key>"),
+    (re.compile(r"(Bearer\s+)[A-Za-z0-9_\-]{16,}"), r"\1<redacted-api-key>"),
+    (re.compile(r"(X-API-Key['\"]?\s*[:=]\s*['\"]?)[A-Za-z0-9_\-]{16,}"),
+     r"\1<redacted-api-key>"),
+    # Postgres URLs carry a password in the userinfo field.
+    (re.compile(r"postgres(?:ql)?://[^:\s]+:[^@\s]+@", re.I),
+     "postgresql://<redacted-credentials>@"),
     # The operator's own address. Government contact addresses (.mil/.gov) are
     # public record and are the tool's actual output, so they stay.
     (re.compile(r"[\w.+-]+@(?:gmail|outlook|hotmail|yahoo|proton|icloud)\.[a-z.]+",

@@ -32,6 +32,7 @@ SECTIONS = [
     ("Core", ["foci_screen/__init__.py", "foci_screen/config.py", "foci_screen/models.py",
               "foci_screen/httpclient.py", "foci_screen/store.py",
               "foci_screen/pipeline.py", "foci_screen/jobs.py",
+              "foci_screen/portfolio.py",
               "foci_screen/worker.py", "foci_screen/scheduler.py",
               "foci_screen/cli.py"]),
     ("Connectors (the data sources)", [

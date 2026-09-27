@@ -28,3 +28,7 @@ foci-screen-all-code.md
 # want it; it carries federal contact addresses and draft notices naming real
 # contractors, which do not belong in a public repository.
 docs/SESSION_LOG.md
+# Documentation and build history in one text file. Generated from the two
+# above, and inherits the same reason for staying out: regenerate it with
+# tools/bundle_docs.py.
+foci-screen-docs.txt
