@@ -389,7 +389,41 @@ revision that existed is still *known* to have existed after its text is gone, a
 Upgrading an existing database backfills bodies from the current snapshots, so the next change
 to each document is diffable rather than each needing to change twice first.
 
-### The award record changing
+### Press, financial and legal releases
+
+Scraping a newsroom is the worse route even where it works. The page carries navigation, a
+cookie banner and a "related items" rail, all of which change for reasons that have nothing to
+do with the company — and several investor-relations hosts refuse an honestly identified
+crawler outright.
+
+A release feed is the better shape *and* the permitted one. Q4, Notified and EQS all publish
+RSS or Atom for this purpose, so `connectors/feeds.py` looks for one, and turns each entry into
+its own document keyed on the release URL. That matters for change detection: a new
+announcement arrives as a **new document** rather than as a diff against a page that has been
+rearranged, and the engine already scores evidence that appeared since the last screen above
+evidence that has sat there for years.
+
+Releases are sorted into **press**, **financial** and **legal** from the headline and
+standfirst, matched on whole words. Where an announcement is both — "Q3 results; company
+settles litigation over pricing" — the legal reading wins, because that is the reportable half.
+
+Every request goes through `WebWatchConnector`, so robots.txt, crawl delay and the honest
+User-Agent are enforced in one place for feeds and pages alike. There is no second HTTP path.
+
+**Coverage is patchy, and this is measured rather than assumed.** Of six primes checked live,
+one (General Dynamics) publishes a usable feed at a discoverable path; the rest advertise
+nothing our probe budget finds, and the page crawl remains their only route.
+
+**One trap, found live.** A content management system will serve `/rss.xml` listing every page
+on the site — "Homepage", "Insights", "Climate Solutions" — with real publication dates
+attached. Accepted, it would have filled a contractor's document history with furniture and
+diffed it forever after. Dates do not separate that from a release feed; both have them. Title
+length does, since a headline is a sentence and a page title is a label, so a feed whose median
+title runs under four words is ignored. It is a heuristic, biased towards rejecting: missing a
+feed costs coverage the page crawl may still get, while accepting the wrong one puts navigation
+in front of a reviewer as though it were evidence.
+
+## The award record changing
 
 Documents are not the only thing that moves. An award's own record can change hands, and when
 it does the contracts row is written over — so nothing afterwards says it happened. Three

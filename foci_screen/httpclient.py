@@ -116,14 +116,18 @@ class HttpClient:
                 return {"status": resp.status_code, "url": resp.url, "text": "",
                         "json": None, "error": last_err}
 
+            ctype = resp.headers.get("content-type", "")
             payload: dict[str, Any] = {
                 "status": resp.status_code,
                 "url": resp.url,
                 "text": resp.text,
                 "json": None,
                 "error": "",
+                # Carried because a caller may need to tell a feed from a page
+                # that merely links to one. Absent from payloads cached by
+                # earlier versions, so read it with .get().
+                "content_type": ctype,
             }
-            ctype = resp.headers.get("content-type", "")
             if "json" in ctype or resp.text[:1] in "{[":
                 try:
                     payload["json"] = resp.json()

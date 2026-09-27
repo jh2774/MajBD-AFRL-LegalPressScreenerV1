@@ -180,6 +180,29 @@ class WebWatchConnector:
 
         return Fetched(html, text, "http") if text else Fetched("", "", "")
 
+    def fetch_raw(self, url: str) -> tuple[str, str]:
+        """Body and content type, unnormalised. Returns ("", "") if refused.
+
+        For documents that are not pages. `_fetch` measures a response against
+        what rendered HTML should look like and escalates a thin one to a
+        headless browser — correct for a newsroom, wrong for an XML feed, whose
+        body would be judged by a heuristic built for prose and then handed to
+        a browser that has no reason to improve on it.
+
+        The robots check and the crawl delay are the same ones `_fetch` uses,
+        deliberately: this is another way in, not a way around.
+        """
+        permitted, reason = self.robots.allowed(url)
+        if not permitted:
+            self.skipped_robots[url] = reason
+            return ("", "")
+        self.robots.wait_turn(url)
+
+        resp = self._get(url)
+        if resp.get("status") != 200:
+            return ("", "")
+        return (resp.get("text") or "", (resp.get("content_type") or "").lower())
+
     # ----------------------------------------------------------- discovery
     def discover_pages(self, domain: str, max_pages: int = 8) -> list[tuple[str, str]]:
         """Return [(url, page_kind)] worth watching for this domain."""

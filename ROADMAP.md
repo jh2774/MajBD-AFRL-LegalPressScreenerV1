@@ -197,8 +197,24 @@ Ordered by how much they limit the tool today.
    **The legitimate route to those pages is permission, not rendering.** Most IR platforms
    (Q4, Notified, EQS) offer RSS or email alerts for press releases, and wire services (PR
    Newswire, Business Wire, GlobeNewswire) syndicate the same announcements with licensed
-   feeds. A feed connector is the next step if IR-page latency ahead of EDGAR matters. Do not
-   put the disguise back.
+   feeds. Do not put the disguise back.
+
+   ~~A feed connector is the next step.~~ **Built** — `connectors/feeds.py`, one document per
+   release, sorted into press / financial / legal, everything through the same compliance
+   layer as the page crawl. See the README for the shape and for the site-inventory feed that
+   has to be rejected.
+
+   **What it recovered, measured rather than assumed: one prime in six.** General Dynamics
+   publishes a usable feed at a discoverable path. Lockheed, RTX, Northrop, Leidos and HII
+   advertise nothing the probe budget finds on their primary domain. So the feed route is a
+   real addition, not a replacement for the page crawl, and the IR-page gap is narrower than
+   it was but not closed.
+
+   Worth trying next, in order of likely yield: newsroom subdomains (`news.*`, `media.*`) and
+   IR subdomains as separate discovery targets, since that is where a Q4 or Notified feed
+   usually lives; the platforms' own feed URL patterns once a host is known to run one; and
+   email alerts, which are offered to anyone and are the route the IR platforms actually
+   intend for this.
 
    Chasing the IR problem did turn up a bug that stands: page normalisation trusted `<main>`,
    and Lockheed's newsroom keeps a nav rail there with the press releases outside it, so 150KB

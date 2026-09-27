@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from .connectors.feeds import FeedConnector
 from .connectors.fpds import FPDSConnector
 from .connectors.registries import IAPDConnector, OFACConnector, SAMConnector, USPTOConnector
 from .connectors.sec_edgar import EdgarConnector
@@ -67,6 +68,9 @@ class Screener:
         self.uspto = USPTOConnector(http, config.uspto_api_key)
         self.sam = SAMConnector(http, config.sam_api_key)
         self.web = WebWatchConnector(http, browser=browser)
+        # Shares the web connector rather than holding an HTTP client, so
+        # robots.txt and crawl delay are enforced in one place for both.
+        self.feeds = FeedConnector(self.web)
 
     # ------------------------------------------------------------------ run
     def run(self, opts: ScreenOptions, progress=lambda msg: None,
@@ -354,6 +358,19 @@ class Screener:
 
         if entity.domains and not opts.skip_web:
             for domain in entity.domains:
+                # The feed first. Where a company publishes one it is the
+                # better source — one document per release rather than a page
+                # whose navigation changes on its own — and it is offered
+                # rather than worked around, which matters on hosts whose bot
+                # management refuses an identified crawler.
+                progress(f"  looking for a release feed on {domain}...")
+                releases = self.feeds.collect(domain, company=entity.name)
+                if releases:
+                    kinds = ", ".join(sorted({d.meta.get("release_kind", "press")
+                                              for d in releases}))
+                    progress(f"    {len(releases)} release(s) via feed ({kinds}).")
+                docs.extend(releases)
+
                 progress(f"  crawling {domain} (IR / press / legal)...")
                 docs.extend(self.web.collect(domain, company=entity.name))
 
