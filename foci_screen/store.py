@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import aliases
 from .models import Change, Document, Finding, signal_key
 
 log = logging.getLogger("foci.store")
@@ -345,6 +346,12 @@ def _contract_update_clause() -> str:
 
 
 CONTRACT_UPDATE_CLAUSE = _contract_update_clause()
+
+
+def _prefix(q: str) -> str:
+    """A LIKE pattern anchored at the start, for ranking rather than filtering."""
+    escaped = q.lower().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"{escaped}%"
 
 
 def _like(q: str) -> str:
@@ -1338,6 +1345,27 @@ class Store:
             (self.tenant_id, like, like, like, like, like, like, limit))
         return [_decode_contract(r) for r in rows]
 
+    def _all_tokens_clause(self, q: str, columns: tuple[str, ...]) -> tuple[str, list]:
+        """SQL matching every word of `q` somewhere across `columns`.
+
+        Word order stops mattering, which is the point: a contracting officer
+        recorded as "Jane Doe" is spoken of as "Doe, Jane" half the time, and a
+        single LIKE over the whole string finds neither from the other.
+        """
+        clauses: list[str] = []
+        params: list = []
+        for token in aliases.tokens(q):
+            ors = " OR ".join(f"LOWER({c}) LIKE ? {ESC}" for c in columns)
+            clauses.append(f"({ors})")
+            params.extend([_like(token)] * len(columns))
+        if not clauses and q.strip():
+            # Something was typed that contains no word — "," or "  ". An
+            # empty clause would drop the filter and return the whole table,
+            # which is the failure mode that made a search for "%" look like
+            # everything matched.
+            return ("1=0", [])
+        return (" AND ".join(clauses), params)
+
     def search_entities(self, q: str = "", limit: int = 25) -> list[dict]:
         """Contractors, with their latest severity attached."""
         params: list = [self.tenant_id]
@@ -1348,10 +1376,21 @@ class Store:
                " MAX(foreign_owned) AS foreign_owned"
                " FROM contracts WHERE tenant_id=?")
         if q:
-            sql += f" AND (LOWER(entity_name) LIKE ? {ESC} OR LOWER(entity_key) LIKE ? {ESC})"
-            like = _like(q)
-            params += [like, like]
-        sql += " GROUP BY entity_key ORDER BY SUM(amount) DESC LIMIT ?"
+            clause, token_params = self._all_tokens_clause(
+                q, ("entity_name", "entity_key"))
+            if clause:
+                sql += f" AND ({clause})"
+                params += token_params
+        sql += " GROUP BY entity_key"
+        # A name that starts with what was typed comes first: typing "lock"
+        # should offer Lockheed before a company that merely contains it.
+        if q:
+            sql += f" ORDER BY (CASE WHEN LOWER(MAX(entity_name)) LIKE ? {ESC}" \
+                   " THEN 0 ELSE 1 END), SUM(amount) DESC"
+            params.append(_prefix(q))
+        else:
+            sql += " ORDER BY SUM(amount) DESC"
+        sql += " LIMIT ?"
         params.append(limit)
 
         rows = self._query(sql, tuple(params))
@@ -1375,10 +1414,22 @@ class Store:
                " FROM contracts WHERE tenant_id=? AND ko_email IS NOT NULL"
                " AND ko_email != ''")
         if q:
-            sql += f" AND (LOWER(ko_email) LIKE ? {ESC} OR LOWER(ko_name) LIKE ? {ESC})"
-            like = _like(q)
-            params += [like, like]
-        sql += " GROUP BY ko_email ORDER BY SUM(amount) DESC LIMIT ?"
+            # Every word, in any order, across the name and the address. "Doe,
+            # Jane", "jane doe" and "doe.jane@mail.mil" are one person typed
+            # three ways, and a single LIKE over the whole string finds at most
+            # one of them from the others.
+            clause, token_params = self._all_tokens_clause(q, ("ko_name", "ko_email"))
+            if clause:
+                sql += f" AND ({clause})"
+                params += token_params
+        sql += " GROUP BY ko_email"
+        if q:
+            sql += f" ORDER BY (CASE WHEN LOWER(MAX(ko_name)) LIKE ? {ESC}" \
+                   " THEN 0 ELSE 1 END), SUM(amount) DESC"
+            params.append(_prefix(q))
+        else:
+            sql += " ORDER BY SUM(amount) DESC"
+        sql += " LIMIT ?"
         params.append(limit)
         return self._query(sql, tuple(params))
 
@@ -1389,9 +1440,17 @@ class Store:
                " COUNT(DISTINCT ko_email) AS officer_count"
                " FROM contracts WHERE tenant_id=? AND agency IS NOT NULL AND agency != ''")
         if q:
-            sql += f" AND (LOWER(agency) LIKE ? {ESC} OR LOWER(sub_agency) LIKE ? {ESC})"
-            like = _like(q)
-            params += [like, like]
+            # Nobody types "Department of the Navy". They type NAVSEA, or DoD,
+            # or Navy — and an award records the long spelling, so matching
+            # only what is stored answers "nothing found" to the most natural
+            # thing a reader can enter.
+            spellings = aliases.expand_agency(q)
+            ors = " OR ".join(
+                f"(LOWER(agency) LIKE ? {ESC} OR LOWER(sub_agency) LIKE ? {ESC})"
+                for _ in spellings)
+            sql += f" AND ({ors})"
+            for spelling in spellings:
+                params += [_like(spelling), _like(spelling)]
         sql += " GROUP BY agency, sub_agency ORDER BY SUM(amount) DESC LIMIT ?"
         params.append(limit)
         return self._query(sql, tuple(params))
