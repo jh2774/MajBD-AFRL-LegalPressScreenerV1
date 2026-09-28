@@ -222,6 +222,11 @@ class FeedConnector:
         # The compliance layer. Not an HTTP client — that is the point.
         self.web = web
         self.feeds_found: dict[str, list[str]] = {}
+        # Hosts that gave us releases. A host can refuse its pages to an
+        # identified client and serve its feed to the same client in the same
+        # run — ir.hii.com does exactly that — and a run that reported it as
+        # unread would be describing the opposite of what happened.
+        self.hosts_read: set[str] = set()
 
     # ------------------------------------------------------------ discovery
     def _feeds_on(self, base: str, paths=CANDIDATE_FEEDS) -> list[str]:
@@ -308,6 +313,8 @@ class FeedConnector:
                 doc_type=f"{kind}_release",
                 meta={"release_kind": kind, "feed_url": url,
                       "domain": urlparse(url).netloc}))
+        if docs:
+            self.hosts_read.add(urlparse(url).netloc.lower())
         return docs
 
     def collect(self, domain: str, company: str = "") -> list[Document]:

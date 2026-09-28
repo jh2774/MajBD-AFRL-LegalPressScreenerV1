@@ -244,13 +244,28 @@ class Screener:
         elsewhere = ("Material announcements usually also appear as SEC 8-K filings, "
                      "which this screen reads, and on the company's main newsroom.")
 
-        if self.web.unreadable_hosts:
-            hosts = ", ".join(sorted(self.web.unreadable_hosts))
+        # A host can refuse its pages and serve its feed in the same run —
+        # ir.hii.com does — and reporting that host as unread describes the
+        # opposite of what happened. Split the two so each says something true.
+        read_by_feed = getattr(getattr(self, "feeds", None), "hosts_read", set())
+        unreadable = sorted(self.web.unreadable_hosts - read_by_feed)
+        pages_closed_feed_open = sorted(self.web.unreadable_hosts & read_by_feed)
+
+        if unreadable:
+            hosts = ", ".join(unreadable)
             notes.append(
                 f"Could not read {hosts} — the site did not serve readable content to "
                 f"this tool's browser, which identifies itself. Investor-relations "
                 f"platforms behind bot management typically refuse automated clients, "
                 f"and the tool does not disguise itself to get past that. {elsewhere}")
+
+        if pages_closed_feed_open:
+            hosts = ", ".join(pages_closed_feed_open)
+            notes.append(
+                f"Read the release feed on {hosts}, but not its pages — the site "
+                f"refuses an identified client the HTML it serves a browser. The "
+                f"releases are covered; anything published only as a page on that "
+                f"host is not.")
 
         by_host: dict[str, dict[str, int]] = {}
         for url, reason in self.web.skipped_robots.items():
