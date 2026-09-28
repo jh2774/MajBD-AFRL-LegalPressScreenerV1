@@ -1,40 +1,26 @@
+/* Always dark: the background is Concord's #1c1c1c, and the Concord logo is
+   white and gold, so it has no light-background version to switch to. */
 :root {
-  --bg: #f6f7f9;
-  --surface: #ffffff;
-  --surface-2: #f0f2f5;
-  --border: #d9dee5;
-  --text: #14181d;
-  --muted: #5c6773;
-  --accent: #1f5fa9;
-  --accent-soft: #e7effa;
+  color-scheme: dark;
 
-  --critical: #b3261e;
-  --high: #c2570a;
-  --medium: #9a6700;
-  --low: #1f5fa9;
-  --info: #6b7681;
+  --bg: #1c1c1c;
+  --surface: #252525;
+  --surface-2: #2e2e2e;
+  --border: #3a3a3a;
+  --text: #e8ecf1;
+  --muted: #9aa5b1;
+  --accent: #6ba4e8;
+  --accent-soft: #1e2a3a;
+  --link: #ffffff;
+
+  --critical: #f2685f;
+  --high: #f0913f;
+  --medium: #d9b23c;
+  --low: #6ba4e8;
+  --info: #8b96a3;
 
   --radius: 10px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #14171c;
-    --surface: #1c2027;
-    --surface-2: #232830;
-    --border: #333a44;
-    --text: #e8ecf1;
-    --muted: #9aa5b1;
-    --accent: #6ba4e8;
-    --accent-soft: #1e2a3a;
-
-    --critical: #f2685f;
-    --high: #f0913f;
-    --medium: #d9b23c;
-    --low: #6ba4e8;
-    --info: #8b96a3;
-  }
 }
 
 * { box-sizing: border-box; }
@@ -51,7 +37,7 @@ body {
   font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
 }
 
-a { color: var(--accent); text-decoration: none; }
+a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
 /* ------------------------------------------------------------------ topbar */
@@ -61,7 +47,7 @@ a:hover { text-decoration: underline; }
   align-items: center;
   gap: 20px;
   padding: 10px 20px;
-  background: var(--surface);
+  background: var(--bg);
   border-bottom: 1px solid var(--border);
   position: sticky;
   top: 0;
@@ -79,10 +65,10 @@ a:hover { text-decoration: underline; }
 }
 .brand:hover { text-decoration: none; }
 
-.brand-mark {
-  width: 15px; height: 15px;
-  border-radius: 4px;
-  background: linear-gradient(135deg, var(--accent), var(--critical));
+.brand-logo {
+  display: block;
+  height: 34px;
+  width: auto;
 }
 
 .searchbar {
@@ -162,7 +148,7 @@ button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.ghost { background: transparent; }
 button.linkish {
-  border: none; background: none; color: var(--accent); padding: 6px 4px;
+  border: none; background: none; color: var(--link); padding: 6px 4px;
 }
 
 .topnav { display: flex; align-items: center; gap: 14px; }
@@ -566,3 +552,8 @@ dialog input {
 .spinner { color: var(--muted); padding: 40px 0; text-align: center; }
 
 .breadcrumb { font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+
+.about p { margin: 0 0 10px; line-height: 1.6; }
+.about ol { margin: 0 0 10px; padding-left: 20px; line-height: 1.6; }
+.about li { margin-bottom: 6px; }
+.about strong { color: var(--text); }
