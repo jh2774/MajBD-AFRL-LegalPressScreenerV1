@@ -70,8 +70,9 @@ jobs:
           done
           cat /tmp/health.json
           # The web UI must be inside the image, not just the repo.
-          curl -fsS http://localhost:8000/ | grep -q foci-screen
+          curl -fsS http://localhost:8000/ | grep -q FOCI-Screener
           curl -fsS http://localhost:8000/app.js > /dev/null
+          curl -fsS http://localhost:8000/concord-logo.png > /dev/null
           # Auth must fail closed.
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8000/v1/overview)" = 401
           curl -fsS -H 'Authorization: Bearer ci-key' http://localhost:8000/v1/overview > /dev/null
