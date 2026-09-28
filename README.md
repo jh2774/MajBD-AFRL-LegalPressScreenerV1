@@ -437,6 +437,30 @@ title runs under four words is ignored. It is a heuristic, biased towards reject
 feed costs coverage the page crawl may still get, while accepting the wrong one puts navigation
 in front of a reviewer as though it were evidence.
 
+### Alerts that arrive by email
+
+The four primes with no readable feed will mail you the same releases. Every investor-relations
+platform offers alerts to anyone who subscribes, and that is the only route that reaches a host
+serving its pages to browsers alone.
+
+Point `FOCI_ALERTS_DIR` at a directory of saved `.eml` files — what a mail client writes when
+you export a message, and what a sync tool drops on disk — and those releases join the screen:
+
+```bash
+export FOCI_ALERTS_DIR=~/ir-alerts
+```
+
+**No credentials, deliberately.** Connecting to the mailbox itself means holding a password or
+an OAuth token for the account a person's notices arrive in, which is a much larger thing to
+get right than it looks. A folder is enough to be useful and cannot leak anything.
+
+A release that arrives by both feed and email is **one document**, because the key is the
+release URL either way — two sightings of one announcement rather than two that each read as
+new. The connector picks the link that points at the company, so the tracking redirect, the
+"view online" and the unsubscribe are not mistaken for the release; and a folder holding
+ordinary mail is not a problem, since a message that neither names the company nor links to it
+is left alone.
+
 ## The award record changing
 
 Documents are not the only thing that moves. An award's own record can change hands, and when

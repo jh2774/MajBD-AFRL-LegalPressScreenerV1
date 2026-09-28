@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from .connectors.alerts import AlertConnector
 from .connectors.feeds import FeedConnector
 from .connectors.fpds import FPDSConnector
 from .connectors.registries import IAPDConnector, OFACConnector, SAMConnector, USPTOConnector
@@ -71,6 +72,9 @@ class Screener:
         # Shares the web connector rather than holding an HTTP client, so
         # robots.txt and crawl delay are enforced in one place for both.
         self.feeds = FeedConnector(self.web)
+        # No network and no credentials: a folder of saved alert emails, which
+        # is the only route that reaches the IR hosts refusing a crawler.
+        self.alerts = AlertConnector(getattr(config, "alerts_dir", ""))
 
     # ------------------------------------------------------------------ run
     def run(self, opts: ScreenOptions, progress=lambda msg: None,
@@ -394,6 +398,15 @@ class Screener:
 
                 progress(f"  crawling {domain} (IR / press / legal)...")
                 docs.extend(self.web.collect(domain, company=entity.name))
+
+        # Saved alert emails, which reach the hosts that refuse a crawler.
+        # Keyed on the release URL like the feed items, so an announcement
+        # that arrived both ways is one document, not two that each read new.
+        if self.alerts.available() and not opts.skip_web:
+            mailed = self.alerts.collect(entity.name, entity.domains)
+            if mailed:
+                progress(f"  {len(mailed)} release(s) from saved email alerts.")
+            docs.extend(mailed)
 
         return [d for d in docs if d.text.strip()]
 

@@ -216,12 +216,22 @@ Ordered by how much they limit the tool today.
    the budget finds, and their IR hosts either do not resolve under the usual names or stall
    behind bot management. A real addition to the page crawl, not a replacement.
 
-   Worth trying next, in order of likely yield: **email alerts**, which every IR platform
-   offers to anyone who asks and is the route they actually intend for this — it needs a
-   mailbox and a parser rather than a crawler, and it is the only option that works on the
-   hosts refusing automated clients. Then **wire services** (PR Newswire, Business Wire,
-   GlobeNewswire), which syndicate the same announcements under licence. Neither is a
-   scraping problem, which is the point.
+   ~~Worth trying next: **email alerts**.~~ **Built** — `connectors/alerts.py` reads a
+   directory of saved `.eml` files named by `FOCI_ALERTS_DIR`, and keys each release on its
+   URL, so an announcement that arrives by both feed and email is one document rather than
+   two that each read as new.
+
+   It stops at a folder on purpose. Connecting to the mailbox means holding a password or an
+   OAuth token for the account somebody's notices arrive in; a folder is enough to be useful
+   and cannot leak anything. **What it still needs from a person: subscribing.** The parser
+   is done and tested; the alerts have to be turned on at each company's IR site and filtered
+   into a folder, and no amount of code does that part.
+
+   Still open here: **wire services** (PR Newswire, Business Wire, GlobeNewswire) syndicate
+   the same announcements under licence, which would cover every contractor at once rather
+   than one subscription at a time. A commercial arrangement rather than a scraping problem,
+   which is the point. And an **IMAP reader**, if the folder ever becomes the friction —
+   worth doing only with a token scoped to one mail folder, never a password.
 
    Chasing the IR problem did turn up a bug that stands: page normalisation trusted `<main>`,
    and Lockheed's newsroom keeps a nav rail there with the press releases outside it, so 150KB

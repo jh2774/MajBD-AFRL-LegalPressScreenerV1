@@ -69,6 +69,12 @@ class Config:
     inprocess_screens_ok: bool = field(
         default_factory=lambda: _flag("FOCI_INPROCESS_SCREENS", False))
 
+    # --- investor-relations email alerts ---
+    # A directory of saved .eml files. The IR platforms that refuse an
+    # identified crawler will happily mail the same releases to anyone who
+    # subscribes, and a folder needs no credentials to read.
+    alerts_dir: str = field(default_factory=lambda: _env("FOCI_ALERTS_DIR"))
+
     # --- headless browser (investor-relations pages) ---
     browser_enabled: bool = field(default_factory=lambda: _flag("FOCI_BROWSER", True))
     browser_timeout: int = field(
@@ -139,6 +145,8 @@ class Config:
             "iapd": True,
             "ofac": True,
             "webwatch": True,
+            "ir_email_alerts": bool(self.alerts_dir
+                                    and Path(self.alerts_dir).is_dir()),
             "samgov": bool(self.sam_api_key),
             "uspto": bool(self.uspto_api_key),
             "trade_gov_csl": bool(self.trade_gov_key),
