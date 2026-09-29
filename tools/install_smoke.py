@@ -84,7 +84,7 @@ try:
 
     status, body, _ = get("/")
     check("GET / serves the web UI from site-packages",
-          status == 200 and b"foci-screen" in body)
+          status == 200 and b"FOCI-Screener" in body)
     for asset in ("/app.js", "/styles.css"):
         status, body, headers = get(asset)
         check(f"GET {asset}", status == 200 and len(body) > 1000,

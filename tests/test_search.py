@@ -510,7 +510,7 @@ def test_web_ui_is_served(client):
     c, _ = client
     r = c.get("/")
     assert r.status_code == 200
-    assert "foci-screen" in r.text
+    assert "FOCI-Screener" in r.text
     assert c.get("/app.js").status_code == 200
     assert c.get("/styles.css").status_code == 200
 

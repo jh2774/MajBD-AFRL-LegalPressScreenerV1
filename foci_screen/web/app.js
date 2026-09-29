@@ -486,39 +486,8 @@ function firstRunPanel() {
     </div>`;
 }
 
-/* The overview used to open on everything in the database, which is whoever
- * the last departmental screen happened to surface — a dashboard nobody chose,
- * presented as though they had. It now opens on the portfolio, and on nothing
- * at all until there is one. */
-function noPortfolioPanel() {
-  return `
-    <div class="page-head">
-      <h1>Overview</h1>
-      <div class="sub">Nothing is being watched yet.</div>
-    </div>
-
-    <div class="card">
-      <h2>Start with the companies you care about</h2>
-      <p class="muted">This dashboard shows a portfolio — the contractors you
-      have chosen to watch — rather than everything that has ever been screened
-      here. Until you pick some, there is nothing it should be showing you.</p>
-      <p class="muted">Two ways in: search for a company above and use
-      <strong>Add to portfolio</strong> on its page, or build one from a list
-      on the Portfolio page. If you already have a key saved in a file, paste
-      it there and this fills in.</p>
-      <div class="actions">
-        <a class="linkish" href="#/portfolio">Open the Portfolio page</a>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>What has been screened here</h2>
-      <div class="muted" style="font-size:12px;margin-bottom:10px">
-        For reference — a portfolio can draw on any of it.</div>
-      <div id="recent-runs" class="muted">Loading…</div>
-    </div>`;
-}
-
+/* With a portfolio saved, the overview is that portfolio. Without one it shows
+ * everything in the database. */
 async function viewOverview() {
   const portfolioKey = savedPortfolioKey();
   if (portfolioKey) {
@@ -538,21 +507,46 @@ async function viewOverview() {
     return;
   }
 
-  view.innerHTML = noPortfolioPanel();
-  loadRecentRuns();
-  return;
+  renderFullDatabase(d);
 }
 
-/* Kept for the run history, which both empty states show. */
-async function viewFullDatabase() {
-  setBusy("Loading overview…");
-  const d = await api("/v1/overview");
+function renderFullDatabase(d) {
   const t = d.totals;
 
   view.innerHTML = `
     <div class="page-head">
       <h1>Overview</h1>
       <div class="sub">What has been screened, and what changed.</div>
+    </div>
+
+    <div class="card about">
+      <h2>What FOCI-Screener does</h2>
+      <p class="muted">FOCI-Screener watches the companies that hold federal
+      contracts for signs of <strong>Foreign Ownership, Control or Influence
+      (FOCI)</strong> and for risks to their intellectual property, such as
+      patents pledged as loan collateral or sold off. It looks for
+      <strong>changes</strong>: a contractor that has always been a Delaware
+      company is not news, but one that filed a notice last week about a new
+      offshore investor is.</p>
+      <ol class="muted">
+        <li><strong>Find the contracts.</strong> For a chosen agency it pulls
+        recent awards from USAspending and FPDS, with the winning company, its
+        parent, and the contracting officer responsible for each award.</li>
+        <li><strong>Check the contractors.</strong> For each company it reads
+        SEC filings, investment-adviser records, the OFAC sanctions list, SAM.gov
+        registrations, USPTO patent assignments, and the company's own press and
+        investor pages.</li>
+        <li><strong>Track what changed.</strong> Every document it reads is
+        stored and fingerprinted. On later screens, rules run against what is
+        new, so findings point to fresh disclosures rather than old news.</li>
+        <li><strong>Draft a notice.</strong> When a contractor's findings are
+        serious enough, it drafts a notice to the contracting officer named on
+        the award. A person reviews every notice, and nothing is emailed
+        automatically.</li>
+      </ol>
+      <p class="muted">The first screen of an agency sets a baseline; screens
+      after that show what moved. Results are leads for an analyst to review,
+      drawn from public records, not a FOCI determination.</p>
     </div>
 
     <div class="grid cols-4">
