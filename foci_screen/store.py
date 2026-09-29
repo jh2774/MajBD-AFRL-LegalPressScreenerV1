@@ -127,7 +127,18 @@ CREATE TABLE IF NOT EXISTS notices (
     decided_by  TEXT,
     decided_at  TEXT,
     decision_note TEXT,
-    created_at  TEXT NOT NULL
+    created_at  TEXT NOT NULL,
+    signal_ids  TEXT,
+    trigger_reason TEXT
+);
+-- One row per tenant: what it screens for and what raises a notice. JSON
+-- rather than columns because the shape will grow, and every read wants the
+-- whole thing at once.
+CREATE TABLE IF NOT EXISTS screening_policy (
+    tenant_id   TEXT PRIMARY KEY,
+    policy      TEXT NOT NULL,
+    updated_by  TEXT,
+    updated_at  TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS contracts (
     id            {pk},
@@ -273,6 +284,12 @@ COLUMN_ADDITIONS = [
     ("findings", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
     ("notifications", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
     ("notices", "original_body_text", "TEXT"),
+    # Which evidence a notice covered, and why it was raised. Without the
+    # first, a notice has no memory: the same finding queues the same draft on
+    # every run. Without the second, a reviewer cannot tell a policy decision
+    # from a threshold.
+    ("notices", "signal_ids", "TEXT"),
+    ("notices", "trigger_reason", "TEXT"),
     ("contracts", "is_subaward", "INTEGER DEFAULT 0"),
     ("contracts", "prime_award_id", "TEXT"),
     ("contracts", "prime_recipient_name", "TEXT"),
@@ -859,17 +876,109 @@ class Store:
     def create_notice(self, *, run_id: str, entity_key: str, entity_name: str,
                       severity: str, recipient: str, officer_confidence: str,
                       subject: str, body_text: str, finding_id: str = "",
-                      status: str = "pending") -> str:
+                      status: str = "pending", signal_ids: list[str] | None = None,
+                      trigger_reason: str = "") -> str:
         notice_id = uuid.uuid4().hex[:12]
         with self._tx() as c:
             c.execute(
                 "INSERT INTO notices (notice_id, tenant_id, run_id, finding_id, entity_key,"
                 " entity_name, severity, recipient, officer_confidence, subject, body_text,"
-                " status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " status, created_at, signal_ids, trigger_reason)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (notice_id, self.tenant_id, run_id, finding_id, entity_key, entity_name,
                  severity, recipient, officer_confidence, subject, body_text,
-                 status, _now()))
+                 status, _now(), json.dumps(signal_ids or []), trigger_reason))
         return notice_id
+
+    def notified_signal_ids(self, entity_key: str) -> set[str]:
+        """Evidence about this contractor that a notice has already covered.
+
+        Any status counts. An approved notice has been said; a rejected one is
+        a reviewer deciding it should not be — the only labelled false positive
+        this tool gets — and raising the same evidence again would overrule
+        them. A superseded one was replaced by a notice that carried it on.
+
+        Notices written before `signal_ids` existed have none recorded, so the
+        signals of the finding each one was raised from stand in for them.
+        Without that fallback, the first screen after an upgrade would
+        re-notify everything that had ever been notified.
+        """
+        seen: set[str] = set()
+        rows = self._query(
+            "SELECT run_id, signal_ids FROM notices WHERE tenant_id=? AND entity_key=?",
+            (self.tenant_id, entity_key))
+        legacy_runs: list[str] = []
+        for r in rows:
+            try:
+                ids = json.loads(r.get("signal_ids") or "[]")
+            except ValueError:
+                ids = []
+            if ids:
+                seen.update(ids)
+            else:
+                legacy_runs.append(r["run_id"])
+
+        for run_id in legacy_runs:
+            for f in self._query(
+                    "SELECT id, payload FROM findings WHERE tenant_id=? AND entity_key=?"
+                    " AND run_id=?", (self.tenant_id, entity_key, run_id)):
+                # Through _with_id, not json.loads: a stored payload need not
+                # carry signal_id, and reading it raw returned nothing — which
+                # is the failure this fallback exists to prevent.
+                payload = _with_id(f)
+                seen.update(s["signal_id"] for s in payload.get("signals", [])
+                            if s.get("signal_id"))
+        return seen
+
+    def supersede_pending(self, entity_key: str, by_notice_id: str) -> int:
+        """Retire older undecided drafts for a contractor that has a newer one.
+
+        One pending notice per contractor. The newer draft carries the current
+        finding in full, and two drafts about the same company in the queue
+        invite approving the stale one. Only pending notices are touched —
+        a decision already made is final.
+        """
+        rows = self._query(
+            "SELECT notice_id FROM notices WHERE tenant_id=? AND entity_key=?"
+            " AND status='pending' AND notice_id != ?",
+            (self.tenant_id, entity_key, by_notice_id))
+        if not rows:
+            return 0
+        with self._tx() as c:
+            c.execute(
+                "UPDATE notices SET status='superseded', decided_by='system',"
+                " decided_at=?, decision_note=? WHERE tenant_id=? AND entity_key=?"
+                " AND status='pending' AND notice_id != ?",
+                (_now(), f"Superseded by {by_notice_id}: newer evidence for the same "
+                         f"contractor.", self.tenant_id, entity_key, by_notice_id))
+        return len(rows)
+
+    # --------------------------------------------------------- screening policy
+    def screening_policy(self) -> dict:
+        """The tenant's stored policy as a dict, or {} for the defaults."""
+        row = self._one("SELECT policy FROM screening_policy WHERE tenant_id=?",
+                        (self.tenant_id,))
+        if not row:
+            return {}
+        try:
+            return json.loads(row["policy"]) or {}
+        except (ValueError, TypeError):
+            log.warning("screening policy for %s is unreadable; using defaults",
+                        self.tenant_id)
+            return {}
+
+    def set_screening_policy(self, policy: dict, updated_by: str = "") -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO screening_policy (tenant_id, policy, updated_by, updated_at)"
+                " VALUES (?,?,?,?) ON CONFLICT (tenant_id) DO UPDATE SET"
+                " policy=excluded.policy, updated_by=excluded.updated_by,"
+                " updated_at=excluded.updated_at",
+                (self.tenant_id, json.dumps(policy), updated_by, _now()))
+
+    def clear_screening_policy(self) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM screening_policy WHERE tenant_id=?", (self.tenant_id,))
 
     def get_notice(self, notice_id: str) -> dict | None:
         return self._one("SELECT * FROM notices WHERE notice_id=? AND tenant_id=?",

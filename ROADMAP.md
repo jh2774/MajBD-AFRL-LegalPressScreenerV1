@@ -123,6 +123,17 @@ before acting.
    evidence-damping factors are still engine constants. They are shared across rules, so
    exposing them per tenant means deciding what happens when two tenants disagree about what
    "China" is worth, which is a product question rather than a plumbing one.
+
+   **Built above it: a screening policy per tenant** — categories and release kinds to screen,
+   and what raises a notice (threshold, categories, first-screen behaviour, events to always
+   hear about). It fixed a defect the notice gate had carried since it was written: notices
+   had no memory, so a standing finding re-queued the same draft on every run. Evidence now
+   notifies once, a rejection counts as notified, and a newer draft supersedes an undecided
+   older one.
+
+   Still open on this: **per-watchlist policies**, so a portfolio of high-priority primes can
+   notify on "low" while a broad agency sweep stays at "high"; and **per-person attribution**
+   of policy changes, which records `api-key:<tenant>` for the same reason decisions do.
 4. **Server-side pagination.** Search caps at 100 rows and the UI renders all of them. Fine at
    current volumes, wrong after a few thousand awards.
 

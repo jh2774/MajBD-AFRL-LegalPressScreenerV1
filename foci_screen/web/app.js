@@ -1378,8 +1378,8 @@ async function viewNotices() {
 
   if (!d.notices.length) {
     view.innerHTML = `<div class="page-head"><h1>Notices</h1></div>
-      <div class="card"><div class="empty">No notices yet. They are created for
-      findings at medium severity or above.</div></div>`;
+      <div class="card"><div class="empty">No notices yet. What raises one is set
+      on the <a href="#/screening">Screening</a> page.</div></div>`;
     return;
   }
 
@@ -1394,6 +1394,8 @@ async function viewNotices() {
         <span class="muted" style="margin-left:auto">${esc(day(n.created_at))}</span>
       </div>
       <div style="margin:10px 0 6px">${esc(n.subject)}</div>
+      ${n.trigger_reason ? `<div class="muted" style="font-size:12.5px;margin-bottom:4px">
+        <strong>Why this was raised:</strong> ${esc(n.trigger_reason)}</div>` : ""}
       <div class="muted" style="font-size:12.5px">
         To: ${n.recipient ? `<span class="mono">${esc(n.recipient)}</span>
              <span class="pill">${esc(n.officer_confidence || "")}</span>`
@@ -1810,6 +1812,167 @@ function wirePortfolio(loadedName) {
   }
 }
 
+/* --------------------------------------------------------------- screening */
+
+/* What this tenant screens for, and what it wants to be told about. Every
+ * label comes from the server's catalogue, so the page cannot offer a choice
+ * the engine does not understand. Saving is explicit, and the preview runs
+ * the real decision over past findings before anything changes — choosing a
+ * notice threshold without seeing what it does is guessing. */
+function checkboxes(name, options, selected, hint = {}) {
+  return Object.entries(options).map(([value, label]) => `
+    <label class="check">
+      <input type="checkbox" name="${esc(name)}" value="${esc(value)}"
+        ${selected.includes(value) ? "checked" : ""}>
+      <span><strong>${esc(value.replace(/_/g, " "))}</strong>
+        <span class="muted"> — ${esc(typeof label === "string" ? label : label.label)}</span>
+        ${hint[value] ? `<span class="muted" style="font-size:11.5px"> (${esc(hint[value])})</span>` : ""}
+      </span>
+    </label>`).join("");
+}
+
+function readPolicyForm(root) {
+  const picked = (name) => [...root.querySelectorAll(`input[name="${name}"]:checked`)]
+    .map((i) => i.value);
+  return {
+    categories: picked("categories"),
+    release_kinds: picked("release_kinds"),
+    notice_min_severity: root.querySelector("#notice-severity").value,
+    notice_mode: (root.querySelector('input[name="notice_mode"]:checked') || {}).value,
+    notice_categories: picked("notice_categories"),
+    notice_always: picked("notice_always"),
+  };
+}
+
+function policyNotes(notes) {
+  if (!notes || !notes.length) return "";
+  return `<div class="card" style="border-left:3px solid var(--medium)">
+    <h2>Adjusted when saved</h2>
+    <ul class="muted" style="font-size:13px;margin:0;padding-left:20px">
+      ${notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul></div>`;
+}
+
+async function viewScreening(notes) {
+  setBusy("Loading screening settings…");
+  const d = await api("/v1/policy");
+  const p = d.policy;
+  const cat = d.catalogue;
+
+  const eventHints = Object.fromEntries(Object.entries(cat.events).map(
+    ([k, e]) => [k, e.requires_new ? "only when newly published" : "once, whenever found"]));
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Screening</h1>
+      <div class="sub">What this deployment looks for, and what it asks a reviewer
+        to look at. ${d.is_default ? "Currently the defaults." : "Customised."}
+        Changes take effect on the next screen.</div>
+    </div>
+
+    ${policyNotes(notes || d.notes)}
+
+    <form id="policy-form">
+    <div class="card">
+      <h2>What to screen for</h2>
+      <p class="muted">A category switched off is dropped before anything is
+      scored, so it cannot raise a finding or combine with another into one.
+      For individual rules and their weights, see <a href="#/rules">Rules</a>.</p>
+      <div class="checks">${checkboxes("categories", cat.categories, p.categories)}</div>
+
+      <h3 style="margin-top:18px">Company releases to read</h3>
+      <p class="muted">From release feeds and saved alert emails. A kind switched
+      off is not read at all, so it builds no history either.</p>
+      <div class="checks">${checkboxes("release_kinds", cat.release_kinds, p.release_kinds)}</div>
+    </div>
+
+    <div class="card">
+      <h2>What raises a notice</h2>
+      <p class="muted">A notice is a draft for a person to read, edit and approve
+      — nothing here sends anything. <strong>Each piece of evidence notifies
+      once</strong>: after that it has been said, and a rejected notice counts, so
+      a reviewer's "no" is not overruled by the next screen.</p>
+
+      <label class="field">Notify for findings at or above
+        <select id="notice-severity">
+          ${cat.notice_severities.map((s) =>
+            `<option value="${s}" ${s === p.notice_min_severity ? "selected" : ""}>${s}</option>`).join("")}
+        </select>
+      </label>
+
+      <h3 style="margin-top:14px">When</h3>
+      <div class="checks">
+        ${Object.entries(cat.notice_modes).map(([k, label]) => `
+          <label class="check"><input type="radio" name="notice_mode" value="${esc(k)}"
+            ${k === p.notice_mode ? "checked" : ""}>
+            <span><strong>${esc(k.replace(/_/g, " "))}</strong>
+              <span class="muted"> — ${esc(label)}</span></span></label>`).join("")}
+      </div>
+
+      <h3 style="margin-top:14px">Categories that may raise a notice</h3>
+      <div class="checks">${checkboxes("notice_categories",
+        Object.fromEntries(Object.entries(cat.categories).filter(([k]) => k !== "DISCLOSURE")),
+        p.notice_categories)}</div>
+
+      <h3 style="margin-top:14px">Always notify me when</h3>
+      <p class="muted">Regardless of the threshold above — still once each.</p>
+      <div class="checks">${checkboxes("notice_always", cat.events, p.notice_always, eventHints)}</div>
+    </div>
+
+    <div class="card">
+      <h2>Try it first</h2>
+      <p class="muted">Runs these settings over each contractor's latest finding,
+      remembering what has already been notified. Nothing is saved or queued.</p>
+      <div class="actions"><button type="button" id="policy-preview">Preview</button></div>
+      <div id="policy-preview-out" style="margin-top:10px"></div>
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="primary">Save</button>
+      <button type="button" class="ghost" id="policy-reset">Reset to defaults</button>
+    </div>
+    </form>`;
+
+  const form = document.getElementById("policy-form");
+
+  document.getElementById("policy-preview").onclick = async () => {
+    const out = document.getElementById("policy-preview-out");
+    out.textContent = "Running…";
+    try {
+      const r = await apiPost("/v1/policy/preview", readPolicyForm(form));
+      out.innerHTML = `
+        <p><strong>${num(r.would_raise)}</strong> of ${num(r.contractors)} contractor(s)
+        would get a new notice.</p>
+        ${r.examples.length ? `<table><thead><tr><th>Contractor</th><th>Severity</th>
+          <th>Why</th></tr></thead><tbody>${r.examples.map((e) => `
+          <tr><td>${linkEntity(e.entity_key, e.entity_name)}</td><td>${sevTag(e.severity)}</td>
+          <td class="muted" style="font-size:12.5px">${esc(e.reason)}</td></tr>`).join("")}
+          </tbody></table>` : ""}
+        ${r.held.length ? `<p class="muted" style="margin-top:10px">Held back:</p>
+          <ul class="muted" style="font-size:12.5px;padding-left:20px">
+          ${r.held.map((h) => `<li>${num(h.count)} — ${esc(h.reason)}</li>`).join("")}</ul>` : ""}
+        ${(r.notes || []).length ? `<p class="muted" style="font-size:12.5px">
+          ${r.notes.map(esc).join(" ")}</p>` : ""}`;
+    } catch (e) {
+      out.textContent = e.message || String(e);
+    }
+  };
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    try {
+      const r = await apiSend("PUT", "/v1/policy", readPolicyForm(form));
+      viewScreening(r.notes);
+    } catch (err) {
+      showError(err);
+    }
+  };
+
+  document.getElementById("policy-reset").onclick = async () => {
+    await apiSend("DELETE", "/v1/policy");
+    viewScreening([]);
+  };
+}
+
 /* ------------------------------------------------------------------ router */
 
 const ROUTES = [
@@ -1826,6 +1989,7 @@ const ROUTES = [
   [/^\/notices$/, () => viewNotices()],
   [/^\/rules$/, () => viewRules()],
   [/^\/portfolio$/, () => viewPortfolio()],
+  [/^\/screening$/, () => viewScreening()],
   [/^\/screens\/(.+)$/, (id) => viewScreen(decodeURIComponent(id))],
 ];
 

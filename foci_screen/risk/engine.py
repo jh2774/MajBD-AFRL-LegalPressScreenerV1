@@ -467,6 +467,37 @@ def rule_edgar_8k_items(doc: Document, ctx: RuleContext) -> list[Signal]:
     return signals
 
 
+def rule_release_disclosure(doc: Document, ctx: RuleContext) -> list[Signal]:
+    """A company published a legal or financial release that was not there before.
+
+    Scored at zero, deliberately. That something was announced is not evidence
+    of risk — the other rules read the release's text for that, and score what
+    they find. A quarterly results release every quarter adding weight to a
+    contractor would inflate severity on a calendar, which is the kind of false
+    positive that teaches reviewers to stop reading.
+
+    It exists so a person can ask to be told: "notify me of any new legal
+    disclosure" needs a signal to hang on, and this is it. Only a release that
+    is new since the last screen produces one, so an unchanged feed is silent.
+    """
+    kind = (doc.meta or {}).get("release_kind")
+    if kind not in ("legal", "financial") or not ctx.is_new:
+        return []
+    headline = doc.title.split(" — ", 1)[-1] if " — " in doc.title else doc.title
+    rule_id = "RELEASE-LEGAL-01" if kind == "legal" else "RELEASE-FINANCIAL-01"
+    label = "legal" if kind == "legal" else "financial"
+    return [Signal(
+        rule_id=rule_id, category="DISCLOSURE", severity="info", score=0.0,
+        title=f"New {label} disclosure: {headline[:120]}",
+        rationale=(f"{ctx.entity.name} published a {label} release"
+                   f"{' on ' + doc.published if doc.published else ''} that was not "
+                   f"present at the previous screen. Recorded so it can raise a "
+                   f"notice where that has been asked for; it carries no risk "
+                   f"weight of its own, since other rules score what it says."),
+        evidence=headline[:300], source="company release",
+        source_url=doc.url, is_new=True)]
+
+
 DOCUMENT_RULES = [
     rule_edgar_8k_items,
     rule_foci_jurisdiction,
@@ -475,6 +506,7 @@ DOCUMENT_RULES = [
     rule_uspto_security_interest,
     rule_sanctions_hit,
     rule_adviser_foreign_domicile,
+    rule_release_disclosure,
 ]
 
 

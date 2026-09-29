@@ -371,6 +371,30 @@ textarea {
 }
 textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
+/* Settings: one option per line, the explanation on the same line as the
+   choice it explains, and enough room to hit a box on a phone. */
+.checks { display: grid; gap: 6px; margin-top: 6px; }
+.check {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13.5px;
+}
+.check:hover { background: var(--surface-2); }
+.check input { margin-top: 3px; flex: none; }
+.field { display: flex; gap: 10px; align-items: center; font-size: 13.5px; }
+.field select {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+}
+h3 { font-size: 14px; margin: 0 0 4px; }
+
 .code {
   font-family: var(--mono);
   font-size: 12.5px;

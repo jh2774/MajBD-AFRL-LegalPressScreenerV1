@@ -17,7 +17,7 @@ from pathlib import Path
 from .config import get_config
 from .connectors.usaspending import USASpendingConnector
 from .httpclient import HttpClient
-from .jobs import NOTICE_THRESHOLD, build_screener, queue_notice, severity_at_least
+from .jobs import build_screener, raise_notices
 from .models import Finding
 from .notify import render
 from .notify.gmail import GmailNotifier, status_banner
@@ -124,13 +124,15 @@ def cmd_screen(args, cfg) -> int:
     json_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
     print(f"\nFull results: {json_path}")
 
-    # Queue the same notices the API would, so the review UI shows this run
-    # whichever way it was started.
-    queued = [queue_notice(store, f, result.run_id) for f in result.findings
-              if severity_at_least(f.severity, NOTICE_THRESHOLD)]
+    # Queue the same notices the API would, under the same policy, so the
+    # review queue shows this run whichever way it was started. This used to
+    # carry its own copy of the old threshold, which meant a screen from the
+    # command line ignored the tenant's settings and re-notified everything.
+    queued, held = raise_notices(store, result.findings, result.run_id)
     if queued:
-        print(f"{len(queued)} notice(s) queued for review "
-              f"(severity {NOTICE_THRESHOLD}+).")
+        print(f"{len(queued)} notice(s) queued for review.")
+    for reason, count in held.items():
+        print(f"  {count} finding(s) held back: {reason}")
 
     if args.notify and result.findings:
         _notify(cfg, store, result.findings, result.run_id)

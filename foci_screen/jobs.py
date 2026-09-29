@@ -29,13 +29,14 @@ from .connectors.browser import BrowserRenderer
 from .httpclient import HttpClient
 from .notify import render as render_notice
 from .pipeline import Screener, ScreenOptions
+from .policy import ScreeningPolicy, decide_notice
 from .store import Store
 
 log = logging.getLogger("foci.jobs")
 
-# Findings weaker than this never become a notice. They remain queryable — the
-# point of the change feed is that most nights are quiet — but nobody is asked
-# to review a low-severity correlation.
+# The default notice threshold. A tenant's screening policy may move it; see
+# policy.py. Findings below it remain queryable — the point of the change feed
+# is that most nights are quiet — but nobody is asked to review them.
 NOTICE_THRESHOLD = "medium"
 SEVERITY_ORDER = ["info", "low", "medium", "high", "critical"]
 
@@ -73,12 +74,15 @@ def run_screen_job(tenant_id: str, run_id: str, options: dict) -> dict:
         opts = ScreenOptions(**options)
         result = screener.run(opts, progress=progress, run_id=run_id)
 
-        notices = [queue_notice(store, f, run_id) for f in result.findings
-                   if severity_at_least(f.severity, NOTICE_THRESHOLD)]
+        notices, held = raise_notices(store, result.findings, run_id)
 
         stats = dict(result.stats)
         stats["findings"] = len(result.findings)
         stats["notices_pending"] = len(notices)
+        # Why the rest did not become notices. A quiet queue after a screen is
+        # the intended outcome most nights, and this is how anyone can tell
+        # "nothing new" from "something is misconfigured".
+        stats["notices_held"] = held
         stats["notes"] = result.notes
         store.finish_run(run_id, status="complete", stats=stats)
         return {"run_id": run_id, "findings": len(result.findings),
@@ -93,7 +97,32 @@ def run_screen_job(tenant_id: str, run_id: str, options: dict) -> dict:
         store.close()
 
 
-def queue_notice(store: Store, finding, run_id: str) -> str:
+def raise_notices(store: Store, findings, run_id: str) -> tuple[list[str], dict]:
+    """Decide which findings become draft notices, under the tenant's policy.
+
+    Returns the new notice ids and a count of why the others were held back.
+    """
+    policy, _ = ScreeningPolicy.from_dict(store.screening_policy())
+    raised: list[str] = []
+    held: dict[str, int] = {}
+
+    for finding in findings:
+        decision = decide_notice(
+            finding.severity, finding.signals, policy,
+            already_notified=store.notified_signal_ids(finding.entity.key()))
+        if not decision.raise_notice:
+            held[decision.reason] = held.get(decision.reason, 0) + 1
+            continue
+        notice_id = queue_notice(store, finding, run_id,
+                                 signal_ids=decision.signal_ids,
+                                 trigger_reason=decision.reason)
+        store.supersede_pending(finding.entity.key(), by_notice_id=notice_id)
+        raised.append(notice_id)
+    return raised, held
+
+
+def queue_notice(store: Store, finding, run_id: str, *,
+                 signal_ids: list[str] | None = None, trigger_reason: str = "") -> str:
     """Persist a notice in `pending` — nothing is addressed without a human."""
     officer = finding.top_officer()
     return store.create_notice(
@@ -106,6 +135,11 @@ def queue_notice(store: Store, finding, run_id: str) -> str:
         subject=render_notice.subject_for(finding),
         body_text=render_notice.render_text(finding, run_id=run_id),
         status="pending",
+        # Every signal in the finding is recorded as covered, not only the
+        # ones that tipped it over: the draft describes all of them, so all of
+        # them have been put in front of a reviewer.
+        signal_ids=sorted({s.key() for s in finding.signals} | set(signal_ids or [])),
+        trigger_reason=trigger_reason,
     )
 
 

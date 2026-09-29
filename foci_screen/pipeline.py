@@ -10,6 +10,7 @@ import logging
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
+from . import policy as screening
 from .connectors.alerts import AlertConnector
 from .connectors.feeds import FeedConnector
 from .connectors.fpds import FPDSConnector
@@ -414,7 +415,16 @@ class Screener:
     def _screen_entity(self, entity: Entity, contracts: list[Contract], run_id: str,
                        opts: ScreenOptions, progress,
                        record_changes: list[dict] | None = None) -> Finding | None:
+        policy = self._policy()
         docs = self._gather(entity, opts, progress)
+        # Releases of a kind this tenant does not read are dropped before they
+        # are observed, so switching a kind off also stops it building a
+        # history — rather than storing everything and hiding some of it.
+        wanted = [d for d in docs if screening.wants_document(d, policy)]
+        if len(wanted) != len(docs):
+            progress(f"  {len(docs) - len(wanted)} release(s) of a kind not screened "
+                     f"here left out.")
+        docs = wanted
         progress(f"  {len(docs)} document(s) collected; diffing against store...")
 
         pairs: list[tuple[Document, Change | None]] = []
@@ -443,6 +453,16 @@ class Screener:
         if before != len(signals):
             progress(f"  {before - len(signals)} signal(s) dropped by rule settings.")
 
+        # Categories switched off go the same way and at the same point, for
+        # the same reason. A compound signal can still form from two halves
+        # that are both screened, even if its own label is a category that is
+        # not — its evidence is exactly what was asked for.
+        before = len(signals)
+        signals = screening.filter_signals(signals, policy)
+        if before != len(signals):
+            progress(f"  {before - len(signals)} signal(s) in categories not "
+                     f"screened here.")
+
         # First time we see an entity everything looks "new"; that would mark a
         # baseline scan as urgent. Damp it unless the evidence is independently strong.
         seen_before = self.store.previous_signal_ids(entity.key(), exclude_run=run_id)
@@ -457,5 +477,20 @@ class Screener:
 
         order = ["info", "low", "medium", "high", "critical"]
         if order.index(finding.severity) < order.index(opts.min_severity):
-            return None
+            # A finding below the recording threshold is still kept if it
+            # carries something this tenant has asked to always hear about —
+            # a new legal disclosure scores nothing on purpose, and dropping it
+            # here would make "always notify on legal disclosures" a setting
+            # that can never fire.
+            if not screening.carries_event(finding.signals, policy):
+                return None
         return finding
+
+    def _policy(self) -> screening.ScreeningPolicy:
+        """This tenant's screening policy, read once per run."""
+        cached = getattr(self, "_cached_policy", None)
+        if cached is None:
+            cached, _ = screening.ScreeningPolicy.from_dict(
+                self.store.screening_policy())
+            self._cached_policy = cached
+        return cached

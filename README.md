@@ -312,6 +312,8 @@ every night on a deploy that was screening nothing.
 | `GET /v1/documents/diff?source=&key=` | **What changed between two revisions** |
 | `DELETE /v1/screens/{id}` | Remove a screen and its data — reports first, deletes on `confirm=true` |
 | `GET /v1/suggest?q=` | Type-ahead: screened matches, plus contractors not screened here |
+| `GET / PUT / DELETE /v1/policy` | What this tenant screens for and what raises a notice |
+| `POST /v1/policy/preview` | What a proposed policy would do over past findings — saves nothing |
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
 | `POST /v1/portfolio/edit` | Add or drop companies, returning a new key |
 | `POST /v1/portfolio` | Open a key into a dashboard of those companies |
@@ -511,6 +513,50 @@ nobody chose to watch. `DELETE /v1/screens/{id}` reports what would go and delet
 repeating it with `confirm=true` removes the run, its awards, findings and pending notices.
 Stored document revisions are shared between tenants — a hash is a fact about the world, not
 about who was watching — so they are never touched.
+
+## Choosing what to screen for, and what raises a notice
+
+The **Screening** page holds a policy per tenant, in two halves.
+
+**What to screen for.** Risk categories — FOCI, corporate structure, IP pledged as collateral,
+IP transfer or distress, sanctions, company disclosures — and which kinds of company release to
+read at all. A category switched off is dropped before anything is scored, so it can neither
+raise a finding nor combine with another into one; a release kind switched off is not read, so
+it builds no history either. Individual rules and their weights stay on the **Rules** page,
+which is the finer layer underneath.
+
+**What raises a notice.** A severity threshold (low to critical — not "info", since a notice
+about something scored as informational has nothing in it to act on); which categories may
+raise one; whether a contractor's first screen notifies or is a silent baseline; and events to
+**always** be told about regardless of the threshold — a novation, a change of registered
+country, a new foreign-ownership certification, a sanctions match, a new legal or financial
+disclosure.
+
+**Each piece of evidence notifies once.** This is the part that matters most, because until
+now a notice had no memory: every finding at medium or above queued a draft on every run, so a
+contractor on a nightly watchlist with a standing finding sent the same draft to the same
+contracting officer every night. Now each notice records the evidence it covered, and evidence
+already covered does not raise another. A **rejected** notice counts as covered — a reviewer's
+"no" is the only labelled false positive this tool gets, and the next screen must not overrule
+it. When genuinely new evidence arrives for a contractor that already has an undecided draft,
+the new draft **supersedes** the old one, so the queue holds one current notice per contractor.
+
+Notices written before this existed recorded no evidence, so the findings they were raised from
+stand in for them. Without that, the first screen after upgrading would re-notify everything
+ever notified — checked against a real database, where the preview reported all three existing
+notices as already covered.
+
+Every notice now says **why it was raised**, and a screen reports why the others were held
+back, so a quiet queue can be told apart from a misconfigured one. The page's **Preview** runs
+a proposed policy over each contractor's latest finding before anything is saved; it previews
+the notice half only, because what a different screening selection would have found is a
+question about evidence never gathered.
+
+New legal and financial releases become **disclosure** signals scored at zero. That something
+was announced is not evidence of risk — other rules score what it says — and a quarterly
+results release adding weight every quarter would inflate severity on a calendar. They exist so
+"always notify me of a new legal disclosure" has something to fire on, and only a release new
+since the last screen produces one: on a company's first screen, its feed is backlog, not news.
 
 ## The dashboard is a portfolio
 

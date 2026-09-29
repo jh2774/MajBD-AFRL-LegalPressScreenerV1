@@ -23,6 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from ..config import get_config
 from ..connectors.usaspending import USASpendingConnector
@@ -756,6 +757,101 @@ def clear_rule(rule_id: str, tenant: str = Depends(require_tenant)) -> Response:
     return Response(status_code=204)
 
 
+# ------------------------------------------------------------------ policy
+
+def _policy_catalogue() -> dict:
+    """Everything the settings page needs to label its controls. Served, not
+    hard-coded in the page, so the two cannot drift apart."""
+    return {
+        "categories": screening.CATEGORIES,
+        "release_kinds": screening.RELEASE_KINDS,
+        "notice_severities": list(screening.NOTICE_SEVERITIES),
+        "notice_modes": screening.NOTICE_MODES,
+        "events": {name: {"rule_id": e.rule_id, "label": e.label,
+                          "requires_new": e.requires_new}
+                   for name, e in screening.EVENTS.items()},
+    }
+
+
+@app.get("/v1/policy", tags=["policy"])
+def get_policy(store: Store = Depends(tenant_store)) -> dict:
+    """What this tenant screens for and what raises a notice."""
+    stored = store.screening_policy()
+    policy, notes = screening.ScreeningPolicy.from_dict(stored)
+    return {"policy": policy.to_dict(), "is_default": not stored,
+            "notes": notes, "catalogue": _policy_catalogue()}
+
+
+@app.put("/v1/policy", tags=["policy"])
+def set_policy(body: dict, tenant: str = Depends(require_tenant)) -> dict:
+    """Save a policy. Takes effect on the next screen.
+
+    Anything inconsistent is corrected rather than refused — a notice for a
+    category that is not screened, an "always notify" whose source is switched
+    off — and each correction is returned, so the person saving it is told
+    what changed instead of being handed an error to decode.
+    """
+    store = store_for(tenant)
+    policy, notes = screening.ScreeningPolicy.from_dict(body)
+    store.set_screening_policy(policy.to_dict(),
+                               updated_by=str(body.get("updated_by") or "")
+                               or f"api-key:{tenant}")
+    log.info("screening policy updated for %s", tenant)
+    return {"policy": policy.to_dict(), "is_default": False, "notes": notes,
+            "catalogue": _policy_catalogue()}
+
+
+@app.delete("/v1/policy", status_code=204, tags=["policy"])
+def reset_policy(tenant: str = Depends(require_tenant)) -> Response:
+    """Back to the defaults, and to any later change in what they are."""
+    store_for(tenant).clear_screening_policy()
+    return Response(status_code=204)
+
+
+@app.post("/v1/policy/preview", tags=["policy"])
+def preview_policy(body: dict, store: Store = Depends(tenant_store)) -> dict:
+    """What a policy would have done, run over each contractor's latest finding.
+
+    Nothing is saved and nothing is queued. The same decision function the
+    screen uses runs over history, with the same memory of what has already
+    been notified — so "0 would raise" after a policy change usually means
+    "you have already been told", and the reasons say which.
+
+    It previews the notice half only. Which categories a finding would contain
+    under a different screening selection is a question about evidence that
+    was never gathered, and pretending to answer it would be worse than not.
+    """
+    policy, notes = screening.ScreeningPolicy.from_dict(body)
+    latest: dict[str, dict] = {}
+    for row in store.search_findings(limit=500):
+        key = ((row.get("entity") or {}).get("uei")
+               or (row.get("entity") or {}).get("name") or "").upper()
+        if key and key not in latest:
+            latest[key] = row
+
+    would_raise: list[dict] = []
+    held: dict[str, int] = {}
+    for key, finding in latest.items():
+        signals = [s for s in (finding.get("signals") or [])
+                   if s.get("category") in policy.categories]
+        decision = screening.decide_notice(
+            finding.get("severity") or "info", signals, policy,
+            already_notified=store.notified_signal_ids(key))
+        if decision.raise_notice:
+            would_raise.append({"entity_key": key,
+                                "entity_name": (finding.get("entity") or {}).get("name"),
+                                "severity": finding.get("severity"),
+                                "reason": decision.reason})
+        else:
+            held[decision.reason] = held.get(decision.reason, 0) + 1
+
+    return {"contractors": len(latest), "would_raise": len(would_raise),
+            "examples": would_raise[:10],
+            "held": [{"reason": r, "count": n}
+                     for r, n in sorted(held.items(), key=lambda kv: -kv[1])],
+            "notes": notes}
+
+
 @app.get("/v1/rules/precision", tags=["dispositions"])
 def rule_precision(store: Store = Depends(tenant_store)) -> dict:
     """Per-rule precision from reviewer verdicts, worst first.
@@ -870,7 +966,10 @@ def deactivate_watchlist(watchlist_id: str,
 
 # ----------------------------------------------------------------- notices
 
-NOTICE_STATUS = "^(|pending|approved|rejected|drafted|sent|suppressed)$"
+# `superseded` is housekeeping, not a decision: an undecided draft replaced by
+# a newer one for the same contractor. It must be filterable, or the history of
+# a contractor's notices would have holes a reviewer could not account for.
+NOTICE_STATUS = "^(|pending|approved|rejected|drafted|sent|suppressed|superseded)$"
 
 
 @app.get("/v1/notices", tags=["notices"])
