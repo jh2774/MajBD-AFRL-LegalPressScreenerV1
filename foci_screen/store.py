@@ -147,6 +147,22 @@ CREATE TABLE IF NOT EXISTS adv_changes (
     payload      TEXT NOT NULL,
     detected_at  TEXT NOT NULL
 );
+-- The same for a company's own Form D fundraising notices, keyed by its SEC
+-- number (CIK). Global for the same reason. Which contractor a CIK belongs to
+-- is a per-tenant decision, and lives in entity_links.
+CREATE TABLE IF NOT EXISTS formd_snapshots (
+    cik          TEXT PRIMARY KEY,
+    snapshot     TEXT NOT NULL,
+    latest_filed TEXT,
+    checked_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS formd_changes (
+    change_id    TEXT PRIMARY KEY,
+    cik          TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    detected_at  TEXT NOT NULL
+);
 -- Who is emailed about which companies. `companies` holds portfolio keys:
 -- contractor UEIs or names, and CRD:<number> for investment firms.
 CREATE TABLE IF NOT EXISTS alert_subscriptions (
@@ -1051,6 +1067,70 @@ class Store:
                 out.append({**json.loads(r["payload"]), "detected_at": r["detected_at"]})
             except (ValueError, TypeError):
                 continue
+        return out
+
+    # ----------------------------------------------------------------- Form D
+    def formd_snapshot(self, cik: str) -> dict | None:
+        row = self._one("SELECT snapshot, checked_at FROM formd_snapshots WHERE cik=?",
+                        (str(int(cik)),))
+        if not row:
+            return None
+        try:
+            return {**json.loads(row["snapshot"]), "checked_at": row["checked_at"]}
+        except (ValueError, TypeError):
+            return None
+
+    def save_formd_snapshot(self, cik: str, snapshot: dict, latest_filed: str) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO formd_snapshots (cik, snapshot, latest_filed, checked_at)"
+                " VALUES (?,?,?,?) ON CONFLICT (cik) DO UPDATE SET"
+                " snapshot=excluded.snapshot, latest_filed=excluded.latest_filed,"
+                " checked_at=excluded.checked_at",
+                (str(int(cik)), json.dumps(snapshot), latest_filed, _now()))
+
+    def record_formd_changes(self, changes: list[dict]) -> int:
+        with self._tx() as c:
+            for ch in changes:
+                c.execute(
+                    "INSERT INTO formd_changes (change_id, cik, kind, payload, detected_at)"
+                    " VALUES (?,?,?,?,?) ON CONFLICT (change_id) DO NOTHING",
+                    (ch["change_id"], str(int(ch["cik"])), ch["kind"], json.dumps(ch),
+                     _now()))
+        return len(changes)
+
+    def formd_changes(self, ciks: list[str] | None = None, limit: int = 100) -> list[dict]:
+        sql = "SELECT payload, detected_at FROM formd_changes"
+        params: list = []
+        if ciks is not None:
+            if not ciks:
+                return []
+            sql += f" WHERE cik IN ({','.join('?' for _ in ciks)})"
+            params += [str(int(c)) for c in ciks]
+        sql += " ORDER BY detected_at DESC LIMIT ?"
+        params.append(limit)
+        out = []
+        for r in self._query(sql, tuple(params)):
+            try:
+                out.append({**json.loads(r["payload"]), "detected_at": r["detected_at"]})
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    def confirmed_ciks(self, entity_keys: list[str]) -> dict[str, str]:
+        """{CIK: entity key} for the contractors whose SEC identity a person confirmed.
+
+        Only confirmed links. A name-similarity match is good enough to narrow
+        a search, not to email someone that a company raised money.
+        """
+        out: dict[str, str] = {}
+        for key in dict.fromkeys(k.upper() for k in entity_keys if k):
+            link = self.get_entity_link(key)
+            if link and link.get("status") == "confirmed" and (link.get("cik") or "").strip():
+                try:
+                    out[str(int(link["cik"]))] = key
+                except ValueError:
+                    continue
         return out
 
     # ---------------------------------------------------------- email alerts

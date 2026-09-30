@@ -30,6 +30,9 @@ from ..config import get_config
 from ..connectors.adv import PDF_URL as ADV_PDF_URL
 from ..connectors.adv import SUMMARY_URL as ADV_SUMMARY_URL
 from ..connectors.adv import AdvConnector
+from ..connectors.formd import COMPANY_URL as EDGAR_COMPANY_URL
+from ..connectors.formd import READABLE_URL as FORMD_READABLE_URL
+from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
 from ..jobs import JobQueue
 from ..notify import render as render_notice
@@ -457,6 +460,7 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
         latest = findings[0] if findings else None
         screened = bool(totals["contract_count"]) or bool(latest)
         rows.append({
+            **_latest_raise(store, company.key),
             "entity_key": company.key,
             # The database's name wins when it has one: it is the name the
             # awards were made under, and the key may carry an older one.
@@ -490,11 +494,34 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
     }
 
 
+def _latest_raise(store: Store, entity_key: str) -> dict:
+    """The newest Form D on record for a contractor, for the portfolio table.
+
+    Read from what is stored; loading a dashboard never reaches out to EDGAR.
+    """
+    ciks = store.confirmed_ciks([entity_key])
+    if not ciks:
+        return {"cik": None, "latest_raise": None}
+    cik = next(iter(ciks))
+    snap = store.formd_snapshot(cik) or {}
+    filings = [f for f in snap.get("filings") or [] if f.get("read_ok", True)]
+    newest = filings[0] if filings else None
+    return {"cik": cik, "latest_raise": {
+        "filed": newest.get("filed"), "form": newest.get("form"),
+        "amount_sold": newest.get("amount_sold"), "investors": newest.get("investors"),
+    } if newest else None, "formd_checked": snap.get("checked_at")}
+
+
 # -------------------------------------------------- investment firms (ADV)
 
 def _adv() -> AdvConnector:
     from ..httpclient import HttpClient
     return AdvConnector(HttpClient(cfg))
+
+
+def _formd() -> FormDConnector:
+    from ..httpclient import HttpClient
+    return FormDConnector(HttpClient(cfg))
 
 
 def _base_url(request: Request) -> str:
@@ -538,6 +565,51 @@ def get_adviser(crd: str, refresh: bool = Query(False),
             "links": {"summary": ADV_SUMMARY_URL.format(crd=crd),
                       "form": ADV_PDF_URL.format(crd=crd)},
             "refreshed": bool(result)}
+
+
+# ---------------------------------------------- a contractor's own Form D
+
+@app.get("/v1/edgar/companies", tags=["fundraising"])
+def search_edgar_companies(q: str = Query("", max_length=120),
+                           tenant: str = Depends(require_tenant)) -> dict:
+    """Companies, people and investment vehicles on EDGAR by name — for a person
+    to pick which one a contractor is. Each carries a label, not a verdict."""
+    try:
+        return {"query": q, "results": _formd().search(q)}
+    except Exception as exc:        # noqa: BLE001 - say so rather than 500
+        log.warning("EDGAR company search failed: %s", exc)
+        return {"query": q, "results": [], "detail": "EDGAR did not answer. Try again "
+                                                     "in a moment."}
+
+
+@app.get("/v1/entities/{entity_key}/formd", tags=["fundraising"])
+def entity_formd(entity_key: str, refresh: bool = Query(False),
+                 store: Store = Depends(tenant_store)) -> dict:
+    """A contractor's Form D fundraising notices, once its SEC record is picked.
+
+    Nothing is attributed on a name match: until a person has confirmed which
+    SEC filer the contractor is, this says so and returns no filings.
+    """
+    key = entity_key.upper()
+    link = store.get_entity_link(key)
+    ciks = store.confirmed_ciks([key])
+    if not ciks:
+        return {"entity_key": key, "linked": False, "link": link}
+    cik = next(iter(ciks))
+
+    result = {}
+    if refresh or not store.formd_snapshot(cik):
+        result = alerts_engine.refresh_issuers(store, _formd(), [cik]).get(cik, {})
+        if not result.get("ok") and not store.formd_snapshot(cik):
+            raise HTTPException(502, result.get("detail") or "EDGAR did not answer.")
+    snapshot = store.formd_snapshot(cik) or {}
+    for f in snapshot.get("filings") or []:
+        f["url"] = FORMD_READABLE_URL.format(cik=int(cik),
+                                             acc=f["accession"].replace("-", ""))
+    return {"entity_key": key, "linked": True, "cik": cik, "link": link,
+            "snapshot": snapshot, "changes": store.formd_changes([cik], limit=50),
+            "links": {"company": EDGAR_COMPANY_URL.format(cik=cik)},
+            "refreshed": bool(result), "refresh_detail": result.get("detail")}
 
 
 # ------------------------------------------------------------ email alerts
@@ -590,12 +662,13 @@ def delete_subscription(subscription_id: str,
 
 @app.post("/v1/alerts/run", tags=["alerts"])
 def run_alerts(request: Request, store: Store = Depends(tenant_store)) -> dict:
-    """Check every watched firm now and email what is new.
+    """Check every watched firm and company now and email what is new.
 
     For a free instance with no cron, something outside has to call this —
     the scheduled GitHub workflow in this repository does, once a day.
     """
-    return alerts_engine.run_alerts(store, _adv(), Mailer(cfg), _base_url(request))
+    return alerts_engine.run_alerts(store, _adv(), Mailer(cfg), _base_url(request),
+                                    formd=_formd())
 
 
 @app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])
@@ -840,10 +913,13 @@ def set_identity(entity_key: str, body: IdentityDecision,
         raise HTTPException(
             422, "Confirming an identity needs a CIK — either already resolved for "
                  "this entity or supplied here.")
-    return store.set_entity_link(
+    link = store.set_entity_link(
         entity_key, status=body.status, cik=body.cik, note=body.note,
         matched_title=body.matched_title,
         decided_by=body.decided_by.strip() or f"api-key:{tenant}")
+    # Its fundraising history is not news to lists already watching it.
+    alerts_engine.baseline_entity(store, entity_key)
+    return link
 
 
 # ------------------------------------------------------------ dispositions

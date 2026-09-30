@@ -315,8 +315,10 @@ every night on a deploy that was screening nothing.
 | `GET / PUT / DELETE /v1/policy` | What this tenant screens for and what raises a notice |
 | `GET /v1/advisers/search?q=` | Investment firms by name, from the SEC's adviser database |
 | `GET /v1/advisers/{crd}` | One firm's Form ADV funds, in plain terms, and changes seen |
+| `GET /v1/edgar/companies?q=` | Companies, vehicles and people on EDGAR by name, labelled, to pick from |
+| `GET /v1/entities/{key}/formd` | A contractor's Form D fundraising notices, once its SEC record is picked |
 | `POST /v1/alerts/subscriptions` | Save who is emailed about a portfolio |
-| `POST /v1/alerts/run` | Check every watched firm now and email what is new |
+| `POST /v1/alerts/run` | Check every watched firm and company now and email what is new |
 | `POST /v1/policy/preview` | What a proposed policy would do over past findings — saves nothing |
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
 | `POST /v1/portfolio/edit` | Add or drop companies, returning a new key |
@@ -550,12 +552,46 @@ their drawing sizes, which cost nothing to read, and extracts only those: 2.5 se
 identical results, checked field by field against reading every page. It uses the fast path
 only when it recovers every fund the form declares, and reads every page otherwise.
 
+## A contractor raising money: Form D
+
+Form ADV covers the investors. The contractor's own fundraising is on **Form D**: the short
+notice a company must file with the SEC within 15 days of first selling shares (or loans,
+options, other stakes) to private investors. It gives how much the company is trying to raise,
+how much it has raised, how many investors bought in, who its directors and executives are and
+where they are based, and whether the money came with a merger or acquisition. It does not name
+the investors.
+
+Form D is only read for a contractor once a person has picked which SEC filer it is, on the
+contractor's page under **Private fundraising (SEC Form D)**. The search there uses EDGAR's own
+company-name lookup. It returns the company alongside **investment vehicles** named after
+it — "HII Shield AI-02, a Series of HII Shield AI-A LLC" bought Shield AI shares; it is not
+Shield AI — and people with similar names. Each result is labelled, and the likely company is
+shown with its city, state of incorporation and number of Form D notices. The tool never picks
+one itself: a wrong pick would put another entity's fundraising under the contractor's name.
+Picking one also confirms the contractor's SEC identity for the rest of the screen, and an
+unreviewed name match is never used for Form D alerts.
+
+The tool then reports, for each new notice:
+
+* a **new fundraising**, with the amount raised, investor count, target and first-sale date
+* an **update** to an earlier notice, with the money raised before and after
+* **people named for the first time**. Anyone with an address outside the U.S. is reported on
+  their own and ranked first.
+* the offering being **tied to a merger or acquisition**, or the company's **address or state
+  of incorporation** changing
+
+How it reads the filings: a company's filing list is one JSON record at `data.sec.gov`, so a
+nightly check costs one request per company. Each Form D is an XML document in the EDGAR
+archive (`/Archives/edgar/data`, which robots.txt allows; `/cgi-bin` is disallowed and never
+used). A filing never changes once made, so each is read once and kept. Checked against Shield
+AI (10 notices, 2016–2026) and Saronic (3), every field of all 13 filings parsed.
+
 ## Email alerts on a portfolio
 
 A portfolio can carry a list of email addresses. Whenever something changes for one of its
-companies — a Form ADV change at a firm, or a contractor being flagged under the screening
-policy — the list gets one email with every new item: what changed, what it is, and where to
-look. **No analysis**; the reader decides.
+companies — a Form ADV change at a firm, a contractor filing a Form D, or a contractor being
+flagged under the screening policy — the list gets one email with every new item: what
+changed, what it is, and where to look. **No analysis**; the reader decides.
 
 * Everything already known when a list is saved is treated as sent, so the first email is about
   something that happens *next*, not the firm's history presented as news.

@@ -867,6 +867,8 @@ async function viewEntity(key) {
 
     ${identityCard(d.identity, key)}
 
+    ${formdPlaceholder()}
+
     ${f ? `<div class="card"><h2>Signals</h2>
       <div class="muted" style="font-size:12px;margin-bottom:10px">
         Marking these is what makes rule weights measurable rather than assumed —
@@ -901,6 +903,196 @@ async function viewEntity(key) {
   wireVerdicts(view, key, f ? f.run_id : "");
   wireIdentity(view, key);
   wireAddToPortfolio();
+  // After the page is drawn: a company's first Form D check reads each of its
+  // filings from EDGAR, and the rest of the page should not wait for that.
+  loadFormD(key, e.name || key);
+}
+
+/* --------------------------------------------- a contractor's own Form D */
+
+/* Form D is the notice a company files when it raises money privately — the
+ * contractor's own record, where Form ADV is the investment firms'. It is only
+ * read once a person has picked which SEC filer the contractor is: EDGAR's
+ * name list mixes in investment vehicles that merely bought shares in a
+ * company, and a wrong pick would put their fundraising under this name. */
+const FORMD_TITLE = "Private fundraising (SEC Form D)";
+
+function formdPlaceholder() {
+  return `<div class="card" id="formd-card"><h2>${FORMD_TITLE}</h2>
+    <p class="muted">Checking…</p></div>`;
+}
+
+async function loadFormD(key, name, refresh = false) {
+  const card = document.getElementById("formd-card");
+  if (!card) return;
+  if (refresh) card.querySelector("#fd-status")?.replaceChildren("Checking EDGAR for new filings…");
+  let d;
+  try {
+    d = await api(`/v1/entities/${encodeURIComponent(key)}/formd${refresh ? "?refresh=true" : ""}`);
+  } catch (e) {
+    card.innerHTML = `<h2>${FORMD_TITLE}</h2>
+      <p class="muted">${esc(e.message || String(e))}</p>`;
+    return;
+  }
+  card.innerHTML = d.linked ? formdFilings(d) : formdPicker(d, name);
+  wireFormD(card, key, name);
+}
+
+function formdPicker(d, name) {
+  const link = d.link || {};
+  return `
+    <h2>${FORMD_TITLE}</h2>
+    <p class="muted">When a private company sells shares to investors, it must file a
+    short notice with the SEC — <strong>Form D</strong> — saying how much it is raising
+    and how many investors bought in. To see and watch this contractor's, find its SEC
+    record below and pick it.</p>
+    <p class="muted" style="font-size:12.5px">Pick the company itself. EDGAR also lists
+    <strong>investment vehicles</strong> named after a company — pools of money that only
+    bought shares in it. Those are not the company, and their filings are not its
+    fundraising. Picking one here also tells the screen which SEC filer this contractor is.</p>
+    ${link.cik && link.status === "auto" ? `<p class="muted" style="font-size:12.5px">
+      The screen matched this contractor by name to CIK ${esc(link.cik)}
+      (${esc(link.matched_title || "")}), but nobody has checked that. Confirm it in the
+      SEC identity card above, or pick below.</p>` : ""}
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input id="fd-q" value="${esc(name)}" aria-label="Company name to look up on EDGAR"
+        style="flex:1;min-width:220px;padding:8px;border:1px solid var(--border);
+        border-radius:8px;background:var(--surface-2);color:var(--text)">
+      <button id="fd-search">Search EDGAR</button>
+    </div>
+    <div id="fd-results" style="margin-top:10px"></div>`;
+}
+
+const FORMD_LABEL = {
+  company: "company",
+  vehicle: "investment vehicle — not the company",
+  person: "looks like a person",
+};
+
+function formdResults(results) {
+  if (!results.length) {
+    return '<p class="muted">Nothing on EDGAR by that name. Private companies that have never raised money from investors often have no SEC record at all.</p>';
+  }
+  return `<table><tbody>${results.map((r) => `
+    <tr><td><strong>${esc(r.name)}</strong>
+        <span class="pill${r.label === "company" ? "" : " warn"}">${esc(FORMD_LABEL[r.label] || r.label)}</span>
+        <div class="muted" style="font-size:12px">CIK ${esc(r.cik)}${
+          r.place ? " · " + esc(r.place) : ""}${
+          r.incorporated_in ? " · incorporated in " + esc(r.incorporated_in) : ""}${
+          r.form_d_count !== undefined ? ` · ${num(r.form_d_count)} Form D notice${r.form_d_count === 1 ? "" : "s"}` : ""}${
+          (r.tickers || []).length ? " · traded as " + esc(r.tickers.join(", ")) : ""}</div></td>
+      <td style="text-align:right;white-space:nowrap">
+        ${r.label === "company"
+          ? `<button class="fd-pick" data-cik="${esc(r.cik)}" data-name="${esc(r.name)}">This is the company</button>`
+          : `<button class="ghost fd-pick" data-cik="${esc(r.cik)}" data-name="${esc(r.name)}"
+               title="The label is a guess from the name; pick this only if you know better">Pick anyway</button>`}
+      </td></tr>`).join("")}</tbody></table>`;
+}
+
+function formdFilings(d) {
+  const s = d.snapshot || {};
+  const filings = s.filings || [];
+  const latest = filings.find((f) => f.read_ok !== false);
+  const cell = (v) => (v === null || v === undefined ? "—" : v);
+  const rows = filings.map((f) => f.read_ok === false ? `
+    <tr><td>${esc(f.filed)}</td><td>${f.form === "D/A" ? "Update" : "New"}</td>
+      <td colspan="4" class="muted">Could not be read here — open it on EDGAR.</td>
+      <td><a class="linkish" href="${esc(f.url)}" target="_blank" rel="noopener noreferrer">Open →</a></td></tr>` : `
+    <tr>
+      <td>${esc(f.filed)}</td>
+      <td>${f.form === "D/A" ? "Update to an earlier notice" : "New fundraising"}
+        ${f.business_combination ? '<span class="pill warn">tied to a merger or acquisition</span>' : ""}
+        ${f.outside_us ? '<span class="pill warn">company address outside the U.S.</span>' : ""}</td>
+      <td class="num">${f.offering_indefinite ? "no set total" : cell(f.offering_amount === null ? null : money(f.offering_amount))}</td>
+      <td class="num"><strong>${cell(f.amount_sold === null ? null : money(f.amount_sold))}</strong></td>
+      <td class="num">${cell(f.investors === null ? null : num(f.investors))}</td>
+      <td>${esc(f.first_sale || "—")}</td>
+      <td><a class="linkish" href="${esc(f.url)}" target="_blank" rel="noopener noreferrer">Open →</a></td>
+    </tr>`).join("");
+
+  const people = latest ? (latest.related_persons || []) : [];
+  return `
+    <h2>${FORMD_TITLE}</h2>
+    <p class="muted">Notices <strong>${esc(s.name || "")}</strong> (CIK ${esc(d.cik)}) filed
+    with the SEC when it sold shares or other stakes to private investors. Each says how
+    much the company set out to raise, how much it had raised by then, and how many
+    investors had bought in. It does not name the investors. Wrong company? Change it in
+    the SEC identity card above.</p>
+
+    ${d.changes.length ? `<h3>New since this company was first checked</h3>
+      ${d.changes.map((c) => `
+        <div style="border-left:3px solid var(--accent);padding:4px 12px;margin:10px 0">
+          <div><strong>${esc(c.headline)}</strong> <span class="muted" style="font-size:12px">· ${esc(day(c.detected_at))}</span></div>
+          ${c.detail ? `<div>${esc(c.detail)}</div>` : ""}
+          <div class="muted" style="font-size:12.5px"><em>What this is:</em> ${esc(c.explainer)}</div>
+          <div class="muted" style="font-size:12.5px"><em>Where to look:</em> ${esc(c.where)}</div>
+        </div>`).join("")}` : ""}
+
+    ${filings.length ? `<table>
+      <thead><tr><th>Filed</th><th>Notice</th><th class="num">Trying to raise</th>
+        <th class="num">Raised so far</th><th class="num">Investors</th><th>First sale</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table>
+      ${s.total_filings > filings.length ? `<p class="muted" style="font-size:12px">
+        Showing the latest ${num(filings.length)} of ${num(s.total_filings)}; the rest are on EDGAR.</p>` : ""}`
+      : `<p class="muted">This company has not filed a Form D. If it is in a portfolio with
+         email alerts, the list will be told when it does.</p>`}
+
+    ${people.length ? `<h3 style="margin-top:14px">People named on the latest notice</h3>
+      <p class="muted" style="font-size:12.5px">Form D must list the company's directors and
+      top executives, and anyone paid to promote the fundraising.</p>
+      <ul style="margin:0;padding-left:20px">${people.map((p) => `<li>${esc(p.name)}
+        <span class="muted">— ${esc(p.title || (p.roles || []).join(", ").toLowerCase() || "named")}${p.place ? ", " + esc(p.place) : ""}</span>
+        ${p.outside_us ? '<span class="pill warn">address outside the U.S.</span>' : ""}</li>`).join("")}</ul>` : ""}
+
+    <div class="actions">
+      <a class="linkish" href="${esc(d.links.company)}" target="_blank" rel="noopener noreferrer">All of its SEC filings on EDGAR →</a>
+      <button id="fd-refresh">Check EDGAR now</button>
+    </div>
+    <p class="muted" id="fd-status" style="font-size:12px">${
+      d.refresh_detail ? esc(d.refresh_detail) + " " : ""}Last checked ${esc(day(s.checked_at))}.</p>`;
+}
+
+function wireFormD(card, key, name) {
+  const refresh = card.querySelector("#fd-refresh");
+  if (refresh) {
+    refresh.onclick = () => { refresh.disabled = true; loadFormD(key, name, true); };
+    return;
+  }
+  const input = card.querySelector("#fd-q");
+  const out = card.querySelector("#fd-results");
+  const search = async () => {
+    const q = input.value.trim();
+    if (q.length < 2) return;
+    out.textContent = "Searching EDGAR…";
+    try {
+      const d = await api(`/v1/edgar/companies?q=${encodeURIComponent(q)}`);
+      out.innerHTML = d.detail ? `<p class="muted">${esc(d.detail)}</p>` : formdResults(d.results);
+    } catch (e) {
+      out.textContent = e.message || String(e);
+      return;
+    }
+    out.querySelectorAll(".fd-pick").forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        b.textContent = "Saving…";
+        try {
+          await apiPost(`/v1/entities/${encodeURIComponent(key)}/identity`, {
+            status: "confirmed",
+            cik: b.dataset.cik.padStart(10, "0"),
+            matched_title: b.dataset.name,
+            note: "Picked from EDGAR's company list on the fundraising card.",
+          });
+          route();
+        } catch (e) {
+          b.disabled = false;
+          b.textContent = "Try again";
+          out.insertAdjacentHTML("afterbegin", `<p class="error">${esc(e.message || String(e))}</p>`);
+        }
+      };
+    });
+  };
+  card.querySelector("#fd-search").onclick = search;
+  input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); search(); } };
 }
 
 /* Which SEC registrant this contractor is. Shown prominently because EDGAR
@@ -1622,12 +1814,24 @@ function portfolioTable(companies) {
   const contractors = companies.filter((r) => r.kind !== "adviser");
   const firms = companies.filter((r) => r.kind === "adviser");
 
+  // What the contractor last told the SEC it raised privately (Form D). Blank
+  // until someone picks its SEC record on its page — see formdPicker.
+  const raise = (r) => {
+    if (!r.cik) return '<span class="muted" title="Pick its SEC record on the contractor page">—</span>';
+    if (!r.formd_checked) return '<span class="muted">not checked yet</span>';
+    if (!r.latest_raise) return '<span class="muted">none filed</span>';
+    const x = r.latest_raise;
+    return `${x.amount_sold === null || x.amount_sold === undefined ? "—" : money(x.amount_sold)}
+      <span class="muted" style="font-size:12px">· ${esc(x.filed)}</span>`;
+  };
+
   const contractorRows = contractors.map((r) => `
     <tr>
       <td>${linkEntity(r.entity_key, r.entity_name)}</td>
       <td>${r.screened_here ? sevTag(r.severity) : '<span class="pill">not screened here</span>'}</td>
       <td class="num">${r.contract_count ? num(r.contract_count) : "—"}</td>
       <td class="num">${r.obligated ? money(r.obligated) : "—"}</td>
+      <td>${raise(r)}</td>
       <td>${r.last_screened ? day(r.last_screened) : "—"}</td>
     </tr>`).join("");
 
@@ -1642,7 +1846,8 @@ function portfolioTable(companies) {
   return `
     ${contractors.length ? `<table>
       <thead><tr><th>Contractor</th><th>Latest severity</th><th class="num">Awards</th>
-        <th class="num">Obligated</th><th>Screened</th></tr></thead>
+        <th class="num">Obligated</th><th title="From the company's latest SEC Form D">Latest private raise</th>
+        <th>Screened</th></tr></thead>
       <tbody>${contractorRows}</tbody></table>` : ""}
     ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
       <table>
@@ -1793,9 +1998,13 @@ async function alertsCard(key, portfolioName) {
       <h2>Email alerts</h2>
       <p class="muted">Anyone on this list gets an email when something changes for a
       company in this portfolio — a new fund or a change in foreign ownership at an
-      investment firm, or a contractor being flagged. Each email says <strong>what
-      changed and where to look</strong>. It does not judge what the change means;
-      that is left to the person reading it.</p>
+      investment firm, a contractor filing a notice that it raised money (Form D), or a
+      contractor being flagged. Each email says <strong>what changed and where to
+      look</strong>. It does not judge what the change means; that is left to the person
+      reading it.</p>
+      <p class="muted" style="font-size:12.5px">Fundraising notices are watched only for
+      contractors whose SEC record has been picked — on the contractor's page, under
+      "${FORMD_TITLE}".</p>
 
       <div class="${mode === "send" ? "muted" : "error"}" style="font-size:12.5px;margin:8px 0">
         ${esc(d.sending.explanation)}</div>
@@ -1848,9 +2057,11 @@ function wireAlerts(key, portfolioName) {
       try {
         const r = await apiPost("/v1/alerts/run", {});
         const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
+        const checked = `Checked ${r.firms_checked} investment firm(s) and `
+          + `${r.companies_checked || 0} contractor(s) with an SEC record.`;
         status.textContent = mine.status === "nothing new"
-          ? `Checked ${r.firms_checked} firm(s). Nothing new since the last alert.`
-          : `Checked ${r.firms_checked} firm(s). ${mine.items || 0} update(s): ${mine.status}.`;
+          ? `${checked} Nothing new since the last alert.`
+          : `${checked} ${mine.items || 0} update(s): ${mine.status}.`;
         setTimeout(viewPortfolio, 1500);
       } catch (e) {
         run.disabled = false;
