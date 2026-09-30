@@ -383,6 +383,53 @@ use in the browser must be `default:<key>` or the site will not show what you ju
 A screen run this way is identical to one the worker would have run; the only difference is
 which machine spends the minutes.
 
+## Turning on email alerts
+
+Alerts are written from the start and shown on the Portfolio page exactly as they would be
+sent — but **no email leaves until you switch it on**. Read a few first.
+
+**1. A mail account to send from.** Any provider that offers SMTP works. The simplest:
+
+| Provider | `SMTP_HOST` | `SMTP_PORT` | Notes |
+|---|---|---|---|
+| Gmail | `smtp.gmail.com` | `587` | Needs an *app password* (Google Account → Security), not your normal one |
+| Outlook / Microsoft 365 | `smtp.office365.com` | `587` | App password if the account has two-step sign-in |
+| Resend, SendGrid, Postmark | from their dashboard | `587`, or `2587`/`2525` | Better for volume; verify a sending domain |
+
+**2. On Render** → the service → **Environment**, add:
+
+| Key | Value |
+|---|---|
+| `ALERTS_SEND` | `true` |
+| `SMTP_HOST` | from the table above |
+| `SMTP_PORT` | `587` |
+| `SMTP_USER` | the sending account's address |
+| `SMTP_PASSWORD` | its app password — kept as a secret on Render, never in the repository |
+| `ALERTS_FROM` | the address alerts come from (usually the same as `SMTP_USER`) |
+| `FOCI_PUBLIC_URL` | `https://contractwatcher-4wxb.onrender.com`, so links in alerts point at the site |
+
+Save; the service restarts. The Portfolio page's alert card then says *"Sending is on"*.
+
+If sending fails with a connection error, the host may be blocking port 587 — try `2587` or
+`2525`, which most providers also listen on for exactly this reason.
+
+**While you are still reading them first**, also set `FOCI_EMAIL_REDIRECT_TO` to your own
+address. Every alert then comes to you, with the intended recipients named in the subject line.
+Clear it when you trust what they say.
+
+**3. A daily check.** A free instance has no scheduler of its own, so the repository includes
+`.github/workflows/alerts.yml`, which asks the site to check once a day at 12:15 UTC. On GitHub
+→ the repository → **Settings → Secrets and variables → Actions**, add:
+
+* a **variable** `FOCI_SITE_URL` = `https://contractwatcher-4wxb.onrender.com`
+* a **secret** `FOCI_ALERTS_KEY` = your API key — the part after `default:`
+
+It does nothing until both exist. **Actions → Daily alerts → Run workflow** runs it by hand. The
+Portfolio page's **Check now** button does the same thing from the browser.
+
+GitHub pauses scheduled workflows in a repository with no commits for 60 days; a push, or
+re-enabling it on the Actions tab, starts it again.
+
 ## Costs and gotchas
 
 - **If Render rejects `type: redis` in the blueprint, change it to `keyvalue`.** Render renamed

@@ -148,5 +148,32 @@ class HttpClient:
     def get(self, url: str, **kw) -> dict:
         return self.request("GET", url, **kw)
 
+    def get_bytes(self, url: str, *, timeout: int = 60,
+                  max_bytes: int = 40_000_000) -> tuple[int, bytes]:
+        """(status, body) for a binary document. Not cached.
+
+        `request` keeps `resp.text`, which decodes a PDF as though it were
+        text and quietly corrupts it — the file still arrives, it just no
+        longer parses. Same rate limiter and same identifying User-Agent as
+        every other call. Nothing is written to the cache: a Form ADV runs to
+        megabytes, and the store keeps what was read from it, not the file.
+        """
+        self.limiter.wait()
+        try:
+            resp = self.session.get(url, timeout=timeout, stream=True)
+        except requests.RequestException as exc:
+            self.stats["errors"] += 1
+            log.warning("could not fetch %s: %s", url, exc)
+            return (0, b"")
+        body = bytearray()
+        for chunk in resp.iter_content(64 * 1024):
+            body.extend(chunk)
+            if len(body) > max_bytes:
+                log.warning("%s is larger than %d bytes; stopped reading", url, max_bytes)
+                resp.close()
+                return (resp.status_code, b"")
+        self.stats["misses"] += 1
+        return (resp.status_code, bytes(body))
+
     def post(self, url: str, **kw) -> dict:
         return self.request("POST", url, **kw)

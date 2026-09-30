@@ -313,6 +313,10 @@ every night on a deploy that was screening nothing.
 | `DELETE /v1/screens/{id}` | Remove a screen and its data — reports first, deletes on `confirm=true` |
 | `GET /v1/suggest?q=` | Type-ahead: screened matches, plus contractors not screened here |
 | `GET / PUT / DELETE /v1/policy` | What this tenant screens for and what raises a notice |
+| `GET /v1/advisers/search?q=` | Investment firms by name, from the SEC's adviser database |
+| `GET /v1/advisers/{crd}` | One firm's Form ADV funds, in plain terms, and changes seen |
+| `POST /v1/alerts/subscriptions` | Save who is emailed about a portfolio |
+| `POST /v1/alerts/run` | Check every watched firm now and email what is new |
 | `POST /v1/policy/preview` | What a proposed policy would do over past findings — saves nothing |
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
 | `POST /v1/portfolio/edit` | Add or drop companies, returning a new key |
@@ -513,6 +517,53 @@ nobody chose to watch. `DELETE /v1/screens/{id}` reports what would go and delet
 repeating it with `confirm=true` removes the run, its awards, findings and pending notices.
 Stored document revisions are shared between tenants — a hash is a fact about the world, not
 about who was watching — so they are never touched.
+
+## Watching investment firms: Form ADV
+
+The firms that own or back a defence contractor — private equity, venture capital — file
+**Form ADV** with the SEC and must keep it current. Contractors themselves do not file it; their
+investors do. Its **Schedule D, Section 7.B.(1)** lists each private fund the firm runs: how
+much money is in it, how many investors, where it is set up, and — question 16 — **how much of
+it is owned by investors outside the United States**.
+
+Add a firm on the **Portfolio** page (search by name; it is added by its SEC CRD number) and its
+page shows those funds in plain English. When it files again, the tool reports:
+
+* a **new private fund** — the firm raising money; funds are partnerships, so this is also the
+  "new partnership" case
+* the **share owned outside the U.S.** rising or falling in any fund — ordered first
+* a fund's **investor count** changing, or its **size** moving by a quarter or more
+* a fund **disappearing**, a fund's **home country** changing, a new **related firm**, and
+  every **new filing**
+
+Each report says what changed, one sentence on what that part of the form *is*, and exactly
+where on the form to look, with links to the SEC's page and the filing. It does not say what
+the change means for the contractor; that is left to the reader.
+
+How it reads the form, and why this way. IAPD's JSON record gives each firm's latest filing
+date, so most nights nothing more is fetched. When the date moves, the full Form ADV is
+downloaded as a PDF: `adviserinfo.sec.gov` serves the same form section by section as web
+pages, but its robots.txt disallows those to automated clients, and this tool does not read
+them. The PDF is built so each page repeats everything before it in its section — reading all
+63 pages of a real filing took 27 seconds. The tool finds the pages that end each section from
+their drawing sizes, which cost nothing to read, and extracts only those: 2.5 seconds, with
+identical results, checked field by field against reading every page. It uses the fast path
+only when it recovers every fund the form declares, and reads every page otherwise.
+
+## Email alerts on a portfolio
+
+A portfolio can carry a list of email addresses. Whenever something changes for one of its
+companies — a Form ADV change at a firm, or a contractor being flagged under the screening
+policy — the list gets one email with every new item: what changed, what it is, and where to
+look. **No analysis**; the reader decides.
+
+* Everything already known when a list is saved is treated as sent, so the first email is about
+  something that happens *next*, not the firm's history presented as news.
+* Each item goes to each list once. A failed send is retried next time.
+* **Sending is off until `ALERTS_SEND=true`.** Until then, every alert is written and shown on
+  the Portfolio page exactly as it would be sent. `FOCI_EMAIL_REDIRECT_TO` still applies, so a
+  pilot can route every alert to one person first.
+* On the free plan, a GitHub Actions workflow triggers the daily check. DEPLOY.md has the setup.
 
 ## Choosing what to screen for, and what raises a notice
 

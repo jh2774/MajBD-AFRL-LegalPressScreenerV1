@@ -68,6 +68,36 @@ class PortfolioKey(BaseModel):
     key: str = Field(..., min_length=1, max_length=64_000)
 
 
+EMAIL_RX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+MAX_ALERT_RECIPIENTS = 25
+
+
+class AlertSubscriptionRequest(BaseModel):
+    """Who to email about a portfolio. Companies come from the portfolio key."""
+    subscription_id: str = Field("", max_length=40)
+    name: str = Field("Portfolio", max_length=120)
+    emails: list[str] = Field(..., min_length=1, max_length=MAX_ALERT_RECIPIENTS)
+    portfolio_key: str = Field(..., min_length=1, max_length=64_000)
+    active: bool = True
+
+    @model_validator(mode="after")
+    def clean_emails(self) -> AlertSubscriptionRequest:
+        import re
+
+        cleaned, bad = [], []
+        for raw in self.emails:
+            for part in re.split(r"[,;\s]+", raw or ""):
+                if not part:
+                    continue
+                (cleaned if re.match(EMAIL_RX, part) else bad).append(part.lower())
+        if bad:
+            raise ValueError(f"Not an email address: {', '.join(bad[:5])}")
+        if not cleaned:
+            raise ValueError("Add at least one email address.")
+        self.emails = list(dict.fromkeys(cleaned))[:MAX_ALERT_RECIPIENTS]
+        return self
+
+
 class PortfolioEdit(BaseModel):
     """Add or drop companies, returning a new key.
 
@@ -78,6 +108,9 @@ class PortfolioEdit(BaseModel):
     name: str = Field("Portfolio", max_length=120)
     add: list[str] = Field(default_factory=list, max_length=500)
     remove: list[str] = Field(default_factory=list, max_length=500)
+    # Display names for what is being added, when the database cannot supply
+    # one — an investment firm added by CRD has never been screened here.
+    names: dict[str, str] = Field(default_factory=dict)
 
 
 class NoticeDecision(BaseModel):

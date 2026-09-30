@@ -69,6 +69,22 @@ class Config:
     inprocess_screens_ok: bool = field(
         default_factory=lambda: _flag("FOCI_INPROCESS_SCREENS", False))
 
+    # --- portfolio email alerts ---
+    # Off until someone turns it on. With it off, every alert is still composed
+    # and shown in the app exactly as it would be sent — so it can be read and
+    # trusted before the first real email goes to anybody.
+    alerts_send: bool = field(default_factory=lambda: _flag("ALERTS_SEND", False))
+    smtp_host: str = field(default_factory=lambda: _env("SMTP_HOST"))
+    smtp_port: int = field(default_factory=lambda: int(_env("SMTP_PORT", "587") or 587))
+    smtp_user: str = field(default_factory=lambda: _env("SMTP_USER"))
+    smtp_password: str = field(default_factory=lambda: _env("SMTP_PASSWORD"))
+    # starttls (587, 2587), ssl (465, 2465), or none (a local relay).
+    smtp_security: str = field(default_factory=lambda: _env("SMTP_SECURITY", "starttls"))
+    alerts_from: str = field(default_factory=lambda: _env("ALERTS_FROM"))
+    # Where the links in an alert point. Without it, links use whatever
+    # address the request that triggered the alerts came in on.
+    public_url: str = field(default_factory=lambda: _env("FOCI_PUBLIC_URL"))
+
     # --- investor-relations email alerts ---
     # A directory of saved .eml files. The IR platforms that refuse an
     # identified crawler will happily mail the same releases to anyone who

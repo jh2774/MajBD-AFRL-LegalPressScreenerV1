@@ -18,20 +18,26 @@ import threading
 from importlib import metadata
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from .. import alerts as alerts_engine
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from ..config import get_config
+from ..connectors.adv import PDF_URL as ADV_PDF_URL
+from ..connectors.adv import SUMMARY_URL as ADV_SUMMARY_URL
+from ..connectors.adv import AdvConnector
 from ..connectors.usaspending import USASpendingConnector
 from ..jobs import JobQueue
 from ..notify import render as render_notice
+from ..notify.mailer import Mailer
 from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_available
 from . import auth
 from .schemas import (
+    AlertSubscriptionRequest,
     IdentityDecision,
     NoticeDecision,
     PortfolioEdit,
@@ -391,11 +397,15 @@ def edit_portfolio(req: PortfolioEdit, store: Store = Depends(tenant_store)) -> 
     keys = [c.key for c in current.companies if c.key.upper() not in dropping]
     names = {c.key: c.name for c in current.companies}
 
+    given_names = {(k or "").strip().upper(): v for k, v in req.names.items()}
     for raw in req.add:
         key = (raw or "").strip().upper()
         if not key or key in {k.upper() for k in keys}:
             continue
         keys.append(key)
+        if given_names.get(key):
+            names[key] = given_names[key].strip()[:200]
+            continue
         row = store.search_entities(key, limit=1)
         if row and (row[0].get("entity_key") or "").upper() == key:
             names[key] = row[0].get("entity_name") or ""
@@ -426,6 +436,22 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
 
     rows: list[dict] = []
     for company in loaded.companies:
+        if company.key.upper().startswith("CRD:"):
+            # An investment firm: what matters is its Form ADV, not awards.
+            crd = company.key.split(":", 1)[1]
+            snap = store.adv_snapshot(crd) or {}
+            funds = snap.get("funds") or []
+            rows.append({
+                "entity_key": company.key, "kind": "adviser", "crd": crd,
+                "entity_name": snap.get("name") or company.name or company.key,
+                "severity": None, "score": None, "last_screened": snap.get("checked_at"),
+                "obligated": 0.0, "contract_count": 0,
+                "screened_here": bool(snap),
+                "adv_filing_date": snap.get("filing_date"),
+                "fund_count": len(funds),
+                "fund_assets": sum(f.get("gross_asset_value") or 0 for f in funds),
+            })
+            continue
         totals = store.contract_totals("entity_key", company.key)
         findings = store.search_findings(entity_key=company.key, limit=1)
         latest = findings[0] if findings else None
@@ -442,6 +468,7 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
             "obligated": totals["obligated"],
             "contract_count": totals["contract_count"],
             "screened_here": screened,
+            "kind": "contractor",
         })
 
     by_severity: dict[str, int] = {}
@@ -461,6 +488,136 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
         },
         "severity": by_severity,
     }
+
+
+# -------------------------------------------------- investment firms (ADV)
+
+def _adv() -> AdvConnector:
+    from ..httpclient import HttpClient
+    return AdvConnector(HttpClient(cfg))
+
+
+def _base_url(request: Request) -> str:
+    """Where links in an alert should point: the configured public address,
+    or failing that the address this request arrived on."""
+    return (cfg.public_url or str(request.base_url)).rstrip("/")
+
+
+@app.get("/v1/advisers/search", tags=["advisers"])
+def search_advisers(q: str = Query("", max_length=120),
+                    tenant: str = Depends(require_tenant)) -> dict:
+    """Investment firms by name, from the SEC's adviser database (IAPD)."""
+    try:
+        return {"query": q, "firms": _adv().search(q)}
+    except Exception as exc:        # noqa: BLE001 - say so rather than 500
+        log.warning("adviser search failed: %s", exc)
+        return {"query": q, "firms": [], "detail": "The SEC's adviser database did not "
+                                                   "answer. Try again in a moment."}
+
+
+@app.get("/v1/advisers/{crd}", tags=["advisers"])
+def get_adviser(crd: str, refresh: bool = Query(False),
+                store: Store = Depends(tenant_store)) -> dict:
+    """One firm's Form ADV as last read, reading it first if never read before.
+
+    Reading goes through the same path the alerts use, so a change discovered
+    by opening the page is recorded and still reaches the people watching.
+    """
+    crd = crd.strip()
+    if not crd.isdigit():
+        raise HTTPException(400, "A CRD number is digits only.")
+    result = {}
+    if refresh or not store.adv_snapshot(crd):
+        result = alerts_engine.refresh_advisers(store, _adv(), [crd]).get(crd, {})
+        if not result.get("ok"):
+            raise HTTPException(502, result.get("detail") or
+                                "The SEC's adviser database did not answer.")
+    snapshot = store.adv_snapshot(crd)
+    return {"crd": crd, "snapshot": snapshot,
+            "changes": store.adv_changes([crd], limit=50),
+            "links": {"summary": ADV_SUMMARY_URL.format(crd=crd),
+                      "form": ADV_PDF_URL.format(crd=crd)},
+            "refreshed": bool(result)}
+
+
+# ------------------------------------------------------------ email alerts
+
+@app.get("/v1/alerts", tags=["alerts"])
+def get_alerts(store: Store = Depends(tenant_store)) -> dict:
+    """Subscriptions, what sending will do, and what was sent recently."""
+    return {"sending": Mailer(cfg).status(),
+            "subscriptions": store.alert_subscriptions(),
+            "deliveries": store.alert_deliveries(limit=30)}
+
+
+@app.post("/v1/alerts/subscriptions", tags=["alerts"])
+def save_subscription(body: AlertSubscriptionRequest,
+                      store: Store = Depends(tenant_store)) -> dict:
+    """Create or update who is emailed about a portfolio.
+
+    Whatever is already known about the portfolio's companies is marked as
+    sent, so the first email is about something that happens next — not the
+    firm's history presented as news.
+    """
+    try:
+        loaded = portfolio_keys.decode(body.portfolio_key)
+    except portfolio_keys.PortfolioKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    companies = [c.key for c in loaded.companies]
+    existing = store.alert_subscription(body.subscription_id) \
+        if body.subscription_id else None
+    before = set(existing["companies"]) if existing else set()
+
+    sub_id = store.save_alert_subscription(
+        subscription_id=body.subscription_id if existing else "",
+        name=(body.name or loaded.name).strip() or loaded.name,
+        emails=body.emails, companies=companies,
+        portfolio_key=body.portfolio_key, active=body.active)
+    baselined = alerts_engine.baseline(store, sub_id,
+                                       [c for c in companies if c not in before])
+    return {"subscription": store.alert_subscription(sub_id), "baselined": baselined}
+
+
+@app.delete("/v1/alerts/subscriptions/{subscription_id}", status_code=204,
+            tags=["alerts"])
+def delete_subscription(subscription_id: str,
+                        store: Store = Depends(tenant_store)) -> Response:
+    if not store.delete_alert_subscription(subscription_id):
+        raise HTTPException(404, "No such alert list.")
+    return Response(status_code=204)
+
+
+@app.post("/v1/alerts/run", tags=["alerts"])
+def run_alerts(request: Request, store: Store = Depends(tenant_store)) -> dict:
+    """Check every watched firm now and email what is new.
+
+    For a free instance with no cron, something outside has to call this —
+    the scheduled GitHub workflow in this repository does, once a day.
+    """
+    return alerts_engine.run_alerts(store, _adv(), Mailer(cfg), _base_url(request))
+
+
+@app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])
+def test_subscription(subscription_id: str,
+                      store: Store = Depends(tenant_store)) -> dict:
+    """Send one short test email to a list, to prove delivery works."""
+    sub = store.alert_subscription(subscription_id)
+    if not sub:
+        raise HTTPException(404, "No such alert list.")
+    subject = f"FOCI-Screener: test alert for \"{sub['name']}\""
+    text = (f"This is a test from FOCI-Screener. You are on the \"{sub['name']}\" alert "
+            f"list, which watches {len(sub['companies'])} compan"
+            f"{'y' if len(sub['companies']) == 1 else 'ies'}. When one of them changes, "
+            f"an email like this will say what changed and where to look.\n\n"
+            + alerts_engine.FOOTER.format(name=sub["name"]))
+    delivery = Mailer(cfg).send(sub["emails"], subject, text)
+    store.log_alert_delivery(subscription_id=subscription_id,
+                             recipients=delivery.recipients, subject=subject,
+                             body_text=text, item_count=0, status=delivery.status,
+                             detail=delivery.detail)
+    return {"status": delivery.status, "recipients": delivery.recipients,
+            "detail": delivery.detail}
 
 
 # -------------------------------------------------------------- type-ahead

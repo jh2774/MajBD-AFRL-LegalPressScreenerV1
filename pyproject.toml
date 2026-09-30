@@ -12,6 +12,10 @@ license = { text = "Proprietary" }
 dependencies = [
     "requests>=2.31",
     "beautifulsoup4>=4.12",
+    # Form ADV arrives only as a PDF — the per-section pages are disallowed by
+    # adviserinfo.sec.gov's robots.txt — and Schedule D 7.B is read from it.
+    # Pure Python, so it needs nothing from the image.
+    "pypdf>=4.0",
 ]
 
 [project.optional-dependencies]

@@ -1606,6 +1606,7 @@ function wireAddToPortfolio() {
         key: savedPortfolioKey(), add: keys,
       });
       rememberPortfolioKey(d.key);
+      await syncAlertList(d.key);
       status.innerHTML = `Added. Portfolio now holds ${num(d.companies)}
         compan${d.companies === 1 ? "y" : "ies"} —
         <a href="#/portfolio">open it</a>. Save the key to a file from there.`;
@@ -1618,7 +1619,10 @@ function wireAddToPortfolio() {
 }
 
 function portfolioTable(companies) {
-  const rows = companies.map((r) => `
+  const contractors = companies.filter((r) => r.kind !== "adviser");
+  const firms = companies.filter((r) => r.kind === "adviser");
+
+  const contractorRows = contractors.map((r) => `
     <tr>
       <td>${linkEntity(r.entity_key, r.entity_name)}</td>
       <td>${r.screened_here ? sevTag(r.severity) : '<span class="pill">not screened here</span>'}</td>
@@ -1626,10 +1630,322 @@ function portfolioTable(companies) {
       <td class="num">${r.obligated ? money(r.obligated) : "—"}</td>
       <td>${r.last_screened ? day(r.last_screened) : "—"}</td>
     </tr>`).join("");
-  return `<table>
-    <thead><tr><th>Company</th><th>Latest severity</th><th class="num">Awards</th>
-      <th class="num">Obligated</th><th>Screened</th></tr></thead>
-    <tbody>${rows}</tbody></table>`;
+
+  const firmRows = firms.map((r) => `
+    <tr>
+      <td><a href="#/adviser/${encodeURIComponent(r.crd)}">${esc(r.entity_name)}</a></td>
+      <td>${r.adv_filing_date ? esc(r.adv_filing_date) : '<span class="pill">not read yet</span>'}</td>
+      <td class="num">${r.screened_here ? num(r.fund_count) : "—"}</td>
+      <td class="num">${r.fund_assets ? money(r.fund_assets) : "—"}</td>
+    </tr>`).join("");
+
+  return `
+    ${contractors.length ? `<table>
+      <thead><tr><th>Contractor</th><th>Latest severity</th><th class="num">Awards</th>
+        <th class="num">Obligated</th><th>Screened</th></tr></thead>
+      <tbody>${contractorRows}</tbody></table>` : ""}
+    ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
+      <table>
+      <thead><tr><th>Firm</th><th>Latest Form ADV</th><th class="num">Private funds</th>
+        <th class="num">Money in those funds</th></tr></thead>
+      <tbody>${firmRows}</tbody></table>` : ""}`;
+}
+
+/* ------------------------------------------------------ investment firms */
+
+/* Form ADV is filed by investment firms — private equity, venture capital,
+ * hedge fund managers — not by contractors. The firms that own or back a
+ * contractor are the ones whose filings say when money is raised and how much
+ * of it comes from outside the U.S., so they are added to a portfolio by name
+ * and watched alongside the contractors. */
+function advisersCard() {
+  return `
+    <div class="card">
+      <h2>Watch an investment firm</h2>
+      <p class="muted">Private equity, venture capital and other investment firms
+      file a public form with the SEC — <strong>Form ADV</strong> — listing the funds
+      they run, how much money is in each, how many investors, and how much of each
+      is owned by investors outside the United States. Add the firms that own or back
+      your contractors, and you will be told when they raise a new fund or when that
+      foreign share changes. Contractors themselves do not file this form.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input id="adv-q" placeholder="Firm name, e.g. Arlington Capital"
+          style="flex:1;min-width:220px;padding:8px;border:1px solid var(--border);
+          border-radius:8px;background:var(--surface-2);color:var(--text)">
+        <button id="adv-search">Search</button>
+      </div>
+      <div id="adv-results" style="margin-top:10px"></div>
+    </div>`;
+}
+
+function wireAdvisers() {
+  const button = document.getElementById("adv-search");
+  if (!button) return;
+  const input = document.getElementById("adv-q");
+  const out = document.getElementById("adv-results");
+  const search = async () => {
+    const q = input.value.trim();
+    if (q.length < 2) return;
+    out.textContent = "Searching the SEC's adviser database…";
+    try {
+      const d = await api(`/v1/advisers/search?q=${encodeURIComponent(q)}`);
+      if (!d.firms.length) {
+        out.textContent = d.detail || "No registered investment firm by that name.";
+        return;
+      }
+      out.innerHTML = `<table><tbody>${d.firms.map((f) => `
+        <tr><td><strong>${esc(f.name)}</strong>
+          <span class="muted" style="font-size:12px"> · CRD ${esc(f.crd)}
+          ${f.status ? " · " + esc(f.status.toLowerCase()) : ""}</span></td>
+        <td style="text-align:right">
+          <button class="adv-add" data-crd="${esc(f.crd)}" data-name="${esc(f.name)}">Watch</button>
+        </td></tr>`).join("")}</tbody></table>`;
+      out.querySelectorAll(".adv-add").forEach((b) => {
+        b.onclick = async () => {
+          b.disabled = true;
+          b.textContent = "Adding…";
+          const key = `CRD:${b.dataset.crd}`;
+          try {
+            const r = await apiPost("/v1/portfolio/edit", {
+              key: savedPortfolioKey(), add: [key], names: { [key]: b.dataset.name },
+            });
+            rememberPortfolioKey(r.key);
+            await syncAlertList(r.key);
+            viewPortfolio();
+          } catch (e) {
+            b.disabled = false;
+            b.textContent = "Watch";
+            out.insertAdjacentHTML("beforeend",
+              `<p class="muted">${esc(e.message || String(e))}</p>`);
+          }
+        };
+      });
+    } catch (e) {
+      out.textContent = e.message || String(e);
+    }
+  };
+  button.onclick = search;
+  input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); search(); } };
+}
+
+/* ------------------------------------------------------------ email alerts */
+
+const ALERT_LIST_STORAGE = "foci.alertlist";
+
+function savedAlertListId() {
+  try { return localStorage.getItem(ALERT_LIST_STORAGE) || ""; } catch { return ""; }
+}
+
+function rememberAlertListId(id) {
+  try {
+    if (id) localStorage.setItem(ALERT_LIST_STORAGE, id);
+    else localStorage.removeItem(ALERT_LIST_STORAGE);
+  } catch { /* the list still exists on the server */ }
+}
+
+/* When the portfolio changes, the alert list follows it — otherwise a firm
+ * added today would quietly never be watched. */
+async function syncAlertList(newKey) {
+  const id = savedAlertListId();
+  if (!id || !newKey) return;
+  try {
+    const d = await api("/v1/alerts");
+    const list = d.subscriptions.find((s) => s.subscription_id === id);
+    if (!list) return;
+    await apiPost("/v1/alerts/subscriptions", {
+      subscription_id: id, name: list.name, emails: list.emails,
+      portfolio_key: newKey, active: list.active,
+    });
+  } catch { /* shown as out of date on the portfolio page instead */ }
+}
+
+function deliveryRows(deliveries) {
+  if (!deliveries.length) {
+    return '<p class="muted" style="font-size:12.5px">No alerts yet. The first one is sent when something changes after the list is saved.</p>';
+  }
+  const label = { sent: "sent", drafted: "written, not sent", failed: "failed" };
+  return deliveries.map((d) => `
+    <details style="margin:6px 0">
+      <summary style="cursor:pointer;font-size:13px">
+        <span class="pill${d.status === "failed" ? " warn" : ""}">${esc(label[d.status] || d.status)}</span>
+        ${esc(d.subject)} <span class="muted">· ${esc(day(d.created_at))}
+        · to ${esc(d.recipients.join(", "))}</span></summary>
+      ${d.detail ? `<p class="muted" style="font-size:12px">${esc(d.detail)}</p>` : ""}
+      <div class="notice-body" style="font-size:12.5px">${esc(d.body_text)}</div>
+    </details>`).join("");
+}
+
+async function alertsCard(key, portfolioName) {
+  let d;
+  try {
+    d = await api("/v1/alerts");
+  } catch (e) {
+    return `<div class="card"><h2>Email alerts</h2><p class="muted">${esc(e.message || String(e))}</p></div>`;
+  }
+  const id = savedAlertListId();
+  const list = d.subscriptions.find((s) => s.subscription_id === id);
+  const deliveries = list ? d.deliveries.filter((x) => x.subscription_id === list.subscription_id) : [];
+  const outOfDate = list && list.portfolio_key !== key;
+  const mode = d.sending.mode;
+
+  return `
+    <div class="card" id="alerts-card">
+      <h2>Email alerts</h2>
+      <p class="muted">Anyone on this list gets an email when something changes for a
+      company in this portfolio — a new fund or a change in foreign ownership at an
+      investment firm, or a contractor being flagged. Each email says <strong>what
+      changed and where to look</strong>. It does not judge what the change means;
+      that is left to the person reading it.</p>
+
+      <div class="${mode === "send" ? "muted" : "error"}" style="font-size:12.5px;margin:8px 0">
+        ${esc(d.sending.explanation)}</div>
+
+      <label class="field" style="display:block">Send to (one or more addresses)
+        <textarea id="alert-emails" rows="2" style="width:100%;margin-top:4px"
+          placeholder="name@agency.gov, colleague@example.com">${esc(list ? list.emails.join(", ") : "")}</textarea>
+      </label>
+      ${outOfDate ? `<p class="muted" style="font-size:12.5px">This portfolio has changed
+        since the list was saved. Save again to watch the new companies.</p>` : ""}
+      <div class="actions">
+        <button class="primary" id="alert-save">${list ? "Update list" : "Start email alerts"}</button>
+        ${list ? `<button id="alert-run">Check now</button>
+                  <button id="alert-test">Send a test email</button>
+                  <button class="ghost" id="alert-delete">Stop alerts</button>` : ""}
+      </div>
+      <p class="muted" id="alert-status" style="font-size:12.5px;margin-top:8px">
+        ${list && list.last_run_at ? `Last checked ${esc(day(list.last_run_at))}.` : ""}</p>
+
+      ${list ? `<h3 style="margin-top:14px">Recent alerts</h3>${deliveryRows(deliveries)}` : ""}
+    </div>`;
+}
+
+function wireAlerts(key, portfolioName) {
+  const status = document.getElementById("alert-status");
+  const save = document.getElementById("alert-save");
+  if (!save) return;
+  save.onclick = async () => {
+    save.disabled = true;
+    try {
+      const r = await apiPost("/v1/alerts/subscriptions", {
+        subscription_id: savedAlertListId(),
+        name: portfolioName || "Portfolio",
+        emails: [document.getElementById("alert-emails").value],
+        portfolio_key: key,
+      });
+      rememberAlertListId(r.subscription.subscription_id);
+      viewPortfolio();
+    } catch (e) {
+      save.disabled = false;
+      status.textContent = e.message || String(e);
+    }
+  };
+
+  const run = document.getElementById("alert-run");
+  if (run) {
+    run.onclick = async () => {
+      run.disabled = true;
+      status.textContent = "Checking every firm and contractor in the portfolio…";
+      try {
+        const r = await apiPost("/v1/alerts/run", {});
+        const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
+        status.textContent = mine.status === "nothing new"
+          ? `Checked ${r.firms_checked} firm(s). Nothing new since the last alert.`
+          : `Checked ${r.firms_checked} firm(s). ${mine.items || 0} update(s): ${mine.status}.`;
+        setTimeout(viewPortfolio, 1500);
+      } catch (e) {
+        run.disabled = false;
+        status.textContent = e.message || String(e);
+      }
+    };
+    document.getElementById("alert-test").onclick = async () => {
+      status.textContent = "Sending a test…";
+      try {
+        const r = await apiPost(`/v1/alerts/subscriptions/${encodeURIComponent(savedAlertListId())}/test`, {});
+        status.textContent = r.status === "sent"
+          ? `Test sent to ${r.recipients.join(", ")}.`
+          : `Test ${r.status}: ${r.detail}`;
+        setTimeout(viewPortfolio, 1500);
+      } catch (e) {
+        status.textContent = e.message || String(e);
+      }
+    };
+    document.getElementById("alert-delete").onclick = async () => {
+      await apiSend("DELETE", `/v1/alerts/subscriptions/${encodeURIComponent(savedAlertListId())}`);
+      rememberAlertListId("");
+      viewPortfolio();
+    };
+  }
+}
+
+/* ------------------------------------------------------------ one firm */
+
+async function viewAdviser(crd) {
+  setBusy("Reading this firm's Form ADV from the SEC — the first time takes a few seconds…");
+  const d = await api(`/v1/advisers/${encodeURIComponent(crd)}`);
+  const s = d.snapshot || {};
+  const funds = s.funds || [];
+  const pct = (v) => (v === null || v === undefined ? "—" : `${v}%`);
+
+  view.innerHTML = `
+    <div class="breadcrumb"><a href="#/portfolio">Portfolio</a> › Investment firm</div>
+    <div class="page-head">
+      <h1>${esc(s.name || "CRD " + crd)}</h1>
+      <div class="sub">CRD ${esc(crd)} · ${esc(s.office || "")}
+        · latest Form ADV ${esc(s.filing_date || "unknown")}
+        ${s.filing_kind ? "(" + esc(s.filing_kind.toLowerCase()) + ")" : ""}</div>
+    </div>
+
+    <div class="card">
+      <h2>Private funds this firm runs</h2>
+      <p class="muted">From the firm's own filing — <strong>Schedule D, Section 7.B.(1)</strong>
+      of Form ADV. A private fund is a pool of money collected from investors and invested
+      on their behalf, often by buying companies. The last column is the share of each fund
+      owned by people or organisations based <strong>outside the United States</strong>.</p>
+      ${s.funds_read ? (funds.length ? `<table>
+        <thead><tr><th>Fund</th><th class="num">Money in the fund</th>
+          <th class="num">Investors</th><th>Set up in</th>
+          <th class="num">Owned outside the U.S.</th></tr></thead>
+        <tbody>${funds.map((f) => `<tr>
+          <td>${esc(f.name)}<div class="muted" style="font-size:11.5px">${esc(f.fund_id)}</div></td>
+          <td class="num">${f.gross_asset_value ? money(f.gross_asset_value) : "—"}</td>
+          <td class="num">${f.investors === null ? "—" : num(f.investors)}</td>
+          <td>${esc([f.state, f.country].filter(Boolean).join(", ") || "—")}</td>
+          <td class="num"><strong>${pct(f.owned_by_non_us_pct)}</strong></td>
+        </tr>`).join("")}</tbody></table>`
+        : '<p class="muted">This firm reports no private funds.</p>')
+        : '<p class="muted">The funds section could not be read from this filing. The links below open it directly.</p>'}
+      <div class="actions">
+        <a class="linkish" href="${esc(d.links.summary)}" target="_blank" rel="noopener noreferrer">Firm summary on the SEC's adviser site →</a>
+        <a class="linkish" href="${esc(d.links.form)}" target="_blank" rel="noopener noreferrer">Full Form ADV (PDF) →</a>
+      </div>
+    </div>
+
+    ${(s.related_firms || []).length ? `<div class="card">
+      <h2>Related firms</h2>
+      <p class="muted">Firms often set up a separate partnership to run each fund. A new
+      one appearing here often comes with a new fund.</p>
+      <ul style="margin:0;padding-left:20px">${s.related_firms.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>
+    </div>` : ""}
+
+    <div class="card">
+      <h2>Changes seen</h2>
+      ${d.changes.length ? d.changes.map((c) => `
+        <div style="border-left:3px solid var(--accent);padding:4px 12px;margin:10px 0">
+          <div><strong>${esc(c.headline)}</strong> <span class="muted" style="font-size:12px">· ${esc(day(c.detected_at))}</span></div>
+          ${c.detail ? `<div>${esc(c.detail)}</div>` : ""}
+          <div class="muted" style="font-size:12.5px"><em>What this is:</em> ${esc(c.explainer)}</div>
+          <div class="muted" style="font-size:12.5px"><em>Where to look:</em> ${esc(c.where)}</div>
+        </div>`).join("")
+        : `<p class="muted">None yet. The first reading is the starting point; changes are
+           reported from the next filing on.</p>`}
+      <div class="actions"><button id="adv-refresh">Check for a new filing now</button></div>
+    </div>`;
+
+  document.getElementById("adv-refresh").onclick = async () => {
+    setBusy("Checking the SEC for a new filing…");
+    await api(`/v1/advisers/${encodeURIComponent(crd)}?refresh=true`);
+    viewAdviser(crd);
+  };
 }
 
 async function viewPortfolio() {
@@ -1637,6 +1953,7 @@ async function viewPortfolio() {
   if (!key) {
     view.innerHTML = portfolioEmpty();
     wirePortfolio(null);
+    wireAdvisers();
     return;
   }
   setBusy("Opening portfolio…");
@@ -1648,10 +1965,12 @@ async function viewPortfolio() {
     // reason and the form, with the key still in the box to be corrected.
     view.innerHTML = portfolioEmpty(key, e.message || String(e));
     wirePortfolio(null);
+    wireAdvisers();
     return;
   }
 
-  const unscreened = d.companies.filter((c) => !c.screened_here).length;
+  const unscreened = d.companies.filter((c) => !c.screened_here && c.kind !== "adviser").length;
+  const alertsHtml = await alertsCard(key, d.name);
   view.innerHTML = `
     <div class="page-head">
       <h1>${esc(d.name)}</h1>
@@ -1682,6 +2001,10 @@ async function viewPortfolio() {
       ${portfolioTable(d.companies)}
     </div>
 
+    ${alertsHtml}
+
+    ${advisersCard()}
+
     <div class="card">
       <h2>Your key</h2>
       <div class="muted" style="font-size:12px;margin-bottom:10px">
@@ -1698,6 +2021,8 @@ async function viewPortfolio() {
       </div>
     </div>`;
   wirePortfolio(d.name);
+  wireAlerts(key, d.name);
+  wireAdvisers();
 }
 
 function portfolioEmpty(key = "", error = "") {
@@ -1732,7 +2057,9 @@ function portfolioEmpty(key = "", error = "") {
         <button class="primary" id="pf-build">Build key</button>
         <button id="pf-build-screened">Use everything screened here</button>
       </div>
-    </div>`;
+    </div>
+
+    ${advisersCard()}`;
 }
 
 function downloadPortfolioKey(key, name) {
@@ -1990,6 +2317,7 @@ const ROUTES = [
   [/^\/rules$/, () => viewRules()],
   [/^\/portfolio$/, () => viewPortfolio()],
   [/^\/screening$/, () => viewScreening()],
+  [/^\/adviser\/(\d+)$/, (crd) => viewAdviser(crd)],
   [/^\/screens\/(.+)$/, (id) => viewScreen(decodeURIComponent(id))],
 ];
 

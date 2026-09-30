@@ -131,6 +131,56 @@ CREATE TABLE IF NOT EXISTS notices (
     signal_ids  TEXT,
     trigger_reason TEXT
 );
+-- The latest reading of each investment firm's Form ADV, and every change seen
+-- between readings. Global, like document snapshots: a filing is a public
+-- fact, and two tenants watching one firm should download it once.
+CREATE TABLE IF NOT EXISTS adv_snapshots (
+    crd          TEXT PRIMARY KEY,
+    snapshot     TEXT NOT NULL,
+    filing_date  TEXT,
+    checked_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS adv_changes (
+    change_id    TEXT PRIMARY KEY,
+    crd          TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    payload      TEXT NOT NULL,
+    detected_at  TEXT NOT NULL
+);
+-- Who is emailed about which companies. `companies` holds portfolio keys:
+-- contractor UEIs or names, and CRD:<number> for investment firms.
+CREATE TABLE IF NOT EXISTS alert_subscriptions (
+    subscription_id TEXT PRIMARY KEY,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    name         TEXT NOT NULL,
+    emails       TEXT NOT NULL,
+    companies    TEXT NOT NULL,
+    portfolio_key TEXT,
+    active       INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    last_run_at  TEXT
+);
+-- What each subscription has already been told, so every item goes out once.
+CREATE TABLE IF NOT EXISTS alert_sent (
+    subscription_id TEXT NOT NULL,
+    item_id      TEXT NOT NULL,
+    sent_at      TEXT NOT NULL,
+    PRIMARY KEY (subscription_id, item_id)
+);
+-- Every email composed, sent or not, with exactly what it said.
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    delivery_id  TEXT PRIMARY KEY,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    subscription_id TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    recipients   TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    body_text    TEXT NOT NULL,
+    item_count   INTEGER NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL,
+    detail       TEXT
+);
 -- One row per tenant: what it screens for and what raises a notice. JSON
 -- rather than columns because the shape will grow, and every read wants the
 -- whole thing at once.
@@ -952,6 +1002,149 @@ class Store:
                 (_now(), f"Superseded by {by_notice_id}: newer evidence for the same "
                          f"contractor.", self.tenant_id, entity_key, by_notice_id))
         return len(rows)
+
+    # --------------------------------------------------------------- Form ADV
+    def adv_snapshot(self, crd: str) -> dict | None:
+        row = self._one("SELECT snapshot, checked_at FROM adv_snapshots WHERE crd=?",
+                        (str(crd),))
+        if not row:
+            return None
+        try:
+            return {**json.loads(row["snapshot"]), "checked_at": row["checked_at"]}
+        except (ValueError, TypeError):
+            return None
+
+    def save_adv_snapshot(self, crd: str, snapshot: dict, filing_date: str) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO adv_snapshots (crd, snapshot, filing_date, checked_at)"
+                " VALUES (?,?,?,?) ON CONFLICT (crd) DO UPDATE SET"
+                " snapshot=excluded.snapshot, filing_date=excluded.filing_date,"
+                " checked_at=excluded.checked_at",
+                (str(crd), json.dumps(snapshot), filing_date, _now()))
+
+    def record_adv_changes(self, changes: list[dict]) -> int:
+        """Store changes; one already seen (same id) is not stored twice."""
+        added = 0
+        with self._tx() as c:
+            for ch in changes:
+                c.execute(
+                    "INSERT INTO adv_changes (change_id, crd, kind, payload, detected_at)"
+                    " VALUES (?,?,?,?,?) ON CONFLICT (change_id) DO NOTHING",
+                    (ch["change_id"], ch["crd"], ch["kind"], json.dumps(ch), _now()))
+                added += 1
+        return added
+
+    def adv_changes(self, crds: list[str] | None = None, limit: int = 100) -> list[dict]:
+        sql = "SELECT payload, detected_at FROM adv_changes"
+        params: list = []
+        if crds is not None:
+            if not crds:
+                return []
+            sql += f" WHERE crd IN ({','.join('?' for _ in crds)})"
+            params += [str(c) for c in crds]
+        sql += " ORDER BY detected_at DESC LIMIT ?"
+        params.append(limit)
+        out = []
+        for r in self._query(sql, tuple(params)):
+            try:
+                out.append({**json.loads(r["payload"]), "detected_at": r["detected_at"]})
+            except (ValueError, TypeError):
+                continue
+        return out
+
+    # ---------------------------------------------------------- email alerts
+    def alert_subscriptions(self, active_only: bool = False) -> list[dict]:
+        sql = "SELECT * FROM alert_subscriptions WHERE tenant_id=?"
+        if active_only:
+            sql += " AND active=1"
+        rows = self._query(sql + " ORDER BY created_at", (self.tenant_id,))
+        for r in rows:
+            r["emails"] = json.loads(r.get("emails") or "[]")
+            r["companies"] = json.loads(r.get("companies") or "[]")
+            r["active"] = bool(r.get("active"))
+        return rows
+
+    def alert_subscription(self, subscription_id: str) -> dict | None:
+        return next((s for s in self.alert_subscriptions()
+                     if s["subscription_id"] == subscription_id), None)
+
+    def save_alert_subscription(self, *, name: str, emails: list[str],
+                                companies: list[str], portfolio_key: str = "",
+                                active: bool = True,
+                                subscription_id: str = "") -> str:
+        subscription_id = subscription_id or uuid.uuid4().hex[:12]
+        now = _now()
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO alert_subscriptions (subscription_id, tenant_id, name, emails,"
+                " companies, portfolio_key, active, created_at, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (subscription_id) DO UPDATE SET"
+                " name=excluded.name, emails=excluded.emails,"
+                " companies=excluded.companies, portfolio_key=excluded.portfolio_key,"
+                " active=excluded.active, updated_at=excluded.updated_at",
+                (subscription_id, self.tenant_id, name, json.dumps(emails),
+                 json.dumps(companies), portfolio_key, 1 if active else 0, now, now))
+        return subscription_id
+
+    def delete_alert_subscription(self, subscription_id: str) -> bool:
+        if not self.alert_subscription(subscription_id):
+            return False
+        with self._tx() as c:
+            c.execute("DELETE FROM alert_subscriptions WHERE tenant_id=? AND"
+                      " subscription_id=?", (self.tenant_id, subscription_id))
+            c.execute("DELETE FROM alert_sent WHERE subscription_id=?", (subscription_id,))
+        return True
+
+    def alert_already_sent(self, subscription_id: str) -> set[str]:
+        return {r["item_id"] for r in self._query(
+            "SELECT item_id FROM alert_sent WHERE subscription_id=?", (subscription_id,))}
+
+    def mark_alert_sent(self, subscription_id: str, item_ids: list[str]) -> None:
+        now = _now()
+        with self._tx() as c:
+            for item_id in item_ids:
+                c.execute("INSERT INTO alert_sent (subscription_id, item_id, sent_at)"
+                          " VALUES (?,?,?) ON CONFLICT (subscription_id, item_id)"
+                          " DO NOTHING", (subscription_id, item_id, now))
+
+    def touch_alert_subscription(self, subscription_id: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE alert_subscriptions SET last_run_at=? WHERE tenant_id=?"
+                      " AND subscription_id=?", (_now(), self.tenant_id, subscription_id))
+
+    def log_alert_delivery(self, *, subscription_id: str, recipients: list[str],
+                           subject: str, body_text: str, item_count: int,
+                           status: str, detail: str = "") -> str:
+        delivery_id = uuid.uuid4().hex[:12]
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO alert_deliveries (delivery_id, tenant_id, subscription_id,"
+                " created_at, recipients, subject, body_text, item_count, status, detail)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (delivery_id, self.tenant_id, subscription_id, _now(),
+                 json.dumps(recipients), subject, body_text, item_count, status, detail))
+        return delivery_id
+
+    def alert_deliveries(self, subscription_id: str = "", limit: int = 30) -> list[dict]:
+        sql = "SELECT * FROM alert_deliveries WHERE tenant_id=?"
+        params: list = [self.tenant_id]
+        if subscription_id:
+            sql += " AND subscription_id=?"
+            params.append(subscription_id)
+        rows = self._query(sql + " ORDER BY created_at DESC LIMIT ?", (*params, limit))
+        for r in rows:
+            r["recipients"] = json.loads(r.get("recipients") or "[]")
+        return rows
+
+    def notices_for_entities(self, entity_keys: list[str], limit: int = 200) -> list[dict]:
+        if not entity_keys:
+            return []
+        marks = ",".join("?" for _ in entity_keys)
+        return self._query(
+            f"SELECT * FROM notices WHERE tenant_id=? AND entity_key IN ({marks})"
+            f" AND status IN ('pending','approved') ORDER BY created_at DESC LIMIT ?",
+            (self.tenant_id, *entity_keys, limit))
 
     # --------------------------------------------------------- screening policy
     def screening_policy(self) -> dict:

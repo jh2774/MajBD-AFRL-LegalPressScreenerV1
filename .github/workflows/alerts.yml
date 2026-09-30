@@ -1,0 +1,36 @@
+# Once a day, ask the deployed site to check every watched firm and email what
+# is new. A free Render instance has no cron of its own, and this costs nothing.
+#
+# Does nothing until two settings exist in the repository
+# (Settings → Secrets and variables → Actions):
+#   variable  FOCI_SITE_URL    e.g. https://contractwatcher-4wxb.onrender.com
+#   secret    FOCI_ALERTS_KEY  an API key the site accepts (the part after "tenant:")
+#
+# Also runnable by hand from the Actions tab ("Run workflow").
+name: Daily alerts
+
+on:
+  schedule:
+    - cron: "15 12 * * *"      # 12:15 UTC, every day
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check portfolios and send alerts
+        env:
+          SITE: ${{ vars.FOCI_SITE_URL }}
+          KEY: ${{ secrets.FOCI_ALERTS_KEY }}
+        run: |
+          if [ -z "$SITE" ] || [ -z "$KEY" ]; then
+            echo "FOCI_SITE_URL or FOCI_ALERTS_KEY is not set, so there is nothing to do."
+            exit 0
+          fi
+          # A free instance sleeps when idle; the first request wakes it, which
+          # can take the better part of a minute.
+          curl -sS --retry 4 --retry-delay 20 --retry-all-errors --max-time 90 \
+            "$SITE/health" > /dev/null || true
+          curl -fsS --max-time 600 -X POST "$SITE/v1/alerts/run" \
+            -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{}'
