@@ -68,8 +68,8 @@ actually return, not what their docs claim.
 |---|---|---|
 | **USAspending** `/search/spending_by_award`, `/awards/{id}` | no | Award population by agency, recipient UEI, parent entity, solicitation number, place of performance |
 | **FPDS-NG ATOM** | no | **Contracting officer email**, `countryOfIncorporation`, `isForeignOwnedAndLocated`, `foreignFunding`, ultimate parent UEI |
-| **SEC EDGAR** submissions + full-text search | no | 8-K item codes, SC 13D/G, and the exhibits where IP security agreements actually live |
-| **IAPD** `api.adviserinfo.sec.gov` | no | Investment adviser registration and office country for investors behind a contractor |
+| **SEC EDGAR** submissions + full-text search | no | 8-K item codes, the exhibits where IP security agreements actually live, and Schedule 13D/13G holders |
+| **IAPD** `api.adviserinfo.sec.gov` | no | Adviser registration, office country and disclosures for the contractor's 5%+ holders — see [Who holds the contractor](#who-holds-the-contractor) |
 | **OFAC SDN** CSV | no | Sanctions name screening |
 | **SAM.gov** entity + opportunities | yes | Registered address, business types, solicitation point of contact |
 | **USPTO** assignments | yes | Recorded `SECURITY INTEREST` conveyances against the patent estate |
@@ -176,6 +176,55 @@ A subcontractor has no contracting officer of its own, so a notice about one goe
 the **prime** contract, and says so in its first sentence: the Government has no privity with
 the subcontractor, the prime does. FPDS data about the prime's vendor is never copied onto the
 subcontractor.
+
+### Who holds the contractor
+
+Anyone holding more than 5% of a registrant files a Schedule 13D (may seek to influence
+control) or 13G (certifies a passive holding). For a contractor with a CIK, the screen reads
+the eight most recent, takes each holder named in them, and looks that holder up in IAPD.
+
+This replaced an IAPD search on the contractor's own name, which asked the wrong question —
+which advisers share a word with it — and got answers to match. For Boeing, Lockheed and
+Sikorsky it stored `NAVY FEDERAL INVESTMENT SERVICES`, `MARINER ADVISOR NETWORK` and
+`PFM HEALTH SCIENCES`, none of which has anything to do with them.
+
+What reading the filings established:
+
+- **EDGAR renamed the forms in December 2024.** Structured filings arrive as `SCHEDULE 13G`,
+  `SCHEDULE 13D/A` and so on, and every holder's 2025–26 filings for Boeing, Lockheed and RTX use
+  the new names. Both are read. The new form is XML and states each reporting person's stake,
+  type (`IA` adviser, `HC` holding company, `IN` individual) and place of organisation; the old
+  one is read from its EDGAR header, which gives the filer and where it is incorporated but not
+  the stake.
+- **A registrant's filing list runs both ways.** Lockheed's carries its own 13D on Terran Orbital.
+  Only filings whose subject company is the contractor are kept, or the contractor would appear
+  as an investor in itself.
+- **A holder at 0% is an exit, not a holding.** Holders file at 0% to report they are below 5%,
+  and are dropped — including under their older spelling (`The Vanguard Group` in 2026,
+  `VANGUARD GROUP INC` in 2019).
+- **IAPD matches are exact or not at all.** A record counts only if its name is the holder's once
+  legal suffixes are set aside, and only if it has an SEC adviser number. `BlackRock, Inc.` is a
+  holding company with no IAPD record of its own; taking `BLACKROCK INVESTMENT MANAGEMENT (UK)
+  LIMITED` in its place would give the holder its affiliate's office country. Individuals are not
+  looked up.
+- **Many of the largest holders are not in IAPD.** Holding companies (FMR, State Street,
+  BlackRock) and fund divisions (Capital World Investors) are not registered advisers, and
+  neither are foreign state investors — Norges Bank returns nothing. So the holder's place of
+  organisation, from its own filing, is screened independently of IAPD.
+
+Two rules come out of it, each firing only for jurisdictions in the lexicon, like every other
+FOCI rule here — a British pension fund holding 6% is not a finding:
+
+| Rule | Fires when |
+|---|---|
+| `FOCI-OWNER-01` | A 13D/13G holder is organised in a listed jurisdiction. A 13D scores higher than a 13G. |
+| `FOCI-IAPD-01` | A holder's IAPD record gives an office in a listed jurisdiction. |
+
+IAPD's disclosure flag is recorded on the evidence rather than scored: Vanguard, BlackRock and
+Capital Research all carry disclosures, so as a rule it would fire on nearly every contractor.
+EDGAR gives places of organisation as codes (`DE`, `X1`, `E9`); `connectors/edgar_codes.py` is
+the SEC's published table, and the documents keep the code rather than the name so the prose
+jurisdiction rule never reads the tool's own words as a mention.
 
 ### How the contracting officer is resolved
 
@@ -730,7 +779,7 @@ foci_screen/
   store.py         SQLite snapshots, diffing, findings, notification log
   pipeline.py      orchestration (injected deps — same code serves an API)
   cli.py           argparse entry point
-  connectors/      usaspending, fpds, sec_edgar, registries, webwatch
+  connectors/      usaspending, fpds, sec_edgar, registries, webwatch, edgar_codes
   risk/            lexicon (jurisdictions, terms, clauses), engine (rules, scoring)
   notify/          render (.eml, text, html), gmail (guarded delivery)
 tests/             45 offline tests

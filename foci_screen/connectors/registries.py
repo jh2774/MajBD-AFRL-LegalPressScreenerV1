@@ -12,6 +12,7 @@ import re
 from difflib import SequenceMatcher
 
 from ..models import Document
+from .sec_edgar import normalise_holder
 
 log = logging.getLogger("foci.registries")
 
@@ -23,9 +24,17 @@ class IAPDConnector:
     Relevant because the investor arriving at a contractor is frequently an
     SEC-registered adviser, and IAPD gives its office country and disclosure
     history without a key. Endpoint is the one the IAPD site itself calls.
+
+    It is asked about the contractor's actual holders, taken from their
+    Schedule 13D/13G filings, via `find_adviser`. Searching on the contractor's
+    own name answered a different question — which advisers share a word with
+    it — and returned unrelated firms.
     """
     name = "iapd"
     SEARCH = "https://api.adviserinfo.sec.gov/search/firm"
+    # Name similarity a record needs, after legal suffixes are removed, before
+    # it is taken to be the holder. High on purpose: see `find_adviser`.
+    MATCH_THRESHOLD = 0.92
 
     def __init__(self, http) -> None:
         self.http = http
@@ -60,6 +69,49 @@ class IAPDConnector:
                       "country": country,
                       "has_disclosures": src.get("firm_ia_disclosure_fl") == "Y"}))
         return docs
+
+    def find_adviser(self, holder: str, *, percent: float | None = None,
+                     filing: str = "", filing_url: str = "") -> list[Document]:
+        """The IAPD record for one named holder of the contractor, if it has one.
+
+        IAPD's search matches loosely on single words, so the raw results for
+        a contractor's own name were unrelated firms that happened to share
+        "Network" or "Health". Here a record is kept only when its name is the
+        holder's name once legal suffixes are set aside, or so close that only
+        punctuation differs. "BlackRock, Inc." does not become "BlackRock
+        Investment Management (UK) Limited": that is a different adviser, and
+        attributing its office country to the holder would be wrong.
+        """
+        target = normalise_holder(holder)
+        if not target:
+            return []
+        best: tuple[float, Document | None] = (0.0, None)
+        for doc in self.search_firm(holder, hits=10):
+            candidate = normalise_holder(doc.meta.get("firm_name", ""))
+            # The search also returns broker-dealers with no adviser
+            # registration; without an SEC adviser number it is not the record
+            # this screen is asking about.
+            if not candidate or not doc.meta.get("sec_number"):
+                continue
+            if candidate == target:
+                score = 1.0
+            elif candidate.split()[0] == target.split()[0]:
+                score = SequenceMatcher(None, candidate, target).ratio()
+            else:
+                continue
+            if score >= self.MATCH_THRESHOLD and score > best[0]:
+                best = (score, doc)
+        doc = best[1]
+        if doc is None:
+            return []
+        # The match goes in meta, not text. The record is stored once per
+        # adviser and shared across contractors; writing "matched to Boeing's
+        # 9% holder" into it would make the next contractor's screen report
+        # the record as changed.
+        doc.meta.update({"investor": holder, "percent": percent,
+                         "match_score": round(best[0], 3),
+                         "filing": filing, "filing_url": filing_url})
+        return [doc]
 
     @staticmethod
     def _address(raw) -> dict:

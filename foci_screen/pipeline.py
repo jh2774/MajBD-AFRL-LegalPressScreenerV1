@@ -361,8 +361,22 @@ class Screener:
         else:
             progress("  SEC EDGAR full-text: skipped (needs a CIK to attribute hits)")
 
-        progress("  IAPD adviser search...")
-        docs.extend(self.iapd.search_firm(entity.parent_name or entity.name, hits=5))
+        if entity.cik:
+            progress("  SEC ownership filings (Schedule 13D/13G)...")
+            owners = self.edgar.ownership_filings(entity.cik)
+            docs.extend(owners)
+            # Individuals are not investment advisers; looking them up in IAPD
+            # would only find firms that share their surname.
+            firms = [o for o in owners if o.meta.get("person_type") != "IN"]
+            progress(f"  IAPD: {len(firms)} holder(s) to look up...")
+            for owner in firms:
+                docs.extend(self.iapd.find_adviser(
+                    owner.meta["holder"], percent=owner.meta.get("percent"),
+                    filing=f"{owner.doc_type} filed {owner.published}",
+                    filing_url=owner.url))
+        else:
+            progress("  Ownership filings and IAPD: skipped (needs a CIK to "
+                     "know whose holders to look up)")
 
         progress("  OFAC SDN name screen...")
         docs.extend(self.ofac.screen(entity.name))

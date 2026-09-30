@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 
+from ..connectors import edgar_codes
 from ..models import SEVERITY_ORDER, Change, Contract, Document, Entity, Finding, Signal
 from . import lexicon as lex
 
@@ -137,6 +138,11 @@ def rule_foci_jurisdiction(doc: Document, ctx: RuleContext) -> list[Signal]:
     back to the surrounding context catches that, at a reduced weight and
     labelled as context so the KO can see which half is new.
     """
+    # Registry records are fields, not prose, and have their own rules. An IAPD
+    # record's office line reads "... Cayman Islands"; read here as well, the
+    # one fact would be flagged twice, once as a bare mention.
+    if doc.source == "iapd" or (doc.meta or {}).get("ownership"):
+        return []
     text = doc.text
     if not text.strip():
         return []
@@ -380,10 +386,11 @@ def rule_sanctions_hit(doc: Document, ctx: RuleContext) -> list[Signal]:
 
 
 def rule_adviser_foreign_domicile(doc: Document, ctx: RuleContext) -> list[Signal]:
-    """An SEC-registered adviser connected to the contractor is domiciled abroad."""
+    """A holder of the contractor is an SEC-registered adviser domiciled abroad."""
     if doc.source != "iapd":
         return []
-    country = (doc.meta or {}).get("country", "")
+    meta = doc.meta or {}
+    country = meta.get("country", "")
     if not country or country.strip().lower() in ("united states", "usa", "us"):
         return []
     hits = lex.find_jurisdictions(country)
@@ -392,15 +399,67 @@ def rule_adviser_foreign_domicile(doc: Document, ctx: RuleContext) -> list[Signa
     name, _ = hits[0]
     mult = lex.jurisdiction_multiplier(name)
     score = _score("FOCI", ctx, mult * 0.8)
+    investor = meta.get("investor", "")
+    stake = ("" if meta.get("percent") is None
+             else f", holding {meta['percent']:g}% of the class")
+    held = (f"'{investor}'{stake} according to {meta.get('filing') or 'its ownership filing'}, "
+            if investor else "")
     return [Signal(
         rule_id="FOCI-IAPD-01", category="FOCI", severity=_sev(score), score=score,
-        title=f"Related investment adviser domiciled in {name}",
-        rationale=(f"IAPD lists '{(doc.meta or {}).get('firm_name', '')}' "
-                   f"(SEC# {(doc.meta or {}).get('sec_number', 'n/a')}) with an office in "
+        title=f"Investment adviser holding the contractor is domiciled in {name}",
+        rationale=(f"A beneficial owner of the contractor, {held}is registered with "
+                   f"the SEC as '{meta.get('firm_name', '')}' "
+                   f"(SEC# {meta.get('sec_number') or 'n/a'}), and IAPD gives its office as "
                    f"{country}. Where an adviser in a {lex.jurisdiction_tier(name)} "
                    f"jurisdiction holds or manages an interest in the contractor, the "
-                   f"beneficial ownership behind that interest should be identified."),
+                   f"beneficial ownership behind that interest should be identified."
+                   + (" IAPD also records regulatory disclosures against this adviser."
+                      if meta.get("has_disclosures") else "")),
         evidence=doc.text[:600], source="iapd", source_url=doc.url,
+        jurisdiction=name, is_new=ctx.is_new)]
+
+
+def rule_ownership_foreign_holder(doc: Document, ctx: RuleContext) -> list[Signal]:
+    """A 5%+ holder of the contractor is organised in a listed jurisdiction.
+
+    Read from the holder's own Schedule 13D/13G, so it does not depend on the
+    holder being in IAPD — foreign state investors usually are not. Only
+    jurisdictions in the lexicon fire, as for every other FOCI rule here: a
+    British pension fund holding 6% is ownership by an ally, not a finding.
+    """
+    meta = doc.meta or {}
+    if not meta.get("ownership"):
+        return []
+    code = meta.get("place_code", "")
+    if not code or edgar_codes.is_domestic(code):
+        return []
+    hits = lex.find_jurisdictions(edgar_codes.place_name(code))
+    if not hits:
+        return []
+    name, _ = hits[0]
+    form = meta.get("form", "")
+    # A 13D is filed by a holder that may seek to influence control; a 13G
+    # certifies it will not. The first is the FOCI question itself.
+    active = "13D" in form
+    mult = lex.jurisdiction_multiplier(name) * (1.0 if active else 0.6)
+    score = _score("FOCI", ctx, mult)
+    stake = ("an undisclosed share" if meta.get("percent") is None
+             else f"{meta['percent']:g}% of the class")
+    return [Signal(
+        rule_id="FOCI-OWNER-01", category="FOCI", severity=_sev(score), score=score,
+        title=f"Beneficial owner of the contractor organised in {name}",
+        rationale=(f"{meta.get('holder', 'A holder')} reports {stake} in {form} "
+                   f"filed {doc.published or 'on an undisclosed date'}, and gives its "
+                   f"place of organisation as {name} ({lex.jurisdiction_tier(name)} "
+                   f"jurisdiction). "
+                   + ("A Schedule 13D is filed by a holder that has not ruled out "
+                      "influencing control, which under 32 CFR Part 117 (NISPOM) is "
+                      "the foreign ability to direct or decide that FOCI concerns."
+                      if active else
+                      "A Schedule 13G certifies a passive holding, so this is a "
+                      "question about who stands behind the holder rather than a "
+                      "claim of control.")),
+        evidence=doc.text[:600], source="sec_edgar", source_url=doc.url,
         jurisdiction=name, is_new=ctx.is_new)]
 
 
@@ -475,6 +534,7 @@ DOCUMENT_RULES = [
     rule_uspto_security_interest,
     rule_sanctions_hit,
     rule_adviser_foreign_domicile,
+    rule_ownership_foreign_holder,
 ]
 
 

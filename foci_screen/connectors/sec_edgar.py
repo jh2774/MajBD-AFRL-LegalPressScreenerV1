@@ -8,6 +8,8 @@ Three things are pulled:
   3. full-text search       -> exhibits containing "intellectual property
      security agreement" and similar, which is where IP collateralisation is
      actually documented
+  4. Schedule 13D/13G       -> who holds more than 5% of the registrant, where
+     they are organised, and how much they hold
 
 EDGAR requires a User-Agent with a contact address; see config.user_agent.
 """
@@ -15,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import xml.etree.ElementTree as ET
 
 from ..models import Document
 
@@ -39,6 +42,12 @@ ITEM_MEANING = {
 }
 INTERESTING_FORMS = {"8-K", "SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A", "D", "D/A",
                      "10-K", "10-Q", "25", "SC 14D9", "DEFM14A", "S-4"}
+
+# Beneficial-ownership reports: anyone holding more than 5% of a class files one.
+# EDGAR renamed them in December 2024 when they became structured XML, and both
+# names are live — older holders' amendments still arrive under the old one.
+OWNERSHIP_FORMS = {"SC 13D", "SC 13D/A", "SC 13G", "SC 13G/A",
+                   "SCHEDULE 13D", "SCHEDULE 13D/A", "SCHEDULE 13G", "SCHEDULE 13G/A"}
 
 IP_COLLATERAL_QUERIES = [
     '"intellectual property security agreement"',
@@ -149,6 +158,125 @@ class EdgarConnector:
                       "item_codes": codes, "form": form, "company": company}))
         return docs
 
+    # ------------------------------------------------------------ ownership
+    def ownership_filings(self, cik: str, limit: int = 8) -> list[Document]:
+        """One Document per holder named in this registrant's recent 13D/13G filings.
+
+        A registrant's filing list mixes two directions: reports *about* it by
+        its holders, and reports it filed about companies it holds itself.
+        Lockheed's list carries its own 13D on Terran Orbital. Only filings whose
+        subject is this registrant are kept; the other kind would make the
+        contractor an investor in itself.
+
+        A holder reporting 0% has filed to say it no longer holds 5%, so it is
+        dropped rather than presented as a current investor. Each holder is
+        kept once, from its most recent filing.
+        """
+        if not cik:
+            return []
+        resp = self.http.get(SUBMISSIONS.format(cik=cik))
+        recent = (((resp.get("json") or {}).get("filings") or {}).get("recent") or {})
+        forms = recent.get("form") or []
+
+        def col(name: str, i: int) -> str:
+            values = recent.get(name) or []
+            return values[i] if i < len(values) else ""
+
+        docs: list[Document] = []
+        seen: set[str] = set()
+        examined = 0
+        for i, form in enumerate(forms):
+            if form not in OWNERSHIP_FORMS:
+                continue
+            if examined >= limit:
+                break
+            examined += 1
+            accession, filed = col("accessionNumber", i), col("filingDate", i)
+            if form.startswith("SCHEDULE"):
+                holders = self._holders_from_xml(cik, accession)
+            else:
+                holders = self._holders_from_header(cik, accession)
+            acc_plain = accession.replace("-", "")
+            url = f"{ARCHIVE}/{int(cik)}/{acc_plain}/"
+            for h in holders:
+                name_key = normalise_holder(h["name"]) or h["name"].upper()
+                if name_key in seen:
+                    continue
+                # Marked seen even at 0%, so an older filing from before the
+                # holder sold down cannot bring it back.
+                seen.add(name_key)
+                if h["percent"] == 0.0:
+                    continue
+                pct = "" if h["percent"] is None else f", {h['percent']:g}% of the class"
+                # Codes and filed values only. The place of organisation is
+                # left as its EDGAR code: spelled out, "Cayman Islands" would be
+                # read by the prose jurisdiction rule as a mention in a document,
+                # and the tool would be matching text it wrote itself.
+                docs.append(Document(
+                    source="sec_edgar", key=f"13dg:{cik}:{name_key}",
+                    title=f"{h['name']} — {form} filed {filed}", url=url,
+                    text=(f"Form {form} filed {filed} reports {h['name']} as a "
+                          f"beneficial owner{pct}. Reporting person type: "
+                          f"{h['type'] or 'not stated'}. Place of organisation "
+                          f"(EDGAR code): {h['place_code'] or 'not stated'}."),
+                    published=filed, doc_type=form,
+                    meta={"ownership": True, "cik": cik, "accession": accession,
+                          "form": form, "holder": h["name"],
+                          "percent": h["percent"], "person_type": h["type"],
+                          "place_code": h["place_code"]}))
+        return docs
+
+    def _holders_from_xml(self, cik: str, accession: str) -> list[dict]:
+        """Reporting persons from a structured (2024+) Schedule 13D/13G."""
+        url = f"{ARCHIVE}/{int(cik)}/{accession.replace('-', '')}/primary_doc.xml"
+        resp = self.http.get(url)
+        if resp.get("status") != 200 or not resp.get("text"):
+            return []
+        try:
+            root = ET.fromstring(resp["text"].encode("utf-8"))
+        except ET.ParseError:
+            return []
+        issuer = _xml_text(root, "issuerCik")
+        if issuer and issuer.zfill(10) != cik.zfill(10):
+            return []
+        holders = []
+        for person in root.iter():
+            if _local(person.tag) != "coverPageHeaderReportingPersonDetails":
+                continue
+            name = _xml_text(person, "reportingPersonName")
+            if not name:
+                continue
+            holders.append({
+                "name": name,
+                "place_code": _xml_text(person, "citizenshipOrOrganization"),
+                "type": _xml_text(person, "typeOfReportingPerson"),
+                "percent": _to_float(_xml_text(person, "classPercent"))})
+        return holders
+
+    def _holders_from_header(self, cik: str, accession: str) -> list[dict]:
+        """Filers from an older text 13D/13G, read from the EDGAR header.
+
+        The old form has no structured cover page, so the stake is unknown; the
+        header does say who filed, where they are incorporated, and which
+        company the filing is about.
+        """
+        url = f"{ARCHIVE}/{int(cik)}/{accession.replace('-', '')}/{accession}.hdr.sgml"
+        resp = self.http.get(url)
+        text = resp.get("text") or ""
+        if resp.get("status") != 200 or not text:
+            return []
+        subject = _sgml_section(text, "SUBJECT-COMPANY")
+        subject_cik = _sgml_field(subject, "CIK")
+        if not subject_cik or subject_cik.zfill(10) != cik.zfill(10):
+            return []
+        holders = []
+        for block in re.findall(r"<FILED-BY>(.*?)</FILED-BY>", text, re.S):
+            name = _sgml_field(block, "CONFORMED-NAME")
+            if name:
+                holders.append({"name": name, "type": "", "percent": None,
+                                "place_code": _sgml_field(block, "STATE-OF-INCORPORATION")})
+        return holders
+
     def fetch_filing_text(self, doc: Document) -> Document:
         """Pull the actual document body so rules see the language, not the label."""
         if not doc.url:
@@ -235,6 +363,46 @@ def _normalise(name: str) -> str:
                    " L.P.", " THE"):
         name = name.replace(suffix, " ")
     return " ".join(re.sub(r"[^A-Z0-9 ]", " ", name).split())
+
+
+def normalise_holder(name: str) -> str:
+    """`_normalise`, also dropping a leading "The".
+
+    Holders are named both ways — "The Vanguard Group" on a 2026 filing,
+    "VANGUARD GROUP INC" on a 2019 one — and a holder that has since reported
+    0% must not come back under its other spelling. Kept apart from
+    `_normalise` so CIK resolution scores exactly as it did.
+    """
+    return _normalise(re.sub(r"^\s*THE\s+", "", name, flags=re.I))
+
+
+def _local(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def _xml_text(node, name: str) -> str:
+    """First descendant with this local name, ignoring the XML namespace."""
+    for el in node.iter():
+        if _local(el.tag) == name:
+            return (el.text or "").strip()
+    return ""
+
+
+def _to_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sgml_section(text: str, tag: str) -> str:
+    m = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.S)
+    return m.group(1) if m else ""
+
+
+def _sgml_field(text: str, tag: str) -> str:
+    m = re.search(rf"^<{tag}>(.*)$", text, re.M)
+    return m.group(1).strip() if m else ""
 
 
 def _similarity(a: str, b: str) -> float:
