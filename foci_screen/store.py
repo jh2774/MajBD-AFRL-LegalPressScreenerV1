@@ -1687,6 +1687,26 @@ class Store:
             " ORDER BY amount DESC LIMIT ?", (self.tenant_id, value, limit))
         return [_decode_contract(r) for r in rows]
 
+    def resolve_entity_key(self, key: str) -> str:
+        """The key this database files a company under, given what a person typed.
+
+        A portfolio built by typing company names holds names, while awards are
+        filed under the contractor's UEI. Without this the two never meet: a
+        company screened yesterday still reads "not screened here" in the
+        portfolio that prompted the screen. A name resolves only when exactly
+        one screened contractor carries it — two contractors sharing a name
+        are left for a person to tell apart.
+        """
+        key = (key or "").strip().upper()
+        if not key or self._one(
+                "SELECT 1 AS found FROM contracts WHERE tenant_id=? AND entity_key=? LIMIT 1",
+                (self.tenant_id, key)):
+            return key
+        rows = self._query(
+            "SELECT DISTINCT entity_key FROM contracts WHERE tenant_id=?"
+            " AND UPPER(entity_name)=? LIMIT 3", (self.tenant_id, key))
+        return rows[0]["entity_key"] if len(rows) == 1 else key
+
     def contract_totals(self, column: str, value: str) -> dict:
         """COUNT and SUM over *every* matching row, not the page that was read.
 

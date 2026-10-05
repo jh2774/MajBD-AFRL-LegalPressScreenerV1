@@ -19,9 +19,12 @@ from foci_screen.connectors.adv import (
     AdvConnector,
     AdviserSnapshot,
     PrivateFund,
+    band_drawings,
     compare,
+    form_text,
     money,
     parse_firm_record,
+    parse_form,
     parse_schedule_d,
 )
 from foci_screen.notify.mailer import Mailer
@@ -42,7 +45,11 @@ Q16 = ("16. What is the approximate percentage of the private fund beneficially 
        "owned by non- United States persons:")
 
 
-def fund_block(name, fund_id, gav, investors, non_us, country="United States"):
+def fund_block(name, fund_id, gav, investors, non_us, country="United States",
+               state="Delaware"):
+    # A fund with no U.S. state prints both labels on one line, country below.
+    organised = f"State:\n{state}\nCountry:\n{country}" if state \
+        else f"State: Country: \n{country}"
     return f"""A. PRIVATE FUND
 Information About the Private Fund
 1. (a) Name of the private fund:
@@ -51,10 +58,7 @@ Information About the Private Fund
 (include the "805-" prefix also)
 {fund_id}
 2. Under the laws of what state or country is the private fund organized:
-State:
-Delaware
-Country:
-{country}
+{organised}
 {Q3}
 Name of General Partner, Manager, Trustee, or Director
 {name.split(',')[0]} GP, L.L.C.
@@ -114,6 +118,15 @@ def test_a_fund_repeated_by_the_pdf_is_counted_once_at_its_most_complete():
                                           fund_block(*FUND_B, 2_000_000_000, 80, 45)))
     assert [f.fund_id for f in funds] == [FUND_A[1], FUND_B[1]]
     assert all(f.gross_asset_value for f in funds)
+
+
+def test_a_fund_organised_abroad_keeps_its_country():
+    """Found on a real filing: 19 Cayman funds came back with no country,
+    because a fund without a U.S. state prints that line differently."""
+    [f] = parse_schedule_d(filing(fund_block(
+        *FUND_A, 155_349_827, 22, 100, country="Cayman Islands", state=None)))[0]
+    assert (f.state, f.country) == ("", "Cayman Islands")
+    assert f.owned_by_non_us_pct == 100
 
 
 def test_money_reads_like_a_person_wrote_it():
@@ -245,7 +258,7 @@ class StubHttp:
 def test_the_pdf_is_only_downloaded_when_there_is_a_new_filing(monkeypatch):
     """Megabytes a night per firm for nothing would be both slow and rude."""
     monkeypatch.setattr("foci_screen.connectors.adv.read_form",
-                        lambda _: parse_schedule_d(
+                        lambda _: parse_form(
                             filing(fund_block(*FUND_A, 900_000_000, 40, 20))))
     http = StubHttp()
     conn = AdvConnector(http)
@@ -262,63 +275,196 @@ def test_the_pdf_is_only_downloaded_when_there_is_a_new_filing(monkeypatch):
     assert http.pdf_calls == 2
 
 
-# ------------------------------------------------------------ fast PDF reading
+# ------------------------------------------------- reading the PDF band by band
+#
+# Stand-ins for the three pypdf objects the reader touches, drawing the way
+# IAPD's PDFs were found to: nothing on the page itself, one drawing per band
+# showing the band from its top down to that page, and a second drawing — the
+# first lines of the next band — on the page where a band ends.
 
-class _Page:
-    def __init__(self, size, text):
-        self.size, self.text = size, text
-        self.extracted = False
+class Drawing:
+    """A form XObject that shows `lines`, in order."""
+
+    def __init__(self, lines):
+        self.lines = list(lines)
+
+    def get_object(self):
+        return self
+
+    def get_data(self):
+        def esc(s):
+            return s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        return "\n".join(f"BT ({esc(line)}) Tj ET" for line in self.lines).encode()
+
+
+class Page:
+    def __init__(self, *drawings, own_text=""):
+        self.drawings, self.own_text, self.read_whole = drawings, own_text, False
+
+    def get(self, key):
+        if key == "/Resources":
+            return {"/XObject": {f"/D{i}": d for i, d in enumerate(self.drawings)}}
+        if key == "/Contents" and self.own_text:
+            return Drawing([self.own_text])
+        return None
+
+    def extract_xform_text(self, drawing):
+        return "\n".join(drawing.lines)
 
     def extract_text(self):
-        self.extracted = True
-        return self.text
+        self.read_whole = True
+        return "\n".join([self.own_text, *(ln for d in self.drawings for ln in d.lines)])
 
 
-class _Reader:
+class Reader:
     def __init__(self, pages):
         self.pages = pages
 
 
-def _sized(monkeypatch):
-    monkeypatch.setattr("foci_screen.connectors.adv._drawn_size", lambda p: p.size)
+def banded(*bands, cuts=()):
+    """Pages for a form drawn in `bands` (each a list of lines).
+
+    `cuts[b]` lists how many lines of band b are visible on each page before
+    the one that completes it.
+    """
+    pages = []
+    for b, lines in enumerate(bands):
+        for shown in (cuts[b] if b < len(cuts) else ()):
+            pages.append(Page(Drawing(lines[:shown])))
+        final = [Drawing(lines)]
+        if b + 1 < len(bands):
+            final.append(Drawing(bands[b + 1][:2]))     # the sliver of the next band
+        pages.append(Page(*final))
+    return Reader(pages)
 
 
-def test_section_ends_are_where_the_drawing_collapses(monkeypatch):
-    """Measured on a real filing: sizes grow through a section and collapse at
-    the next; small wobbles inside a section are not ends."""
-    from foci_screen.connectors.adv import section_end_pages
-
-    _sized(monkeypatch)
-    sizes = [29, 47, 65, 64, 90, 562, 39, 64, 617, 36, 82, 384]   # KB, shaped like a real one
-    reader = _Reader([_Page(s * 1000, "") for s in sizes])
-    assert section_end_pages(reader) == [5, 8, 11]
+def lines_of(*chunks):
+    return [ln for chunk in chunks for ln in chunk.strip("\n").split("\n")]
 
 
-def test_an_ordinary_pdf_is_read_in_full(monkeypatch):
-    """No cumulative pattern — sizes up and down — means every page matters."""
-    from foci_screen.connectors.adv import section_end_pages
+def test_one_complete_drawing_is_taken_for_each_band():
+    one = [f"line {i} of band one" for i in range(60)]
+    two = [f"line {i} of band two" for i in range(50)]
+    reader = banded(one, two, cuts=([10, 30], [20]))
 
-    _sized(monkeypatch)
-    sizes = [50, 10, 60, 12, 70, 15, 80, 11, 90, 14, 55, 9]
-    assert section_end_pages(_Reader([_Page(s * 1000, "") for s in sizes])) is None
+    drawings = band_drawings(reader)
+    assert [d.lines for _, d in drawings] == [one, two]
+    assert form_text(reader).split("\n") == one + two, "every line once, in order"
+    assert not any(p.read_whole for p in reader.pages)
 
 
-def test_the_fast_read_falls_back_when_a_fund_is_missing(monkeypatch):
-    """The fast path is trusted only when it finds every fund the form
-    declares. Here the section-end page lacks one, so every page is read."""
-    from foci_screen.connectors import adv as adv_module
+def test_joining_every_page_gives_a_fund_another_funds_numbers():
+    """The failure this reader exists to avoid, as found on a real filing.
 
-    _sized(monkeypatch)
-    both = filing(fund_block(*FUND_A, 900_000_000, 40, 20),
-                  fund_block(*FUND_B, 2_000_000_000, 80, 45))
-    only_a = filing(fund_block(*FUND_A, 900_000_000, 40, 20)).replace(
-        "Total Funds: 1", "Total Funds: 2")
-    pages = [_Page(100_000, both), _Page(300_000, only_a)]   # page 2 "ends the section"
-    monkeypatch.setattr("pypdf.PdfReader", lambda _: _Reader(pages))
+    Band one ends part-way through a Cayman fund's entry; band two therefore
+    opens with the rest of it — its size, its investors, its 100% foreign
+    ownership. A page inside band two then stops part-way through the next
+    fund. Joined page after page, that half-entry is followed by the top of
+    band two again, and reads as one whole entry carrying the Cayman fund's
+    figures. Reading one drawing per band gives each fund its own.
+    """
+    cayman = fund_block("HARBORLIGHT OFFSHORE FUND, L.P.", "805-3333333333",
+                        155_349_827, 22, 100, country="Cayman Islands", state=None)
+    split = cayman.index("11. Current gross asset value")
+    domestic = fund_block(*FUND_B, 8_894_873, 2, 0)
+    header = ("FORM ADV\nAnnual Amendment - All Sections Rev. 10/2021\n"
+              "Item 7 Private Fund Reporting")
 
-    funds, declared, _ = adv_module.read_form(b"%PDF-")
-    assert declared == 2 and len(funds) == 2, "both funds recovered by the full read"
-    assert pages[0].extracted, "the fallback read the page the fast path skipped"
+    one = lines_of(header, fund_block(*FUND_A, 900_000_000, 40, 20), cayman[:split])
+    two = lines_of(cayman[split:], domestic, "Item 8 Participation in Client Transactions")
+    # The page inside band two ends just before the domestic fund's figures.
+    before_figures = domestic[:domestic.index("11. Current gross asset value")]
+    stops_inside_domestic = len(lines_of(cayman[split:])) + len(lines_of(before_figures))
+    reader = banded(one, two, cuts=([12], [stops_inside_domestic]))
+
+    naive = parse_form("\n".join(p.extract_text() for p in reader.pages))
+    wrong = next(f for f in naive.funds if f.fund_id == FUND_B[1])
+    assert (wrong.gross_asset_value, wrong.owned_by_non_us_pct) == (155_349_827, 100), \
+        "page-by-page, the domestic fund takes the Cayman fund's size and foreign share"
+
+    funds = {f.fund_id: f for f in parse_form(form_text(reader)).funds}
+    assert len(funds) == 3
+    assert (funds[FUND_B[1]].gross_asset_value, funds[FUND_B[1]].owned_by_non_us_pct) == (
+        8_894_873, 0)
+    offshore = funds["805-3333333333"]
+    assert (offshore.country, offshore.gross_asset_value, offshore.investors,
+            offshore.owned_by_non_us_pct) == ("Cayman Islands", 155_349_827, 22, 100), \
+        "an entry that spans two bands is read across them"
+
+
+def test_a_band_redrawn_part_way_is_still_one_band():
+    """A table running off the page is drawn in part, then differently once
+    the next page shows more of it. The half-drawn version is not a band."""
+    body = [f"question {i}" for i in range(50)]
+    half_drawn = Drawing(body + ["AL", "AZ", "IL"])
+    full = Drawing(body + ["AL", "AK", "AZ", "AR", "IL", "IN"] + ["after the table"])
+    reader = Reader([Page(Drawing(body[:20])), Page(half_drawn), Page(full)])
+
+    [(page, drawing)] = band_drawings(reader)
+    assert page == 2 and drawing is full
+
+
+def test_an_ordinary_pdf_is_read_page_by_page():
+    """Text on the page itself means it is not built in bands; each page then
+    holds only its own text and reading them all is right."""
+    reader = Reader([Page(own_text="page one"), Page(own_text="page two")])
+    assert band_drawings(reader) is None
+    assert "page one" in form_text(reader) and "page two" in form_text(reader)
+
+    unrelated = Reader([Page(Drawing([f"stamp {i}", "x"])) for i in range(12)])
+    assert band_drawings(unrelated) is None, "a different drawing on every page is not bands"
+
+
+def test_fewer_funds_than_the_form_declares_is_not_a_reading():
+    text = filing(fund_block(*FUND_A, 900_000_000, 40, 20)).replace(
+        "Total Funds: 1", "Total Funds: 3")
+    form = parse_form(text)
+    assert form.funds_declared == 3 and len(form.funds) == 1 and form.funds_read is False
+
+    old = snapshot(funds=[fund(), fund(fid=FUND_B[1], name=FUND_B[0])])
+    short = snapshot(date="09/30/2026", funds=form.funds, read=form.funds_read)
+    assert kinds(compare(old, short)) == ["new_filing"], "no fund is reported as gone"
+
+
+def test_a_failed_download_keeps_the_last_good_reading(monkeypatch):
+    """Otherwise the next successful reading becomes the baseline, and what
+    changed in between is never reported."""
+    class Http(StubHttp):
+        ok = True
+
+        def get_bytes(self, url, **kw):
+            self.pdf_calls += 1
+            return (200, b"%PDF-stub") if self.ok else (503, b"")
+
+    http = Http()
+    conn = AdvConnector(http)
+    texts = iter([filing(fund_block(*FUND_A, 900_000_000, 40, 20)),
+                  filing(fund_block(*FUND_A, 900_000_000, 40, 55))])
+    monkeypatch.setattr("foci_screen.connectors.adv.read_form",
+                        lambda _: parse_form(next(texts)))
+    first = conn.refresh("999001")
+
+    http.filing_date, http.ok = "09/30/2026", False
+    held = conn.refresh("999001", previous=first)
+    assert held.funds == first.funds and held.filing_date == "03/31/2026"
+    assert compare(first, held) == []
+
+    http.ok = True
+    fresh = conn.refresh("999001", previous=held)
+    assert "non_us_share" in kinds(compare(held, fresh)), "the change still surfaces"
+
+
+def test_a_reading_by_an_older_reader_is_not_compared_field_by_field():
+    """Correcting this tool's own misreading must not go out as news."""
+    misread = snapshot(funds=[fund(non_us=0)])                    # reader version 0
+    correct = snapshot(funds=[fund(non_us=100)])
+    correct.reader_version = 2
+    assert compare(misread, correct) == []
+
+    refiled = snapshot(date="09/30/2026", funds=[fund(non_us=100)])
+    refiled.reader_version = 2
+    [only] = compare(misread, refiled)
+    assert only.kind == "new_filing" and "reading of the form was improved" in only.detail
 
 
 # ------------------------------------------------------------ alerts, end to end

@@ -314,7 +314,9 @@ def list_findings(severity: str = Query("", pattern="^(|info|low|medium|high|cri
 
 @app.get("/v1/entities/{entity_key}", tags=["findings"])
 def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
-    key = entity_key.upper()
+    # A company's name, as typed into a portfolio, finds the contractor it was
+    # screened as. `entity_key` in the reply says which record answered.
+    key = store.resolve_entity_key(entity_key)
     contracts = store.contracts_where("entity_key", key)
     findings = store.search_findings(entity_key=key, limit=1)
     if not contracts and not findings:
@@ -323,6 +325,7 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
     latest = findings[0] if findings else None
     totals = store.contract_totals("entity_key", key)
     return {
+        "entity_key": key,
         "entity": (latest or {}).get("entity", {"name": contracts[0]["entity_name"],
                                                 "uei": contracts[0]["recipient_uei"]}
                                      if contracts else {}),
@@ -453,15 +456,24 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
                 "adv_filing_date": snap.get("filing_date"),
                 "fund_count": len(funds),
                 "fund_assets": sum(f.get("gross_asset_value") or 0 for f in funds),
+                # Owners the form marks as companies based outside the U.S.
+                # None until the ownership schedules have been read.
+                "foreign_owners": (sum(1 for o in snap.get("owners") or []
+                                       if o.get("kind") == "FE")
+                                   if snap.get("owners_read") else None),
             })
             continue
-        totals = store.contract_totals("entity_key", company.key)
-        findings = store.search_findings(entity_key=company.key, limit=1)
+        # A name typed into the portfolio is looked up under the key its
+        # awards were filed as; `page_key` is where its page lives.
+        page_key = store.resolve_entity_key(company.key)
+        totals = store.contract_totals("entity_key", page_key)
+        findings = store.search_findings(entity_key=page_key, limit=1)
         latest = findings[0] if findings else None
         screened = bool(totals["contract_count"]) or bool(latest)
         rows.append({
-            **_latest_raise(store, company.key),
+            **_latest_raise(store, [company.key, page_key]),
             "entity_key": company.key,
+            "page_key": page_key,
             # The database's name wins when it has one: it is the name the
             # awards were made under, and the key may carry an older one.
             "entity_name": (latest or {}).get("entity", {}).get("name")
@@ -494,12 +506,12 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
     }
 
 
-def _latest_raise(store: Store, entity_key: str) -> dict:
+def _latest_raise(store: Store, entity_keys: list[str]) -> dict:
     """The newest Form D on record for a contractor, for the portfolio table.
 
     Read from what is stored; loading a dashboard never reaches out to EDGAR.
     """
-    ciks = store.confirmed_ciks([entity_key])
+    ciks = store.confirmed_ciks(entity_keys)
     if not ciks:
         return {"cik": None, "latest_raise": None}
     cik = next(iter(ciks))
@@ -582,6 +594,25 @@ def search_edgar_companies(q: str = Query("", max_length=120),
                                                      "in a moment."}
 
 
+def _picked_under_name(store: Store, key: str) -> dict | None:
+    """An SEC record someone picked for this company before it was screened.
+
+    Then the company was known only by the name typed into a portfolio; now
+    its awards are filed under a UEI. The earlier choice is offered, not
+    applied: two contractors can share a name, and whether this is the same
+    company is for a person to say.
+    """
+    rows = store.contracts_where("entity_key", key, limit=1)
+    name = (rows[0].get("entity_name") or "").strip().upper() if rows else ""
+    if not name or name == key:
+        return None
+    link = store.get_entity_link(name)
+    if link and link.get("status") == "confirmed" and (link.get("cik") or "").strip():
+        return {"cik": link["cik"], "matched_title": link.get("matched_title") or "",
+                "picked_under": name}
+    return None
+
+
 @app.get("/v1/entities/{entity_key}/formd", tags=["fundraising"])
 def entity_formd(entity_key: str, refresh: bool = Query(False),
                  store: Store = Depends(tenant_store)) -> dict:
@@ -594,7 +625,8 @@ def entity_formd(entity_key: str, refresh: bool = Query(False),
     link = store.get_entity_link(key)
     ciks = store.confirmed_ciks([key])
     if not ciks:
-        return {"entity_key": key, "linked": False, "link": link}
+        return {"entity_key": key, "linked": False, "link": link,
+                "suggested": _picked_under_name(store, key)}
     cik = next(iter(ciks))
 
     result = {}

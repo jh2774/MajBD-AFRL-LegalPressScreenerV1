@@ -538,6 +538,23 @@ page shows those funds in plain English. When it files again, the tool reports:
 * a fund **disappearing**, a fund's **home country** changing, a new **related firm**, and
   every **new filing**
 
+**Who owns the firm itself** is read too, from **Schedule A** (everyone holding 5% or more
+directly, and the top executives) and **Schedule B** (who owns those owners, level by level,
+at 25% or more). The form marks each owner as a person, a U.S. company, or a company based
+outside the United States. It does not name the country, and it records nothing about a
+person's nationality; the page says exactly that. The tool reports:
+
+* a **new owner**, direct or up the chain. A company based outside the U.S. is ordered first.
+* an owner **leaving**, an owner's **share band** moving (the form gives bands: 5–10%, 10–25%,
+  25–50%, 50–75%, 75% or more), an owner gaining or losing **control**, and an owner newly
+  marked as foreign
+* new **executives with no stake**, grouped into one low-ranked item
+
+A firm's page opens with four numbers: its private funds, how many are more than half owned
+from outside the U.S., how many are set up outside the U.S., and how many of the firm's own
+owners are marked as foreign companies. The last column of the form (CRD, tax or Social
+Security number) is never stored.
+
 Each report says what changed, one sentence on what that part of the form *is*, and exactly
 where on the form to look, with links to the SEC's page and the filing. It does not say what
 the change means for the contractor; that is left to the reader.
@@ -546,11 +563,31 @@ How it reads the form, and why this way. IAPD's JSON record gives each firm's la
 date, so most nights nothing more is fetched. When the date moves, the full Form ADV is
 downloaded as a PDF: `adviserinfo.sec.gov` serves the same form section by section as web
 pages, but its robots.txt disallows those to automated clients, and this tool does not read
-them. The PDF is built so each page repeats everything before it in its section — reading all
-63 pages of a real filing took 27 seconds. The tool finds the pages that end each section from
-their drawing sizes, which cost nothing to read, and extracts only those: 2.5 seconds, with
-identical results, checked field by field against reading every page. It uses the fast path
-only when it recovers every fund the form declares, and reads every page otherwise.
+them.
+
+The PDF is drawn on tall strips ("bands") of about 24 pages, cut wherever the strip runs out
+rather than where a section of the form ends. Each page draws its band from the top of the
+band down to that page, and a page that crosses two bands draws both. The tool takes the one
+complete drawing of each band, in order, which is the form's text exactly once: 13 seconds for
+a 303-page filing, 4 for a 63-page one.
+
+**An earlier version got this wrong, and it matters to say how.** It read the pages that end
+each band, which is nearly right, but fell back to joining every page whenever a filing did
+not print its fund total — and none of the three large filings checked prints one. Joined page
+by page, an entry cut off by a page break
+is followed by the top of the band again — usually the tail of a *different* fund's entry —
+and the two read as one entry with the other fund's figures. On the 303-page filing that gave
+five funds the same $1.9 million and 0% foreign ownership; one of them is a $155 million Cayman
+fund owned entirely from outside the United States. That version also dropped the country of
+any fund organised abroad, because the form prints that line differently when there is no U.S.
+state. Both are fixed and covered by tests that reproduce them. Filings that print their fund
+total, which the smaller ones do, took the right path and were not affected by the first
+problem. Every stored firm is read once more by the new reader, and that one re-reading is not
+compared fund by fund with the old one, so the correction itself is not sent out as news.
+
+There is deliberately no slower fallback now. A form that does not check out — fewer funds
+than it declares, ownership schedules not found — is shown as not read. If a download fails,
+the last good reading is kept, so the next successful one is still compared against it.
 
 ## A contractor raising money: Form D
 
@@ -570,6 +607,15 @@ shown with its city, state of incorporation and number of Form D notices. The to
 one itself: a wrong pick would put another entity's fundraising under the contractor's name.
 Picking one also confirms the contractor's SEC identity for the rest of the screen, and an
 unreviewed name match is never used for Form D alerts.
+
+**No screen is needed for this.** A company typed into a portfolio by name, which this site has
+never screened, has a page of its own: it says so, offers to screen it, and carries the same
+fundraising section, so its SEC record can be picked and watched straight away. Once such a
+company is screened, its awards are filed under its UEI rather than its name. The portfolio
+and the alerts follow it there when exactly one screened contractor carries that name; two
+contractors sharing a name are left for a person to tell apart. An SEC record picked under
+the name is then offered on the screened contractor's page with one click, not applied
+automatically.
 
 The tool then reports, for each new notice:
 

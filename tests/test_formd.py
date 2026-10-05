@@ -445,6 +445,58 @@ def test_picking_a_company_after_subscribing_does_not_send_its_history(store):
     assert store.alert_deliveries(sid) == []
 
 
+# ------------------------------------------ portfolios built from typed names
+#
+# A portfolio made by typing company names holds names. Awards, notices and SEC
+# identities are filed under the contractor's UEI. These used to never meet.
+
+NAME = "NORTHWIND ROBOTICS INC"
+
+
+def award(store, entity_key, name, piid):
+    with store._tx() as c:
+        c.execute(
+            "INSERT INTO contracts (tenant_id, contract_key, run_id, piid, entity_key,"
+            " entity_name, amount, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (store.tenant_id, piid, "r1", piid, entity_key, name, 1000.0,
+             "2026-01-01T00:00:00Z"))
+
+
+def test_a_typed_name_finds_the_contractor_it_was_screened_as(store):
+    assert store.resolve_entity_key("northwind robotics inc") == NAME, "nothing screened yet"
+
+    award(store, "UEI777", NAME, "P1")
+    assert store.resolve_entity_key("northwind robotics inc") == "UEI777"
+    assert store.resolve_entity_key("UEI777") == "UEI777"
+
+    # Two contractors with one name: which is meant is not for the tool to guess.
+    award(store, "UEI888", NAME, "P2")
+    assert store.resolve_entity_key(NAME) == NAME
+
+
+def test_a_portfolio_of_names_is_alerted_like_any_other(store):
+    award(store, "UEI777", NAME, "P1")
+    confirm(store, key="UEI777")                 # SEC record picked on the screened page
+    formd = FakeFormD()
+    first = filing("0004400123-26-000001", "2026-03-10")
+    formd.current[CIK] = issuer(first)
+    alerts.refresh_issuers(store, formd, [CIK])
+
+    sid = subscribe(store, [NAME])               # the portfolio holds the typed name
+    formd.current[CIK] = issuer(first, filing("0004400123-26-000002", "2026-09-01"))
+    store.start_run("DoD", {}, run_id="r1")
+    store.create_notice(run_id="r1", entity_key="UEI777", entity_name=NAME,
+                        severity="high", recipient="x@mail.mil", officer_confidence="high",
+                        subject="s", body_text="b", trigger_reason="Always notify.")
+
+    result = alerts.run_alerts(store, FakeAdv(), Mailer(FakeCfg()),
+                               "https://site.example", formd=formd)
+    assert result["companies_checked"] == 1
+    [delivery] = store.alert_deliveries(sid)
+    assert "reported raising money privately" in delivery["body_text"]
+    assert f"{NAME} was flagged (HIGH)" in delivery["body_text"]
+
+
 # ----------------------------------------------------------------------- API
 
 @pytest.fixture()
@@ -491,6 +543,41 @@ def test_a_picked_company_shows_its_filings_with_links(client):
     row = c.post("/v1/portfolio", headers=AUTH, json={"key": key}).json()["companies"][0]
     assert row["latest_raise"]["amount_sold"] == 20_000_000
     assert row["latest_raise"]["filed"] == "2026-03-10"
+
+
+def test_a_company_picked_before_it_was_screened_is_offered_not_assumed(client):
+    """Its SEC record was picked under the name typed into a portfolio. Now it
+    is screened under a UEI. The page for the UEI offers that earlier choice;
+    it does not apply it, because two contractors can share a name."""
+    c, app_module = client
+    store = app_module.store_for("acme")
+    name_url = NAME.replace(" ", "%20")
+
+    assert c.get(f"/v1/entities/{name_url}", headers=AUTH).status_code == 404
+    unscreened = c.get(f"/v1/entities/{name_url}/formd", headers=AUTH).json()
+    assert unscreened["linked"] is False, "the fundraising card works with no screen"
+
+    snap = issuer(filing("0004400123-26-000001", "2026-03-10"))
+    store.save_formd_snapshot(CIK, snap.to_dict(), "2026-03-10")
+    c.post(f"/v1/entities/{name_url}/identity", headers=AUTH,
+           json={"status": "confirmed", "cik": CIK.zfill(10),
+                 "matched_title": "Northwind Robotics, Inc."})
+    key = pf.encode(pf.from_entity_keys("Watch", [NAME]))
+    row = c.post("/v1/portfolio", headers=AUTH, json={"key": key}).json()["companies"][0]
+    assert row["page_key"] == NAME and not row["screened_here"]
+    assert row["latest_raise"]["amount_sold"] == 20_000_000
+
+    award(store, "UEI777", NAME, "P1")           # ...and then it is screened
+    row = c.post("/v1/portfolio", headers=AUTH, json={"key": key}).json()["companies"][0]
+    assert row["page_key"] == "UEI777" and row["screened_here"]
+    assert row["contract_count"] == 1
+    assert row["latest_raise"]["amount_sold"] == 20_000_000, "still followed by its name"
+
+    assert c.get(f"/v1/entities/{name_url}", headers=AUTH).json()["entity_key"] == "UEI777"
+    page = c.get("/v1/entities/UEI777/formd", headers=AUTH).json()
+    assert page["linked"] is False
+    assert page["suggested"] == {"cik": CIK.zfill(10), "picked_under": NAME,
+                                 "matched_title": "Northwind Robotics, Inc."}
 
 
 def test_fundraising_routes_need_a_key(client):

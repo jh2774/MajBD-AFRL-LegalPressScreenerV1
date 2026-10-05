@@ -90,7 +90,8 @@ async function api(path) {
     try {
       detail = (await res.json()).detail || detail;
     } catch { /* not JSON */ }
-    throw { title: "Request failed", message: detail };
+    // `status` so a caller can tell "nothing here" from "something broke".
+    throw { title: "Request failed", message: detail, status: res.status };
   }
   return res.json();
 }
@@ -824,12 +825,22 @@ function wireScreenRemove(runId) {
 async function viewEntity(key) {
   setBusy("Loading contractor…");
   const [d, docs, verdicts, identity] = await Promise.all([
-    api(`/v1/entities/${encodeURIComponent(key)}`),
+    // Nothing recorded is an answer, not a failure: a company named in a
+    // portfolio but never screened still has a page — see viewUnscreened.
+    api(`/v1/entities/${encodeURIComponent(key)}`)
+      .catch((e) => { if (e.status === 404) return null; throw e; }),
     api(`/v1/documents?entity_key=${encodeURIComponent(key)}`).catch(() => ({ documents: [] })),
     api(`/v1/entities/${encodeURIComponent(key)}/dispositions`)
       .catch(() => ({ dispositions: {} })),
     api(`/v1/entities/${encodeURIComponent(key)}/identity`).catch(() => null),
   ]);
+  if (!d) return viewUnscreened(key, identity);
+  // Opened by the name typed into a portfolio, but screened under its UEI:
+  // go to the page everything else is filed against.
+  if (d.entity_key && d.entity_key !== key.toUpperCase()) {
+    location.replace(`#/entity/${encodeURIComponent(d.entity_key)}`);
+    return;
+  }
   d.documents = docs.documents || [];
   d.dispositions = verdicts.dispositions || {};
   d.identity = identity;
@@ -908,6 +919,60 @@ async function viewEntity(key) {
   loadFormD(key, e.name || key);
 }
 
+/* A company someone put in a portfolio by name, which this database has never
+ * screened. It used to have no page at all — the portfolio linked to an error —
+ * which made the one thing that needs no screen, picking its SEC record to
+ * watch its fundraising, impossible for exactly the companies it is for. */
+async function viewUnscreened(key, identity) {
+  let name = (identity && identity.entity_name) || "";
+  let inPortfolio = false;
+  const saved = savedPortfolioKey();
+  if (saved) {
+    try {
+      const p = await apiPost("/v1/portfolio", { key: saved });
+      const row = p.companies.find(
+        (c) => (c.entity_key || "").toUpperCase() === key.toUpperCase());
+      if (row) {
+        inPortfolio = true;
+        name = name || row.entity_name;
+      }
+    } catch { /* the page works without the portfolio */ }
+  }
+  name = name || key;
+
+  view.innerHTML = `
+    <div class="breadcrumb"><a href="#/">Overview</a> ›
+      ${inPortfolio ? '<a href="#/portfolio">Portfolio</a> › ' : ""}Contractor</div>
+    <div class="page-head">
+      <h1>${esc(name)}</h1>
+      <div class="sub"><span class="pill">not screened here</span>
+        ${inPortfolio ? " · in your portfolio" : ""}</div>
+    </div>
+
+    <div class="card">
+      <h2>Not screened on this site yet</h2>
+      <p class="muted">Nothing is stored here about this company's federal awards. You
+      can still pick its SEC record below and be told when it raises money — that
+      needs no screen. To pull its awards from USAspending and run the full check,
+      screen it; that takes a few minutes.</p>
+      <div class="actions">
+        <button class="primary" id="screen-firm">Screen “${esc(name)}”</button>
+      </div>
+      <p class="muted" id="screen-firm-status" style="margin-top:10px"></p>
+    </div>
+
+    ${identity ? identityCard(identity, key) : ""}
+
+    ${formdPlaceholder()}
+
+    ${inPortfolio ? "" : addToPortfolioButton([key], "Watch this company on your dashboard.")}`;
+
+  wireScreenFirm(name);
+  wireIdentity(view, key);
+  wireAddToPortfolio();
+  loadFormD(key, name);
+}
+
 /* --------------------------------------------- a contractor's own Form D */
 
 /* Form D is the notice a company files when it raises money privately — the
@@ -954,6 +1019,12 @@ function formdPicker(d, name) {
       The screen matched this contractor by name to CIK ${esc(link.cik)}
       (${esc(link.matched_title || "")}), but nobody has checked that. Confirm it in the
       SEC identity card above, or pick below.</p>` : ""}
+    ${d.suggested ? `<div class="notice-body" style="margin:10px 0">
+      Before this company was screened, someone picked
+      <strong>${esc(d.suggested.matched_title || "CIK " + d.suggested.cik)}</strong>
+      (CIK ${esc(d.suggested.cik)}) as its SEC record. If this is the same company:
+      <button class="fd-pick" style="margin-left:8px" data-cik="${esc(d.suggested.cik)}"
+        data-name="${esc(d.suggested.matched_title || "")}">Use it here</button></div>` : ""}
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <input id="fd-q" value="${esc(name)}" aria-label="Company name to look up on EDGAR"
         style="flex:1;min-width:220px;padding:8px;border:1px solid var(--border);
@@ -1060,6 +1131,26 @@ function wireFormD(card, key, name) {
   }
   const input = card.querySelector("#fd-q");
   const out = card.querySelector("#fd-results");
+  const wirePicks = (root) => root.querySelectorAll(".fd-pick").forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      b.textContent = "Saving…";
+      try {
+        await apiPost(`/v1/entities/${encodeURIComponent(key)}/identity`, {
+          status: "confirmed",
+          cik: b.dataset.cik.padStart(10, "0"),
+          matched_title: b.dataset.name,
+          note: "Picked from EDGAR's company list on the fundraising card.",
+        });
+        route();
+      } catch (e) {
+        b.disabled = false;
+        b.textContent = "Try again";
+        out.insertAdjacentHTML("afterbegin", `<p class="error">${esc(e.message || String(e))}</p>`);
+      }
+    };
+  });
+  wirePicks(card);      // an SEC record picked earlier under the company's name
   const search = async () => {
     const q = input.value.trim();
     if (q.length < 2) return;
@@ -1071,25 +1162,7 @@ function wireFormD(card, key, name) {
       out.textContent = e.message || String(e);
       return;
     }
-    out.querySelectorAll(".fd-pick").forEach((b) => {
-      b.onclick = async () => {
-        b.disabled = true;
-        b.textContent = "Saving…";
-        try {
-          await apiPost(`/v1/entities/${encodeURIComponent(key)}/identity`, {
-            status: "confirmed",
-            cik: b.dataset.cik.padStart(10, "0"),
-            matched_title: b.dataset.name,
-            note: "Picked from EDGAR's company list on the fundraising card.",
-          });
-          route();
-        } catch (e) {
-          b.disabled = false;
-          b.textContent = "Try again";
-          out.insertAdjacentHTML("afterbegin", `<p class="error">${esc(e.message || String(e))}</p>`);
-        }
-      };
-    });
+    wirePicks(out);
   };
   card.querySelector("#fd-search").onclick = search;
   input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); search(); } };
@@ -1827,7 +1900,7 @@ function portfolioTable(companies) {
 
   const contractorRows = contractors.map((r) => `
     <tr>
-      <td>${linkEntity(r.entity_key, r.entity_name)}</td>
+      <td>${linkEntity(r.page_key || r.entity_key, r.entity_name)}</td>
       <td>${r.screened_here ? sevTag(r.severity) : '<span class="pill">not screened here</span>'}</td>
       <td class="num">${r.contract_count ? num(r.contract_count) : "—"}</td>
       <td class="num">${r.obligated ? money(r.obligated) : "—"}</td>
@@ -1841,6 +1914,8 @@ function portfolioTable(companies) {
       <td>${r.adv_filing_date ? esc(r.adv_filing_date) : '<span class="pill">not read yet</span>'}</td>
       <td class="num">${r.screened_here ? num(r.fund_count) : "—"}</td>
       <td class="num">${r.fund_assets ? money(r.fund_assets) : "—"}</td>
+      <td class="num">${r.foreign_owners === null || r.foreign_owners === undefined ? "—"
+        : r.foreign_owners ? `<span class="pill warn">${num(r.foreign_owners)}</span>` : "none"}</td>
     </tr>`).join("");
 
   return `
@@ -1852,7 +1927,8 @@ function portfolioTable(companies) {
     ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
       <table>
       <thead><tr><th>Firm</th><th>Latest Form ADV</th><th class="num">Private funds</th>
-        <th class="num">Money in those funds</th></tr></thead>
+        <th class="num">Money in those funds</th>
+        <th class="num" title="Owners of the firm that its Form ADV marks as companies based outside the United States">Owners outside the U.S.</th></tr></thead>
       <tbody>${firmRows}</tbody></table>` : ""}`;
 }
 
@@ -2090,12 +2166,86 @@ function wireAlerts(key, portfolioName) {
 
 /* ------------------------------------------------------------ one firm */
 
+/* Who owns the investment firm itself: Schedule A (direct owners and top
+ * executives) and Schedule B (who owns those owners). The form marks each
+ * owner as a person, a U.S. company or a foreign company and stops there — no
+ * country, and nothing about a person's nationality — so the page says exactly
+ * that much and no more. */
+function ownersCard(s, links) {
+  const title = "Who owns and runs this firm";
+  if (!s.owners_read) {
+    return `<div class="card" id="owners-card"><h2>${title}</h2>
+      <p class="muted">The ownership pages of this filing could not be read here. They
+      are Schedule A and Schedule B of the full form:
+      <a class="linkish" href="${esc(links.form)}" target="_blank" rel="noopener noreferrer">open it →</a></p></div>`;
+  }
+  const owners = s.owners || [];
+  const direct = owners.filter((o) => !o.indirect);
+  const indirect = owners.filter((o) => o.indirect);
+  const foreign = owners.filter((o) => o.foreign);
+  const what = (o) => ({
+    I: "Person", DE: "U.S. company",
+    FE: '<span class="pill warn">company outside the U.S.</span>',
+  }[o.kind] || "—");
+  const yes = (v) => (v ? "Yes" : "No");
+  const share = (o) => (o.code === "F" ? "General partner, trustee or manager"
+    : o.code === "NA" && !o.indirect ? "Under 5%, or none" : esc(o.share || "—"));
+
+  // People are filed "Last, First, Middle" and shown first-name-first; the
+  // tooltip keeps the filed form, since not every filer follows the order.
+  const name = (o) => `<span title="As filed: ${esc(o.name)}">${esc(o.display)}</span>`;
+
+  return `<div class="card" id="owners-card">
+    <h2>${title}</h2>
+    <p class="muted">From the firm's own filing. The form marks each owner as a person, a
+    U.S. company, or a company based outside the United States. It does not say which
+    country, and it does not record the nationality of people. “Control” is the form's
+    word for the power to direct the firm's management or policies.</p>
+    <p>${foreign.length
+      ? `<strong>${num(foreign.length)} of the ${num(owners.length)}</strong> names listed
+         ${foreign.length === 1 ? "is a company" : "are companies"} based outside the United States:
+         ${foreign.map((o) => esc(o.display)).join(", ")}.`
+      : `None of the ${num(owners.length)} names listed is marked as a company based outside
+         the United States.`}</p>
+
+    <h3>Direct owners and top executives <span class="muted" style="font-weight:400">· Schedule A</span></h3>
+    ${direct.length ? `<table>
+      <thead><tr><th>Name</th><th>What it is</th><th>Role</th><th>Since</th>
+        <th>Owns</th><th>Has control</th></tr></thead>
+      <tbody>${direct.map((o) => `<tr>
+        <td>${name(o)}</td><td>${what(o)}</td>
+        <td>${esc((o.title || "—").toLowerCase())}</td><td>${esc(o.since || "—")}</td>
+        <td>${share(o)}</td><td>${yes(o.control)}</td></tr>`).join("")}</tbody></table>`
+      : '<p class="muted">None listed.</p>'}
+
+    <h3 style="margin-top:16px">Who owns those owners <span class="muted" style="font-weight:400">· Schedule B</span></h3>
+    ${indirect.length ? `<p class="muted" style="font-size:12.5px">Each row is one step up
+      the chain: the name on the left owns the share shown of the name in the “Of” column.</p>
+      <table>
+      <thead><tr><th>Name</th><th>What it is</th><th>Owns</th><th>Of</th><th>Since</th>
+        <th>Has control</th></tr></thead>
+      <tbody>${indirect.map((o) => `<tr>
+        <td>${name(o)}</td><td>${what(o)}</td><td>${share(o)}</td>
+        <td>${esc(o.through || "—")}</td><td>${esc(o.since || "—")}</td>
+        <td>${yes(o.control)}</td></tr>`).join("")}</tbody></table>`
+      : `<p class="muted">The firm lists no owners behind its owners. That is usual when
+         every direct owner is a person.</p>`}
+  </div>`;
+}
+
 async function viewAdviser(crd) {
   setBusy("Reading this firm's Form ADV from the SEC — the first time takes a few seconds…");
   const d = await api(`/v1/advisers/${encodeURIComponent(crd)}`);
   const s = d.snapshot || {};
-  const funds = s.funds || [];
+  // Highest foreign share first: on a firm with dozens of funds that is the
+  // column a reader came for, and alphabetical order buried it.
+  const funds = [...(s.funds || [])].sort((a, b) =>
+    (b.owned_by_non_us_pct ?? -1) - (a.owned_by_non_us_pct ?? -1)
+    || (b.gross_asset_value || 0) - (a.gross_asset_value || 0));
   const pct = (v) => (v === null || v === undefined ? "—" : `${v}%`);
+  const mostlyForeign = funds.filter((f) => (f.owned_by_non_us_pct ?? 0) > 50).length;
+  const abroad = funds.filter((f) => f.country && !/^united states$/i.test(f.country)).length;
+  const foreignOwners = (s.owners || []).filter((o) => o.foreign).length;
 
   view.innerHTML = `
     <div class="breadcrumb"><a href="#/portfolio">Portfolio</a> › Investment firm</div>
@@ -2106,19 +2256,29 @@ async function viewAdviser(crd) {
         ${s.filing_kind ? "(" + esc(s.filing_kind.toLowerCase()) + ")" : ""}</div>
     </div>
 
+    <div class="grid cols-4">
+      ${statCard("Private funds", s.funds_read ? num(funds.length) : "—")}
+      ${statCard("Funds more than half owned outside the U.S.", s.funds_read ? num(mostlyForeign) : "—")}
+      ${statCard("Funds set up outside the U.S.", s.funds_read ? num(abroad) : "—")}
+      ${statCard("Owners of the firm based outside the U.S.", s.owners_read ? num(foreignOwners) : "—")}
+    </div>
+
     <div class="card">
       <h2>Private funds this firm runs</h2>
       <p class="muted">From the firm's own filing — <strong>Schedule D, Section 7.B.(1)</strong>
       of Form ADV. A private fund is a pool of money collected from investors and invested
       on their behalf, often by buying companies. The last column is the share of each fund
-      owned by people or organisations based <strong>outside the United States</strong>.</p>
+      owned by people or organisations based <strong>outside the United States</strong>;
+      funds are listed with the highest share first. Who owns the firm itself is
+      <a href="#" id="to-owners">further down</a>.</p>
       ${s.funds_read ? (funds.length ? `<table>
         <thead><tr><th>Fund</th><th class="num">Money in the fund</th>
           <th class="num">Investors</th><th>Set up in</th>
           <th class="num">Owned outside the U.S.</th></tr></thead>
         <tbody>${funds.map((f) => `<tr>
           <td>${esc(f.name)}<div class="muted" style="font-size:11.5px">${esc(f.fund_id)}</div></td>
-          <td class="num">${f.gross_asset_value ? money(f.gross_asset_value) : "—"}</td>
+          <td class="num">${f.gross_asset_value === null || f.gross_asset_value === undefined
+            ? "—" : money(f.gross_asset_value)}</td>
           <td class="num">${f.investors === null ? "—" : num(f.investors)}</td>
           <td>${esc([f.state, f.country].filter(Boolean).join(", ") || "—")}</td>
           <td class="num"><strong>${pct(f.owned_by_non_us_pct)}</strong></td>
@@ -2130,6 +2290,8 @@ async function viewAdviser(crd) {
         <a class="linkish" href="${esc(d.links.form)}" target="_blank" rel="noopener noreferrer">Full Form ADV (PDF) →</a>
       </div>
     </div>
+
+    ${ownersCard(s, d.links)}
 
     ${(s.related_firms || []).length ? `<div class="card">
       <h2>Related firms</h2>
@@ -2152,6 +2314,10 @@ async function viewAdviser(crd) {
       <div class="actions"><button id="adv-refresh">Check for a new filing now</button></div>
     </div>`;
 
+  document.getElementById("to-owners").onclick = (e) => {
+    e.preventDefault();     // the page routes on the hash, so no #anchor links
+    document.getElementById("owners-card")?.scrollIntoView({ behavior: "smooth" });
+  };
   document.getElementById("adv-refresh").onclick = async () => {
     setBusy("Checking the SEC for a new filing…");
     await api(`/v1/advisers/${encodeURIComponent(crd)}?refresh=true`);

@@ -168,8 +168,25 @@ def notice_item(notice: dict, base_url: str) -> dict:
     }
 
 
+def watched_keys(store, entities: list[str]) -> list[str]:
+    """Each contractor key, plus the key its awards are filed under if different.
+
+    A portfolio built from typed names holds names; notices and SEC identities
+    are recorded against the screened contractor's UEI. Both are looked up, so
+    a company is followed whichever way it was added.
+    """
+    out: list[str] = []
+    for key in entities:
+        out.append(key)
+        resolved = store.resolve_entity_key(key)
+        if resolved != key:
+            out.append(resolved)
+    return list(dict.fromkeys(out))
+
+
 def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     crds, entities = split_keys(subscription["companies"])
+    entities = watched_keys(store, entities)
     ciks = store.confirmed_ciks(entities)
     sent = store.alert_already_sent(subscription["subscription_id"])
     items = [adv_item(c) for c in store.adv_changes(crds, limit=200)]
@@ -183,6 +200,7 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
 def baseline(store, subscription_id: str, companies: list[str]) -> int:
     """Mark everything already known as sent. Future changes only."""
     crds, entities = split_keys(companies)
+    entities = watched_keys(store, entities)
     ids = [f"adv:{c['change_id']}" for c in store.adv_changes(crds, limit=5000)]
     ciks = list(store.confirmed_ciks(entities))
     ids += [f"formd:{c['change_id']}" for c in store.formd_changes(ciks, limit=5000)]
@@ -205,7 +223,7 @@ def baseline_entity(store, entity_key: str) -> int:
     ids = [f"formd:{c['change_id']}" for c in store.formd_changes(ciks, limit=5000)]
     marked = 0
     for sub in store.alert_subscriptions():
-        if key in {c.upper() for c in sub["companies"]}:
+        if key in watched_keys(store, split_keys(sub["companies"])[1]):
             store.mark_alert_sent(sub["subscription_id"], ids)
             marked += len(ids)
     return marked
@@ -280,6 +298,7 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
         all_crds += crds
         all_entities += entities
     firms = refresh_advisers(store, adv, all_crds)
+    all_entities = watched_keys(store, all_entities)
     companies = (refresh_issuers(store, formd, list(store.confirmed_ciks(all_entities)))
                  if formd is not None else {})
 
