@@ -23,6 +23,12 @@ def _flag(name: str, default: bool = False) -> bool:
     return raw.lower() in _TRUE if raw else default
 
 
+def _switch(name: str) -> bool | None:
+    """A flag that can also be left alone: True, False, or None for not set."""
+    raw = _env(name)
+    return raw.lower() in _TRUE if raw else None
+
+
 def load_dotenv(path: str | Path = ".env") -> None:
     """Minimal .env loader so we don't take a dependency on python-dotenv."""
     p = Path(path)
@@ -70,10 +76,20 @@ class Config:
         default_factory=lambda: _flag("FOCI_INPROCESS_SCREENS", False))
 
     # --- portfolio email alerts ---
-    # Off until someone turns it on. With it off, every alert is still composed
-    # and shown in the app exactly as it would be sent — so it can be read and
-    # trusted before the first real email goes to anybody.
-    alerts_send: bool = field(default_factory=lambda: _flag("ALERTS_SEND", False))
+    # Alerts go to the addresses typed into a portfolio as soon as a mail
+    # service is connected below, and not before: with none, every alert is
+    # still composed and shown in the app exactly as it would be sent.
+    # ALERTS_SEND is the override — false keeps everything as a draft even
+    # with a service connected; true insists on sending and reports the
+    # missing service as a fault. Left unset, connecting a service is the
+    # decision to send.
+    alerts_send: bool | None = field(default_factory=lambda: _switch("ALERTS_SEND"))
+    # A mail service reached over HTTPS. This is the route that works on a
+    # free Render instance, which blocks the SMTP ports (25, 465, 587).
+    brevo_api_key: str = field(default_factory=lambda: _env("BREVO_API_KEY"))
+    resend_api_key: str = field(default_factory=lambda: _env("RESEND_API_KEY"))
+    # brevo | resend | smtp. Only needed when more than one is configured.
+    mail_provider: str = field(default_factory=lambda: _env("MAIL_PROVIDER"))
     smtp_host: str = field(default_factory=lambda: _env("SMTP_HOST"))
     smtp_port: int = field(default_factory=lambda: int(_env("SMTP_PORT", "587") or 587))
     smtp_user: str = field(default_factory=lambda: _env("SMTP_USER"))

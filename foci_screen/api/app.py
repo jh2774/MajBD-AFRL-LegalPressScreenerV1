@@ -36,6 +36,7 @@ from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
 from ..jobs import JobQueue
 from ..notify import render as render_notice
+from ..notify.mailer import LABEL as LABEL_OF_MAIL
 from ..notify.mailer import Mailer
 from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_available
 from . import auth
@@ -163,6 +164,11 @@ def deployment_warnings() -> list[str]:
             f"retire this notice.")
     if not on_sqlite and not postgres_driver_available():
         warnings.append(DRIVER_MISSING)
+    # Half-connected mail is the state worth a banner: alerts are being
+    # attempted and failing. No mail service at all is a choice, not a fault.
+    mail = Mailer(cfg).status()
+    if mail["mode"] == "misconfigured":
+        warnings.append("Email alerts: " + mail["explanation"])
     return warnings
 
 
@@ -216,10 +222,15 @@ def health() -> dict:
     ship, and any configuration warnings, so a misconfigured deployment can be
     diagnosed from outside without a key.
     """
+    mail = Mailer(cfg)
     return {"status": "ok", "version": VERSION, "queue": queue.backend,
             "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
             "authenticated": bool(keymap),
             "ephemeral_storage": storage_is_ephemeral(),
+            # Whether alert emails actually leave: send, redirect, draft or
+            # misconfigured — and through which service. No addresses, no keys.
+            "alerts": {"mode": mail.status()["mode"],
+                       "provider": LABEL_OF_MAIL.get(mail.transport, "")},
             "warnings": deployment_warnings()}
 
 
@@ -692,15 +703,36 @@ def delete_subscription(subscription_id: str,
     return Response(status_code=204)
 
 
+# One check at a time. Two running together — the daily schedule and someone
+# pressing "Check now" — would each find the same new items before either had
+# recorded sending them, and every recipient would get the email twice.
+_alerts_running = threading.Lock()
+
+
 @app.post("/v1/alerts/run", tags=["alerts"])
-def run_alerts(request: Request, store: Store = Depends(tenant_store)) -> dict:
+def run_alerts(request: Request, only_if_due: bool = Query(False),
+               store: Store = Depends(tenant_store)) -> dict:
     """Check every watched firm and company now and email what is new.
 
-    For a free instance with no cron, something outside has to call this —
-    the scheduled GitHub workflow in this repository does, once a day.
+    A free instance has no scheduler, so something has to ask. Two things do:
+    the scheduled GitHub workflow in this repository, once a day, and the
+    portfolio page, which asks with `only_if_due` each time it is opened — a
+    check then runs only if a list has gone most of a day without one. Either
+    alone keeps alerts flowing; together, a day nobody opens the site is
+    still covered.
     """
-    return alerts_engine.run_alerts(store, _adv(), Mailer(cfg), _base_url(request),
-                                    formd=_formd())
+    if only_if_due and not alerts_engine.is_due(store):
+        return {"status": "not due", "emails": []}
+    if not _alerts_running.acquire(blocking=False):
+        return {"status": "already running", "emails": [],
+                "detail": "A check is already under way. Its results will appear "
+                          "under Recent alerts when it finishes."}
+    try:
+        result = alerts_engine.run_alerts(store, _adv(), Mailer(cfg), _base_url(request),
+                                          formd=_formd())
+    finally:
+        _alerts_running.release()
+    return {"status": "checked", **result}
 
 
 @app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])

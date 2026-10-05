@@ -2044,11 +2044,12 @@ function deliveryRows(deliveries) {
   if (!deliveries.length) {
     return '<p class="muted" style="font-size:12.5px">No alerts yet. The first one is sent when something changes after the list is saved.</p>';
   }
-  const label = { sent: "sent", drafted: "written, not sent", failed: "failed" };
+  const label = { sent: "sent", drafted: "written, not sent", failed: "failed",
+                  partial: "sent to some" };
   return deliveries.map((d) => `
     <details style="margin:6px 0">
       <summary style="cursor:pointer;font-size:13px">
-        <span class="pill${d.status === "failed" ? " warn" : ""}">${esc(label[d.status] || d.status)}</span>
+        <span class="pill${["failed", "partial"].includes(d.status) ? " warn" : ""}">${esc(label[d.status] || d.status)}</span>
         ${esc(d.subject)} <span class="muted">· ${esc(day(d.created_at))}
         · to ${esc(d.recipients.join(", "))}</span></summary>
       ${d.detail ? `<p class="muted" style="font-size:12px">${esc(d.detail)}</p>` : ""}
@@ -2099,15 +2100,55 @@ async function alertsCard(key, portfolioName) {
       </div>
       <p class="muted" id="alert-status" style="font-size:12.5px;margin-top:8px">
         ${list && list.last_run_at ? `Last checked ${esc(day(list.last_run_at))}.` : ""}</p>
+      ${list ? `<p class="muted" style="font-size:12px">A check runs when this page is
+        opened and the last one was most of a day ago, and once a day on its own if the
+        daily schedule has been set up. “Check now” runs one immediately.</p>` : ""}
 
       ${list ? `<h3 style="margin-top:14px">Recent alerts</h3>${deliveryRows(deliveries)}` : ""}
     </div>`;
+}
+
+/* What a check did, for the line under the buttons. */
+function describeCheck(r, portfolioName) {
+  if (r.status === "already running") return r.detail;
+  const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
+  const checked = `Checked ${r.firms_checked} investment firm(s) and `
+    + `${r.companies_checked || 0} contractor(s) with an SEC record.`;
+  if (mine.status === "nothing new" || !mine.status) {
+    return `${checked} Nothing new since the last alert.`;
+  }
+  const outcome = {
+    sent: "emailed to this list",
+    drafted: "written but not sent",
+    partial: "emailed to some of this list — see Recent alerts",
+    failed: "could not be sent, and will be tried again — see Recent alerts",
+  }[mine.status] || mine.status;
+  return `${checked} ${mine.items || 0} update(s), ${outcome}.`;
+}
+
+/* A free instance has no clock of its own to run a daily check, so opening the
+ * portfolio asks for one. The server runs it only if this list has gone most
+ * of a day without, and the page does not wait: the answer, when it comes,
+ * updates the line under the buttons. */
+let dueCheckAsked = 0;
+function checkIfDue(portfolioName) {
+  if (Date.now() - dueCheckAsked < 10 * 60 * 1000) return;   // once per visit, not per redraw
+  dueCheckAsked = Date.now();
+  apiPost("/v1/alerts/run?only_if_due=true", {}).then((r) => {
+    if (r.status !== "checked") return;
+    const status = document.getElementById("alert-status");
+    if (!status) return;                // the reader has moved to another page
+    const changed = (r.emails || []).some((e) => e.status !== "nothing new");
+    if (changed) viewPortfolio();       // new entries under Recent alerts
+    else status.textContent = describeCheck(r, portfolioName);
+  }).catch(() => { /* the daily schedule and "Check now" remain */ });
 }
 
 function wireAlerts(key, portfolioName) {
   const status = document.getElementById("alert-status");
   const save = document.getElementById("alert-save");
   if (!save) return;
+  if (document.getElementById("alert-run")) checkIfDue(portfolioName);
   save.onclick = async () => {
     save.disabled = true;
     try {
@@ -2132,13 +2173,9 @@ function wireAlerts(key, portfolioName) {
       status.textContent = "Checking every firm and contractor in the portfolio…";
       try {
         const r = await apiPost("/v1/alerts/run", {});
-        const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
-        const checked = `Checked ${r.firms_checked} investment firm(s) and `
-          + `${r.companies_checked || 0} contractor(s) with an SEC record.`;
-        status.textContent = mine.status === "nothing new"
-          ? `${checked} Nothing new since the last alert.`
-          : `${checked} ${mine.items || 0} update(s): ${mine.status}.`;
-        setTimeout(viewPortfolio, 1500);
+        status.textContent = describeCheck(r, portfolioName);
+        if (r.status === "already running") { run.disabled = false; return; }
+        setTimeout(viewPortfolio, 2500);
       } catch (e) {
         run.disabled = false;
         status.textContent = e.message || String(e);
@@ -2148,10 +2185,13 @@ function wireAlerts(key, portfolioName) {
       status.textContent = "Sending a test…";
       try {
         const r = await apiPost(`/v1/alerts/subscriptions/${encodeURIComponent(savedAlertListId())}/test`, {});
-        status.textContent = r.status === "sent"
-          ? `Test sent to ${r.recipients.join(", ")}.`
-          : `Test ${r.status}: ${r.detail}`;
-        setTimeout(viewPortfolio, 1500);
+        status.textContent = {
+          sent: `Test sent to ${r.recipients.join(", ")}. It can take a minute to arrive; check spam too.`,
+          drafted: `Test written but not sent: ${r.detail}`,
+          partial: `Test sent to some addresses only. ${r.detail}`,
+          failed: `Test not sent. ${r.detail}`,
+        }[r.status] || `Test ${r.status}: ${r.detail}`;
+        setTimeout(viewPortfolio, 4000);
       } catch (e) {
         status.textContent = e.message || String(e);
       }

@@ -691,10 +691,23 @@ changed, what it is, and where to look. **No analysis**; the reader decides.
 * Everything already known when a list is saved is treated as sent, so the first email is about
   something that happens *next*, not the firm's history presented as news.
 * Each item goes to each list once. A failed send is retried next time.
-* **Sending is off until `ALERTS_SEND=true`.** Until then, every alert is written and shown on
-  the Portfolio page exactly as it would be sent. `FOCI_EMAIL_REDIRECT_TO` still applies, so a
+* **Connecting a mail service is what turns sending on.** With none, every alert is written and
+  shown on the Portfolio page exactly as it would be sent, and nothing leaves. Setting
+  `BREVO_API_KEY` and `ALERTS_FROM` is enough to send; `ALERTS_SEND=false` holds everything as
+  a draft again without disconnecting anything. `FOCI_EMAIL_REDIRECT_TO` still applies, so a
   pilot can route every alert to one person first.
-* On the free plan, a GitHub Actions workflow triggers the daily check. DEPLOY.md has the setup.
+* Mail goes over HTTPS (Brevo or Resend) because **Render's free plan blocks the SMTP ports**
+  (25, 465, 587), so Gmail or Outlook cannot be reached from a free instance. Plain SMTP is
+  still supported for a paid instance, or on port 2525 where a relay offers it.
+* Each person on a list gets their own copy and is not shown the other addresses. One refused
+  address does not hold up the rest: the alert is logged as *sent to some*, naming the address
+  and the reason, and is not sent again to the people it reached.
+* A check runs when the Portfolio page is opened and the last one was most of a day ago, and
+  once a day from a GitHub Actions workflow if that is set up. Two checks never run at once.
+* `GET /health` reports whether alerts actually leave (`send`, `redirect`, `draft` or
+  `misconfigured`) and through which service, without a key and without naming any address.
+
+DEPLOY.md, "Turning on email alerts", has the steps.
 
 ## Choosing what to screen for, and what raises a notice
 

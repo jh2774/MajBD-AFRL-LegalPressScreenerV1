@@ -352,7 +352,7 @@ def test_search_puts_companies_first_and_describes_them():
 # ------------------------------------------------------------ alerts, end to end
 
 class FakeCfg:
-    alerts_send = False
+    alerts_send = None
     smtp_host = ""
     smtp_port = 587
     smtp_user = ""

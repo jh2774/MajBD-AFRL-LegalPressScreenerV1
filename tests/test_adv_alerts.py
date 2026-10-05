@@ -470,7 +470,9 @@ def test_a_reading_by_an_older_reader_is_not_compared_field_by_field():
 # ------------------------------------------------------------ alerts, end to end
 
 class FakeCfg:
-    alerts_send = False
+    """Nothing set: no mail service, so alerts are written and not sent.
+    The mailer itself is tested in test_mailer.py."""
+    alerts_send = None
     smtp_host = ""
     smtp_port = 587
     smtp_user = ""
@@ -582,70 +584,6 @@ def test_a_flagged_contractor_in_the_portfolio_is_included(store):
     assert "https://site.example/#/entity/UEI123" in delivery["body_text"]
 
 
-# -------------------------------------------------------------------- mailer
-
-class FakeSMTP:
-    sent: list = []
-
-    def __init__(self, host, port, timeout=30):
-        self.host, self.port = host, port
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
-
-    def starttls(self, context=None):
-        pass
-
-    def login(self, user, password):
-        pass
-
-    def send_message(self, message):
-        FakeSMTP.sent.append(message)
-
-
-def sending_cfg(**kw):
-    cfg = FakeCfg()
-    cfg.alerts_send = True
-    cfg.smtp_host, cfg.smtp_user, cfg.smtp_password = "smtp.example", "me@example.com", "pw"
-    for k, v in kw.items():
-        setattr(cfg, k, v)
-    return cfg
-
-
-def test_sending_is_off_by_default():
-    d = Mailer(FakeCfg()).send(["ko@agency.gov"], "s", "t")
-    assert d.status == "drafted"
-
-
-def test_a_configured_mailer_sends(monkeypatch):
-    FakeSMTP.sent = []
-    monkeypatch.setattr("smtplib.SMTP", FakeSMTP)
-    d = Mailer(sending_cfg()).send(["ko@agency.gov", "ko@agency.gov"], "Subject", "Body")
-    assert d.status == "sent"
-    assert FakeSMTP.sent[0]["To"] == "ko@agency.gov", "duplicates collapse"
-
-
-def test_the_pilot_redirect_still_applies(monkeypatch):
-    """The safety valve that governs notices to contracting officers governs
-    these too: while it is set, one person reads everything first."""
-    FakeSMTP.sent = []
-    monkeypatch.setattr("smtplib.SMTP", FakeSMTP)
-    d = Mailer(sending_cfg(email_redirect_to="me@example.com")).send(
-        ["ko@agency.gov"], "Alert", "Body")
-    assert d.recipients == ["me@example.com"]
-    assert "[for ko@agency.gov]" in FakeSMTP.sent[0]["Subject"]
-
-
-def test_the_status_says_what_will_happen():
-    assert Mailer(FakeCfg()).status()["mode"] == "draft"
-    cfg = FakeCfg()
-    cfg.alerts_send = True
-    assert Mailer(cfg).status()["mode"] == "misconfigured"
-
-
 # ----------------------------------------------------------------------- API
 
 @pytest.fixture()
@@ -689,7 +627,7 @@ def test_the_alerts_page_says_sending_is_off(client):
     c, _ = client
     body = c.get("/v1/alerts", headers=AUTH).json()
     assert body["sending"]["mode"] == "draft"
-    assert "ALERTS_SEND" in body["sending"]["explanation"]
+    assert "no mail service is connected" in body["sending"]["explanation"]
 
 
 def test_alert_routes_need_a_key(client):

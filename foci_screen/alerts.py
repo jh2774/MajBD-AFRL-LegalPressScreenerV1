@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import html as html_lib
 import logging
+from datetime import datetime, timedelta, timezone
 
 from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
@@ -287,6 +288,29 @@ def compose(subscription: dict, items: list[dict]) -> tuple[str, str, str]:
 
 # ------------------------------------------------------------------- the run
 
+# How stale a list may get before opening its portfolio triggers a check. Under
+# a day, so someone who looks every morning gets a check every morning.
+DUE_AFTER_HOURS = 20
+
+
+def is_due(store, hours: float = DUE_AFTER_HOURS) -> bool:
+    """Whether any active list has gone unchecked for longer than `hours`."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    for s in store.alert_subscriptions(active_only=True):
+        last = s.get("last_run_at")
+        if not last:
+            return True
+        try:
+            when = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+        except ValueError:
+            return True
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if when < cutoff:
+            return True
+    return False
+
+
 def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
                formd: FormDConnector | None = None) -> dict:
     """Refresh every watched firm and company, then email each portfolio what is new."""
@@ -317,8 +341,11 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
             subscription_id=s["subscription_id"], recipients=delivery.recipients,
             subject=subject, body_text=text, item_count=len(items),
             status=delivery.status, detail=delivery.detail)
-        # A failed send is retried next run; drafted and sent are both "said".
-        if delivery.status in ("sent", "drafted"):
+        # A failed send — nobody reached — is retried next run. Drafted and
+        # sent are both "said". So is partial: sending again would give the
+        # people it reached a second copy, and the address it missed is named
+        # in the log for someone to correct, which a retry would not do.
+        if delivery.status in ("sent", "drafted", "partial"):
             store.mark_alert_sent(s["subscription_id"], [i["item_id"] for i in items])
         summary["emails"].append({"subscription": s["name"], "status": delivery.status,
                                   "items": len(items), "detail": delivery.detail})

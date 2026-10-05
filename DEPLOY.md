@@ -385,50 +385,98 @@ which machine spends the minutes.
 
 ## Turning on email alerts
 
-Alerts are written from the start and shown on the Portfolio page exactly as they would be
-sent — but **no email leaves until you switch it on**. Read a few first.
+Alerts go to the addresses typed into a portfolio's **Email alerts** box. Until a mail service
+is connected, every alert is still written and shown on the Portfolio page exactly as it would
+be sent, and nothing leaves. **Connecting a mail service is what turns sending on.**
 
-**1. A mail account to send from.** Any provider that offers SMTP works. The simplest:
+**Why not just Gmail.** Since September 2025, Render's free web services cannot connect to the
+ports ordinary email uses (25, 465 and 587). Gmail and Outlook only accept mail on those ports,
+so from a free instance they time out however they are configured. A mail service that accepts
+messages as an ordinary web request is not affected, and that is the route below.
 
-| Provider | `SMTP_HOST` | `SMTP_PORT` | Notes |
-|---|---|---|---|
-| Gmail | `smtp.gmail.com` | `587` | Needs an *app password* (Google Account → Security), not your normal one |
-| Outlook / Microsoft 365 | `smtp.office365.com` | `587` | App password if the account has two-step sign-in |
-| Resend, SendGrid, Postmark | from their dashboard | `587`, or `2587`/`2525` | Better for volume; verify a sending domain |
+### 1. Create a free Brevo account (about ten minutes)
 
-**2. On Render** → the service → **Environment**, add:
+[Brevo](https://www.brevo.com) sends up to 300 emails a day on its free plan and does not
+need you to own a domain.
+
+1. Sign up, and confirm your own email address when it asks.
+2. **Add the address alerts will come from.** In Brevo: your organisation name (top right) →
+   **Senders, domains, IPs** → **Senders** → **Add a sender**. Enter a name ("FOCI-Screener")
+   and an address you can read. Brevo emails that address a code or link; confirm it.
+   Recipients' replies go to this address.
+3. **Create an API key.** Organisation name → **SMTP & API** → **API keys** → **Generate a new
+   API key**. Copy it. It is shown once.
+4. **Stop Brevo blocking the site later.** Brevo records which internet addresses use a key,
+   and after about a month starts refusing any it has not seen. A Render free instance has no
+   fixed address, so alerts would work at first and then begin to fail. Organisation name →
+   **Settings → Security → Authorised IPs → Deactivate blocking**. If this is ever the cause,
+   the failed alert says "unrecognised IP address" and links to that same page.
+
+Brevo rearranges its menus from time to time. The three things to end up with are a confirmed
+sender address, an API key, and blocking of unknown addresses switched off.
+
+### 2. Give the site the key
+
+On Render → the service → **Environment**, add:
 
 | Key | Value |
 |---|---|
-| `ALERTS_SEND` | `true` |
-| `SMTP_HOST` | from the table above |
-| `SMTP_PORT` | `587` |
-| `SMTP_USER` | the sending account's address |
-| `SMTP_PASSWORD` | its app password — kept as a secret on Render, never in the repository |
-| `ALERTS_FROM` | the address alerts come from (usually the same as `SMTP_USER`) |
+| `BREVO_API_KEY` | the key from step 3, kept as a secret on Render, never in the repository |
+| `ALERTS_FROM` | the sender address you confirmed in step 2 |
 | `FOCI_PUBLIC_URL` | `https://contractwatcher-4wxb.onrender.com`, so links in alerts point at the site |
 
-Save; the service restarts. The Portfolio page's alert card then says *"Sending is on"*.
+Save; the service restarts. That is all that is needed to send.
 
-If sending fails with a connection error, the host may be blocking port 587 — try `2587` or
-`2525`, which most providers also listen on for exactly this reason.
+### 3. Check it
 
-**While you are still reading them first**, also set `FOCI_EMAIL_REDIRECT_TO` to your own
-address. Every alert then comes to you, with the intended recipients named in the subject line.
-Clear it when you trust what they say.
+* Open the **Portfolio** page. The Email alerts box should now say *"Sending is on: alerts go
+  to the addresses on this list, from … through Brevo."*
+* Press **Send a test email**. The line under the buttons says what happened. If it failed, it
+  gives the mail service's own reason.
+* Without signing in, `https://contractwatcher-4wxb.onrender.com/health` shows
+  `"alerts": {"mode": "send", "provider": "Brevo"}`. `draft` means no service is connected;
+  `misconfigured` means one is half-connected, and the `warnings` list says what is missing.
 
-**3. A daily check.** A free instance has no scheduler of its own, so the repository includes
-`.github/workflows/alerts.yml`, which asks the site to check once a day at 12:15 UTC. On GitHub
-→ the repository → **Settings → Secrets and variables → Actions**, add:
+**To read alerts yourself first**, also set `FOCI_EMAIL_REDIRECT_TO` to your own address. Every
+alert then comes to you alone, with the intended recipients named in the subject line. Remove
+it when you are happy with what they say. To stop sending without disconnecting anything, set
+`ALERTS_SEND` to `false`.
 
-* a **variable** `FOCI_SITE_URL` = `https://contractwatcher-4wxb.onrender.com`
-* a **secret** `FOCI_ALERTS_KEY` = your API key — the part after `default:`
+Each person on a list gets their own copy and does not see the other addresses. If one address
+is refused, the others still get theirs, and the Portfolio page lists the alert as *sent to
+some* with the address and the reason.
 
-It does nothing until both exist. **Actions → Daily alerts → Run workflow** runs it by hand. The
-Portfolio page's **Check now** button does the same thing from the browser.
+A personal address such as a Gmail one works as the sender, but mail from it sent through a
+third party is more likely to land in spam. An address on a domain your organisation controls,
+authenticated in Brevo under **Domains**, delivers better.
 
-GitHub pauses scheduled workflows in a repository with no commits for 60 days; a push, or
-re-enabling it on the Actions tab, starts it again.
+### 4. When checks happen
+
+A free instance has no scheduler. Two things ask it to check, and either is enough:
+
+* **Opening the Portfolio page.** If a list has gone most of a day without a check, one runs in
+  the background. Nothing to set up.
+* **A daily schedule**, for days nobody opens the site. The repository includes
+  `.github/workflows/alerts.yml`, which asks the site to check at 12:15 UTC every day. On GitHub
+  → the repository → **Settings → Secrets and variables → Actions**, add:
+  * a **variable** `FOCI_SITE_URL` = `https://contractwatcher-4wxb.onrender.com`
+  * a **secret** `FOCI_ALERTS_KEY` = your API key — the part after `default:`
+
+  It does nothing until both exist. **Actions → Daily alerts → Run workflow** runs it by hand.
+  GitHub pauses scheduled workflows in a repository with no commits for 60 days; a push, or
+  re-enabling it on the Actions tab, starts it again.
+
+The **Check now** button runs a check immediately. Two checks never run at once, so the
+schedule and a button press cannot send the same alert twice.
+
+### Other mail services
+
+| Service | Settings | Notes |
+|---|---|---|
+| Resend | `RESEND_API_KEY`, `ALERTS_FROM` | Also HTTPS. Needs a domain you control. |
+| Any SMTP relay | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `ALERTS_FROM` | On Render's free plan use port `2525` where the service offers it; 25, 465 and 587 are blocked there. On a paid instance any port works, including Gmail on 587 with an app password. |
+
+If more than one is set, `MAIL_PROVIDER` (`brevo`, `resend` or `smtp`) picks.
 
 ## Costs and gotchas
 
