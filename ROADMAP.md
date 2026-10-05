@@ -269,9 +269,12 @@ Ordered by how much they limit the tool today.
    a reviewer can confirm, correct or reject it; both verdicts outrank the matcher permanently,
    and rejection actively stops attribution rather than merely leaving it unreviewed.
 
-   Still open: **CAGE and CRD**. IAPD adviser matching is still by name each run, and there is
-   no CAGE crosswalk at all. Both want SAM.gov (item 2) as the authoritative seed rather than
-   another similarity score.
+   Still open: **CAGE and CRD**. IAPD is now asked about the contractor's 13D/13G holders
+   rather than its own name, and only an exact match (legal suffixes aside) is accepted, with
+   its CRD kept on the record. What is missing is the link from a holding company to its
+   registered advisers — FMR LLC and BlackRock, Inc. have no IAPD record of their own. There
+   is still no CAGE crosswalk. Both want an authoritative seed rather than another
+   similarity score.
 7. ~~**Feedback loop.**~~ **Done.** Verdicts are recorded per signal (`POST /v1/dispositions`),
    keyed on a hash of rule plus evidence so rewording a rule does not orphan them, and
    `GET /v1/rules/precision` reports precision per rule, worst first. The UI collects them
