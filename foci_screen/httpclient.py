@@ -8,6 +8,7 @@ cache so re-running a screen doesn't re-hammer the same URLs.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import threading
@@ -25,6 +26,11 @@ except Exception:  # pragma: no cover - optional
     pass
 
 log = logging.getLogger("foci.http")
+
+# Counted across every client in the process: most are made for one request
+# and thrown away, so a per-client count would never reach the threshold.
+_cache_writes = itertools.count(1)
+PRUNE_EVERY = 25
 
 
 class RateLimiter:
@@ -70,6 +76,39 @@ class HttpClient:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+    def prune_cache(self) -> int:
+        """Delete expired responses, then the oldest, until under the size cap.
+
+        Nothing else ever removed a cache file: one past its lifetime was
+        ignored when read and left where it was. On a disk that is an untidy
+        directory. On Cloud Run there is no disk — files in the container are
+        held in the instance's memory — so it is a leak that ends with the
+        instance being killed for exceeding its limit, mid-screen.
+        """
+        limit = max(1, int(getattr(self.cfg, "cache_max_mb", 256) or 256)) * 1024 * 1024
+        now, kept, removed = time.time(), [], 0
+        for path in self.cache_dir.glob("*.json"):
+            try:
+                stat = path.stat()
+                if now - stat.st_mtime > self.cfg.cache_ttl_seconds:
+                    path.unlink()
+                    removed += 1
+                else:
+                    kept.append((stat.st_mtime, stat.st_size, path))
+            except OSError:
+                continue            # another thread got there first
+        total = sum(size for _, size, _ in kept)
+        for _, size, path in sorted(kept):
+            if total <= limit:
+                break
+            try:
+                path.unlink()
+                removed += 1
+            except OSError:
+                pass
+            total -= size
+        return removed
 
     # ----------------------------------------------------------------- request
     def request(self, method: str, url: str, *, json_body: Any = None,
@@ -139,6 +178,8 @@ class HttpClient:
                     path.write_text(json.dumps(payload), encoding="utf-8")
                 except Exception:
                     pass
+                if next(_cache_writes) % PRUNE_EVERY == 0:
+                    self.prune_cache()
             return payload
 
         self.stats["errors"] += 1

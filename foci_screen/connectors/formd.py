@@ -34,6 +34,7 @@ import re
 import xml.etree.ElementTree as ET
 from dataclasses import asdict, dataclass, field
 
+from . import edgar_codes
 from .adv import money
 
 log = logging.getLogger("foci.formd")
@@ -50,23 +51,18 @@ FORMS = ("D", "D/A")
 # read: they are history, and the page only needs the recent picture.
 MAX_FILINGS = 25
 
-# EDGAR's codes for places in the United States — the fifty states, D.C., the
-# territories, and X1 ("UNITED STATES"). Every other code is a province or a
-# country. XX ("UNKNOWN") is neither, and is not called foreign.
-US_CODES = frozenset("""
-    AL AK AZ AR CA CO CT DE DC FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS
-    MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI
-    WY X1 PR GU VI 1V 2J B5
-""".split())
-
-
 def cik10(cik: str | int) -> str:
     return str(int(str(cik).strip())).zfill(10)
 
 
 def is_outside_us(code: str) -> bool:
+    """Whether an EDGAR place code is a province or country, not a U.S. one.
+
+    The table is `edgar_codes`, the SEC's own. A missing code, and XX
+    ("UNKNOWN"), are neither here nor abroad, and are not called foreign.
+    """
     code = (code or "").strip().upper()
-    return bool(code) and code != "XX" and code not in US_CODES
+    return bool(code) and code != "XX" and not edgar_codes.is_domestic(code)
 
 
 # ----------------------------------------------------------------- the record

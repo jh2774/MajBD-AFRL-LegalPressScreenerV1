@@ -151,6 +151,9 @@ class JobQueue:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self._queue = None
+        # Screens running as threads in this process, by run id.
+        self._threads: dict[str, threading.Thread] = {}
+        self._threads_lock = threading.Lock()
         if cfg.redis_url:
             try:
                 from redis import Redis
@@ -192,14 +195,31 @@ class JobQueue:
             log.debug("could not count workers: %s", exc)
             return None
 
-    def enqueue(self, tenant_id: str, run_id: str, options: dict) -> None:
+    def enqueue(self, tenant_id: str, run_id: str, options: dict, *,
+                hold_url: str = "", hold_token: str = "") -> None:
+        """Start a screen. `hold_url` is this service's own hold endpoint for
+        the run; when given, a request is kept open against it for as long as
+        the screen is running in this process — see `_hold_open`."""
         if self._queue is not None:
             self._queue.enqueue(run_screen_job, tenant_id, run_id, options,
                                 job_id=run_id, job_timeout=self.cfg.job_timeout)
             return
-        threading.Thread(
+        worker = threading.Thread(
             target=_thread_target, args=(tenant_id, run_id, options),
-            name=f"screen-{run_id}", daemon=True).start()
+            name=f"screen-{run_id}", daemon=True)
+        with self._threads_lock:
+            self._threads = {k: t for k, t in self._threads.items() if t.is_alive()}
+            self._threads[run_id] = worker
+        worker.start()
+        if hold_url:
+            threading.Thread(target=_hold_open, args=(hold_url, hold_token, worker.is_alive),
+                             name=f"hold-{run_id}", daemon=True).start()
+
+    def is_running(self, run_id: str) -> bool:
+        """Whether this process has a thread working on the run right now."""
+        with self._threads_lock:
+            worker = self._threads.get(run_id)
+        return bool(worker and worker.is_alive())
 
 
 def _thread_target(tenant_id: str, run_id: str, options: dict) -> None:
@@ -209,3 +229,49 @@ def _thread_target(tenant_id: str, run_id: str, options: dict) -> None:
         # Already recorded on the run row by run_screen_job; this keeps a dead
         # thread from printing an unhandled-exception traceback to the log.
         log.debug("threaded screen %s ended in failure", run_id)
+
+
+# How long one hold request stays open. Under Cloud Run's default request
+# timeout of five minutes, with room to spare.
+HOLD_SECONDS = 240
+
+
+def _hold_open(url: str, token: str, still_running) -> None:
+    """Keep a request open against this same service while a screen runs.
+
+    A screen runs in a background thread after its request has been answered,
+    and a managed host does not count that as work. Cloud Run gives the
+    container processor time only while a request is in flight, so the thread
+    would be starved to a crawl; Render's free plan, and Cloud Run again, shut
+    an instance down once it has gone a few minutes without traffic, so a long
+    screen would be cut off. Both treat an open request as work in progress.
+    So for as long as the screen runs, the service holds one request open to
+    itself: the endpoint simply waits, and this asks again each time it
+    returns. It costs one idle connection, and on Cloud Run it means the
+    service is billed for the minutes a screen takes and no others.
+
+    Stops with the screen. If the service cannot reach itself, it gives up
+    quietly — the screen is then no worse off than before this existed.
+    """
+    import time
+
+    import requests
+
+    failures = 0
+    while still_running():
+        started = time.monotonic()
+        try:
+            requests.get(url, headers={"X-Hold-Token": token}, timeout=HOLD_SECONDS + 30)
+            failures = 0
+        except requests.RequestException as exc:
+            failures += 1
+            log.debug("hold request failed (%s)", type(exc).__name__)
+            if failures >= 5:
+                log.info("could not keep a request open against %s; the screen "
+                         "continues without it", url.split("/internal/")[0])
+                return
+        # An answer that came straight back did not hold anything — a different
+        # instance took it, or the address is wrong. Do not spin on it. (A real
+        # hold lasts minutes, or ends because the screen did.)
+        if time.monotonic() - started < 1 and still_running():
+            time.sleep(15)

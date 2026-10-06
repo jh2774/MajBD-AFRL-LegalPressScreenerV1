@@ -14,7 +14,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
+import secrets
 import threading
+import time
 from importlib import metadata
 from pathlib import Path
 
@@ -34,7 +37,7 @@ from ..connectors.formd import COMPANY_URL as EDGAR_COMPANY_URL
 from ..connectors.formd import READABLE_URL as FORMD_READABLE_URL
 from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
-from ..jobs import JobQueue
+from ..jobs import HOLD_SECONDS, JobQueue
 from ..notify import render as render_notice
 from ..notify.mailer import LABEL as LABEL_OF_MAIL
 from ..notify.mailer import Mailer
@@ -152,16 +155,23 @@ def deployment_warnings() -> list[str]:
             "will be accepted, queued, and never run. Start the worker service, "
             "or unset REDIS_URL to run them in this process instead.")
     elif queue.backend == "thread" and host and not cfg.inprocess_screens_ok:
+        held = cfg.keep_awake is not False
         warnings.append(
             f"Screens run inside the web process on {host}, because no REDIS_URL "
-            f"is set. Each one keeps whatever it has finished — contractors are "
-            f"saved as they are screened — but a screen still in progress ends "
-            f"if the instance restarts or spins down while idle, and is marked "
-            f"interrupted. A worker service is the durable answer; where one is "
-            f"not available, keep screens small enough to finish, or run them "
-            f"from the command line against this database. Set "
-            f"FOCI_INPROCESS_SCREENS=true to record that as a decision and "
-            f"retire this notice.")
+            f"is set. "
+            + (f"While one runs, the service keeps a request open to itself, so "
+               f"{host} neither starves it of processor time nor shuts the "
+               f"instance down as idle. " if held else
+               "FOCI_KEEP_AWAKE is off, so a screen can be starved or cut short "
+               "when the instance goes idle. ")
+            + "Each one keeps whatever it has finished — contractors are saved as "
+              "they are screened — but a screen still in progress ends if the "
+              "instance is replaced, by a deploy for instance, and is marked "
+              "interrupted. A worker service is the durable answer; where one is "
+              "not available, keep screens small enough to finish, or run them "
+              "from the command line against this database. Set "
+              "FOCI_INPROCESS_SCREENS=true to record that as a decision and "
+              "retire this notice.")
     if not on_sqlite and not postgres_driver_available():
         warnings.append(DRIVER_MISSING)
     # Half-connected mail is the state worth a banner: alerts are being
@@ -224,6 +234,11 @@ def health() -> dict:
     """
     mail = Mailer(cfg)
     return {"status": "ok", "version": VERSION, "queue": queue.backend,
+            # Which platform answered, and which deploy of it. During a move
+            # between hosts this is how to tell the old site from the new one
+            # at a glance; K_REVISION is Cloud Run's name for a deploy.
+            "host": cfg.managed_host or "self-hosted",
+            "revision": os.environ.get("K_REVISION", ""),
             "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
             "authenticated": bool(keymap),
             "ephemeral_storage": storage_is_ephemeral(),
@@ -246,7 +261,8 @@ def configuration(tenant: str = Depends(require_tenant)) -> dict:
 # ---------------------------------------------------------------- screens
 
 @app.post("/v1/screens", status_code=202, tags=["screens"])
-def create_screen(body: ScreenRequest, tenant: str = Depends(require_tenant)) -> dict:
+def create_screen(body: ScreenRequest, request: Request,
+                  tenant: str = Depends(require_tenant)) -> dict:
     store = store_for(tenant)
     options = body.model_dump()
     # The run row's subject is what identifies it in the history and in the
@@ -254,8 +270,38 @@ def create_screen(body: ScreenRequest, tenant: str = Depends(require_tenant)) ->
     # blank would leave a run nobody can tell apart from the next one.
     subject = body.recipient or body.agency
     run_id = store.start_run(subject, options, status="queued")
-    queue.enqueue(tenant, run_id, options)
+    queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
     return {"run_id": run_id, "status": "queued", "backend": queue.backend}
+
+
+# ------------------------------------------------- staying awake for a screen
+#
+# See jobs._hold_open for why. The token is made fresh each time the process
+# starts and never leaves it except in the service's requests to itself, so
+# the endpoint is no use to anyone else: without the token it is a 404.
+
+_hold_token = secrets.token_urlsafe(24)
+
+
+def _hold_for(run_id: str, request: Request) -> dict:
+    """The hold address for a run, or nothing where holding is not wanted."""
+    wanted = cfg.keep_awake if cfg.keep_awake is not None else bool(cfg.managed_host)
+    if not wanted or queue.backend != "thread":
+        return {}
+    return {"hold_url": f"{_base_url(request)}/internal/hold/{run_id}",
+            "hold_token": _hold_token}
+
+
+@app.get("/internal/hold/{run_id}", include_in_schema=False)
+def hold_for_screen(run_id: str, request: Request) -> dict:
+    """Wait while this process is running the screen, then say whether it still is."""
+    given = request.headers.get("x-hold-token", "")
+    if not secrets.compare_digest(given, _hold_token):
+        raise HTTPException(404, "Not Found")
+    deadline = time.monotonic() + HOLD_SECONDS
+    while queue.is_running(run_id) and time.monotonic() < deadline:
+        time.sleep(1)
+    return {"running": queue.is_running(run_id)}
 
 
 @app.get("/v1/screens", tags=["screens"])
@@ -721,15 +767,24 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
     alone keeps alerts flowing; together, a day nobody opens the site is
     still covered.
     """
+    busy = {"status": "already running", "emails": [],
+            "detail": "A check is already under way. Its results will appear "
+                      "under Recent alerts when it finishes."}
     if only_if_due and not alerts_engine.is_due(store):
         return {"status": "not due", "emails": []}
     if not _alerts_running.acquire(blocking=False):
-        return {"status": "already running", "emails": [],
-                "detail": "A check is already under way. Its results will appear "
-                          "under Recent alerts when it finishes."}
+        return busy
     try:
-        result = alerts_engine.run_alerts(store, _adv(), Mailer(cfg), _base_url(request),
-                                          formd=_formd())
+        # The lock above covers this process. A host that scales out runs
+        # several, and each has its own copy of it; the database lock is the
+        # one they share.
+        if not store.try_lock("alerts"):
+            return busy
+        try:
+            result = alerts_engine.run_alerts(store, _adv(), Mailer(cfg),
+                                              _base_url(request), formd=_formd())
+        finally:
+            store.unlock("alerts")
     finally:
         _alerts_running.release()
     return {"status": "checked", **result}
@@ -1241,7 +1296,8 @@ def list_watchlists(store: Store = Depends(tenant_store)) -> dict:
 
 
 @app.post("/v1/watchlists/{watchlist_id}/run", status_code=202, tags=["watchlists"])
-def run_watchlist(watchlist_id: str, tenant: str = Depends(require_tenant)) -> dict:
+def run_watchlist(watchlist_id: str, request: Request,
+                  tenant: str = Depends(require_tenant)) -> dict:
     store = store_for(tenant)
     rows = [w for w in store.list_watchlists() if w["watchlist_id"] == watchlist_id]
     if not rows:
@@ -1249,7 +1305,7 @@ def run_watchlist(watchlist_id: str, tenant: str = Depends(require_tenant)) -> d
     options = _json(rows[0]["params"])
     run_id = store.start_run(options.get("agency", ""), options, status="queued")
     store.mark_watchlist_run(watchlist_id, run_id)
-    queue.enqueue(tenant, run_id, options)
+    queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
     return {"run_id": run_id, "status": "queued"}
 
 

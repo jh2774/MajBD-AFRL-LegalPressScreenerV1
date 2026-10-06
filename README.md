@@ -919,6 +919,35 @@ Every tool in `tools/` is Python, so the repository runs the same way on Windows
 Linux. The only non-Python code is the web interface's HTML, CSS and JavaScript, which a
 browser requires.
 
+### Deploying to Google Cloud
+
+[docs/GOOGLE_CLOUD.md](docs/GOOGLE_CLOUD.md) is the step-by-step guide: Cloud Run for the site,
+Cloud SQL for the database, and how to move an existing deployment's data across. The same
+image runs on both hosts. What Cloud Run does differently, and what the application does about
+each:
+
+* **Processor time only while a request is being answered, and an idle instance is shut down.**
+  A screen runs in a background thread for minutes after its request has returned, so while one
+  runs the service holds a request open against itself (`jobs._hold_open`). That keeps the
+  thread running and the instance alive, and it is billed for the minutes the screen takes. On
+  by default wherever a managed host is detected; `FOCI_KEEP_AWAKE=false` turns it off. It also
+  stops Render's free plan cutting a long screen short.
+* **A database connection can be closed while the instance is frozen.** The store checks a
+  connection that has sat idle before using it and reconnects; a read that hits a dead
+  connection is repeated once on a new one. A write is never silently replayed.
+* **No disk.** Files written in the container live in its memory. The HTTP cache deletes expired
+  responses and is capped (`FOCI_CACHE_MAX_MB`, 64 on Cloud Run).
+* **More than one instance.** Run one (`--max-instances 1`). The one thing that would do real
+  harm with two — both running the alert check and emailing everyone twice — is also guarded
+  with a lock in the database.
+
+`foci-screen copy-db` copies every table from one database to another and compares the row
+counts: `SOURCE_DATABASE_URL` is the old database, the configured one is the destination. It
+only reads the source, creates the current schema at the destination, refuses a destination
+that already holds rows, and on Postgres moves the id counters past the copied rows.
+
+`GET /health` reports `host` (`Cloud Run`, `Render`, …) and, on Cloud Run, the `revision`.
+
 ### Deploying to Render
 
 `render.yaml` is a Blueprint: in Render, **New → Blueprint** against the repository. It defines

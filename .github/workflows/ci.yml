@@ -41,8 +41,81 @@ jobs:
           cd /tmp/elsewhere
           python "$GITHUB_WORKSPACE/tools/install_smoke.py"
 
+  # The Postgres-only behaviour, against a real Postgres: the copy that moves a
+  # database between hosts (and the id counters it must reset), a connection the
+  # server closes, and the lock two instances share. None of it can be shown
+  # with stand-ins, and it is exactly what a move to Cloud SQL leans on.
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: foci
+          POSTGRES_PASSWORD: foci
+          POSTGRES_DB: foci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U foci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[api,queue,postgres,dev]"
+
+      - name: Tests against a real Postgres
+        # `shell: bash` turns on pipefail, so a failing pytest is not hidden by tee.
+        shell: bash
+        env:
+          FOCI_TEST_DATABASE_URL: postgresql://foci:foci@localhost:5432/foci
+        run: |
+          pytest -q tests/test_postgres_live.py -rs | tee /tmp/pg.txt
+          # A skip here would mean the job proved nothing while looking green.
+          if grep -q "SKIPPED" /tmp/pg.txt; then
+            echo "The live Postgres tests were skipped."; exit 1
+          fi
+
+      - name: The copy command, end to end
+        shell: bash
+        env:
+          FOCI_USER_AGENT: "foci-screen CI (ci@example.org)"
+          OLD: postgresql://foci:foci@localhost:5432/old_site
+          NEW: postgresql://foci:foci@localhost:5432/new_site
+        run: |
+          # Two databases, and something to move between them: a schema with
+          # rows in it, made by the application itself.
+          python tools/ci_seed_for_copy.py
+          SOURCE_DATABASE_URL="$OLD" DATABASE_URL="$NEW" foci-screen copy-db | tee /tmp/copy.txt
+          grep -q "every table's count matches the source" /tmp/copy.txt
+          if grep -q "foci:foci" /tmp/copy.txt; then
+            echo "The copy printed a database password."; exit 1
+          fi
+
   api-image:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: foci
+          POSTGRES_PASSWORD: foci
+          POSTGRES_DB: foci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U foci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -78,6 +151,41 @@ jobs:
           curl -fsS -H 'Authorization: Bearer ci-key' http://localhost:8000/v1/overview > /dev/null
           docker logs api | grep -i traceback && exit 1 || true
           docker rm -f api
+
+      - name: Boot it the way Cloud Run does
+        # Cloud Run chooses the port (8080), names the service and the deploy in
+        # the environment, and the database is Postgres. This is as close to a
+        # first deploy there as a runner gets: if the image cannot start like
+        # this, it is cheaper to find out here.
+        run: |
+          docker run -d --name cloudrun --network host \
+            -e PORT=8080 -e K_SERVICE=foci -e K_REVISION=foci-ci-00001 \
+            -e DATABASE_URL=postgresql://foci:foci@localhost:5432/foci \
+            -e FOCI_API_KEYS=ci:ci-key -e FOCI_INPROCESS_SCREENS=true \
+            -e FOCI_USER_AGENT="foci-screen CI (ci@example.org)" \
+            foci-api:ci
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health > /tmp/cloudrun.json; then break; fi
+            sleep 2
+          done
+          cat /tmp/cloudrun.json
+          python3 -c "
+          import json
+          h = json.load(open('/tmp/cloudrun.json'))
+          assert h['host'] == 'Cloud Run', h
+          assert h['revision'] == 'foci-ci-00001', h
+          assert h['database'] == 'postgres', h
+          assert h['warnings'] == [], h['warnings']
+          "
+          curl -fsS -H 'Authorization: Bearer ci-key' http://localhost:8080/v1/overview > /dev/null
+          # Behind the host's proxy the app must believe the forwarded address:
+          # it puts it in alert emails and uses it to stay awake during a screen.
+          curl -fsS -H 'X-Forwarded-Proto: https' -H 'X-Forwarded-Host: foci.example' \
+            http://localhost:8080/health > /dev/null
+          # The copy command ships in the image, since that is where a move runs it.
+          docker exec cloudrun foci-screen copy-db --help | grep -q "allow-nonempty"
+          docker logs cloudrun | grep -i traceback && exit 1 || true
+          docker rm -f cloudrun
 
   worker-image:
     runs-on: ubuntu-latest

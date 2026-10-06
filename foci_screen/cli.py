@@ -202,6 +202,43 @@ def cmd_history(args, cfg) -> int:
     return 0
 
 
+def cmd_copy_db(args, cfg) -> int:
+    """Copy every table from one database to another — for moving hosts."""
+    import os
+
+    from . import dbcopy
+
+    # From the environment by default, so a database password is never typed
+    # where the shell keeps a history of it.
+    source = args.source or os.environ.get("SOURCE_DATABASE_URL", "").strip()
+    target = args.target or cfg.dsn
+    if not source:
+        print("Nothing to copy from. Set SOURCE_DATABASE_URL to the old database's "
+              "address (or pass --from).", file=sys.stderr)
+        return 2
+
+    print(f"From: {dbcopy.describe(source)}")
+    print(f"To:   {dbcopy.describe(target)}")
+    try:
+        report = dbcopy.copy_database(source, target, allow_nonempty=args.allow_nonempty,
+                                      progress=print)
+    except dbcopy.CopyRefused as exc:
+        print(f"\nNot started: {exc}", file=sys.stderr)
+        return 2
+
+    rows = sum(r["target"] for r in report.values())
+    short = dbcopy.mismatches(report)
+    if short:
+        print("\nINCOMPLETE — the destination has fewer rows than the source in:",
+              file=sys.stderr)
+        for line in short:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+    print(f"\nDone. {rows:,} row(s) across {len(report)} table(s); every table's count "
+          f"matches the source.")
+    return 0
+
+
 # --------------------------------------------------------------------- entry
 
 def build_parser() -> argparse.ArgumentParser:
@@ -251,6 +288,21 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("history", help="recent findings")
     h.add_argument("--limit", type=int, default=25)
     h.set_defaults(func=cmd_history)
+
+    c = sub.add_parser(
+        "copy-db", help="copy every table to another database, for moving hosts",
+        description="Copies all data from one database to another and checks the row "
+                    "counts. The source is only read. The destination gets the current "
+                    "schema and must be empty.")
+    c.add_argument("--from", dest="source", metavar="URL",
+                   help="the database to copy from (default: $SOURCE_DATABASE_URL)")
+    c.add_argument("--to", dest="target", metavar="URL",
+                   help="the database to copy into (default: the configured one — "
+                        "DATABASE_URL, or the Cloud SQL settings)")
+    c.add_argument("--allow-nonempty", action="store_true",
+                   help="continue although the destination already has rows; only for "
+                        "re-running an interrupted copy")
+    c.set_defaults(func=cmd_copy_db)
     return p
 
 

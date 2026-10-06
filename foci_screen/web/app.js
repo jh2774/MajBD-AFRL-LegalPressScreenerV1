@@ -2065,7 +2065,17 @@ async function alertsCard(key, portfolioName) {
     return `<div class="card"><h2>Email alerts</h2><p class="muted">${esc(e.message || String(e))}</p></div>`;
   }
   const id = savedAlertListId();
-  const list = d.subscriptions.find((s) => s.subscription_id === id);
+  // Which list is "this one" is remembered by the browser, per website
+  // address. On a new address — the site moved hosts, or a colleague opened
+  // the same portfolio key — nothing is remembered, and offering "Start email
+  // alerts" would create a second list for the same portfolio and email
+  // everyone on it twice. A list already saved for this exact portfolio is
+  // this portfolio's list.
+  let list = d.subscriptions.find((s) => s.subscription_id === id);
+  if (!list) {
+    list = d.subscriptions.find((s) => s.portfolio_key === key);
+    if (list) rememberAlertListId(list.subscription_id);
+  }
   const deliveries = list ? d.deliveries.filter((x) => x.subscription_id === list.subscription_id) : [];
   const outOfDate = list && list.portfolio_key !== key;
   const mode = d.sending.mode;

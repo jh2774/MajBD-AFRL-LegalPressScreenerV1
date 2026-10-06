@@ -23,6 +23,7 @@ import difflib
 import json
 import logging
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -461,6 +462,36 @@ def _statements(ddl: str) -> list[str]:
     return [s.strip() for s in stripped.split(";") if s.strip()]
 
 
+def open_connection(dsn: str):
+    """A raw connection to SQLite or Postgres, with rows addressable by name."""
+    if _is_postgres(dsn):
+        try:
+            import psycopg
+            from psycopg.rows import dict_row
+        except ImportError as exc:      # say which extra, not "no module named"
+            raise RuntimeError(DRIVER_MISSING) from exc
+
+        # Render hands out postgres:// ; psycopg wants postgresql://
+        return psycopg.connect(dsn.replace("postgres://", "postgresql://", 1),
+                               row_factory=dict_row, autocommit=False)
+
+    import sqlite3
+
+    Path(dsn).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(dsn, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _connection_lost(exc: Exception) -> bool:
+    """Whether an error means the connection itself is gone, not the statement."""
+    try:
+        import psycopg
+    except ImportError:
+        return False
+    return isinstance(exc, (psycopg.OperationalError, psycopg.InterfaceError))
+
+
 class Store:
     """Thread-safe over a single connection.
 
@@ -468,35 +499,61 @@ class Store:
     an analyst team, a nightly batch — contention is irrelevant next to the
     minutes each screen spends waiting on government APIs, and a single
     connection removes a whole class of pool-exhaustion failure.
+
+    One connection held for the life of the process has a cost of its own: it
+    can be closed underneath it. A managed database restarts for maintenance,
+    and a serverless host freezes the process between requests for long enough
+    that the far end gives up on the socket. So a Postgres connection that has
+    sat idle is checked before it is used and replaced if it has gone — see
+    `_ensure_connection`. Without that the first request after a quiet spell
+    fails, and so does every one after it until the process restarts.
     """
+
+    # A connection used this recently is trusted without asking.
+    IDLE_CHECK_SECONDS = 20
 
     def __init__(self, path: str = "foci_screen.db", tenant_id: str = DEFAULT_TENANT) -> None:
         self.path = path
         self.tenant_id = tenant_id or DEFAULT_TENANT
         self.is_postgres = _is_postgres(path)
         self._lock = threading.RLock()
+        self._depth = 0                     # open `_tx` blocks on this thread's lock
         self._conn = self._connect()
+        self._last_used = time.monotonic()
         self._migrate()
 
     # ------------------------------------------------------------- dialect
     def _connect(self):
-        if self.is_postgres:
+        return open_connection(self.path)
+
+    def _reconnect(self) -> None:
+        log.warning("database connection was lost; reconnecting")
+        try:
+            self._conn.close()
+        except Exception:       # noqa: BLE001 - it is already gone
+            pass
+        self._conn = self._connect()
+
+    def _ensure_connection(self) -> None:
+        """Make sure there is a live connection. Call with the lock held.
+
+        Never inside an open transaction: replacing the connection there would
+        silently drop the statements already made on it.
+        """
+        if not self.is_postgres or self._depth:
+            return
+        conn = self._conn
+        lost = bool(getattr(conn, "closed", False) or getattr(conn, "broken", False))
+        if not lost and time.monotonic() - self._last_used > self.IDLE_CHECK_SECONDS:
             try:
-                import psycopg
-                from psycopg.rows import dict_row
-            except ImportError as exc:      # say which extra, not "no module named"
-                raise RuntimeError(DRIVER_MISSING) from exc
-
-            # Render hands out postgres:// ; psycopg wants postgresql://
-            dsn = self.path.replace("postgres://", "postgresql://", 1)
-            return psycopg.connect(dsn, row_factory=dict_row, autocommit=False)
-
-        import sqlite3
-
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+                conn.execute("SELECT 1")
+                conn.commit()
+            except Exception as exc:        # noqa: BLE001 - any failure here means gone
+                log.info("idle database connection did not answer (%s)", type(exc).__name__)
+                lost = True
+        if lost:
+            self._reconnect()
+        self._last_used = time.monotonic()
 
     def _sql(self, sql: str) -> str:
         return sql.replace("?", "%s") if self.is_postgres else sql
@@ -558,25 +615,75 @@ class Store:
     @contextmanager
     def _tx(self):
         with self._lock:
+            self._ensure_connection()
             cur = self._conn.cursor()
+            self._depth += 1
             try:
                 yield _Cursor(cur, self._sql)
                 self._conn.commit()
             except Exception:
-                self._conn.rollback()
+                try:
+                    self._conn.rollback()
+                except Exception:       # noqa: BLE001 - nothing to roll back on a dead socket
+                    pass
                 raise
+            finally:
+                self._depth -= 1
+                self._last_used = time.monotonic()
 
     def _query(self, sql: str, params: tuple = ()) -> list[dict]:
         with self._lock:
-            cur = self._conn.cursor()
+            self._ensure_connection()
             try:
-                cur.execute(self._sql(sql), params)
-                return [dict(r) for r in cur.fetchall()]
+                return self._read(sql, params)
+            except Exception as exc:
+                # A read can simply be asked again. If the connection died
+                # between the check above and the statement — or is one the
+                # check trusted because it was used a moment ago — reconnect
+                # once and repeat it, rather than fail a page load over it.
+                if not (self.is_postgres and not self._depth and _connection_lost(exc)):
+                    raise
+                self._reconnect()
+                return self._read(sql, params)
             finally:
-                # Postgres opens a transaction on read; leaving it idle holds a
-                # snapshot open and blocks vacuum.
-                if self.is_postgres:
+                self._last_used = time.monotonic()
+
+    def _read(self, sql: str, params: tuple) -> list[dict]:
+        cur = self._conn.cursor()
+        try:
+            cur.execute(self._sql(sql), params)
+            return [dict(r) for r in cur.fetchall()]
+        finally:
+            # Postgres opens a transaction on read; leaving it idle holds a
+            # snapshot open and blocks vacuum.
+            if self.is_postgres:
+                try:
                     self._conn.commit()
+                except Exception:       # noqa: BLE001 - the read's own error is the one to raise
+                    pass
+
+    # ------------------------------------------------------- cross-process lock
+    def try_lock(self, name: str) -> bool:
+        """Take a named lock that no other process holds, or return False.
+
+        An in-process lock stops two threads doing the same job at once. It
+        does nothing about two *instances* of the service, which a host that
+        scales out will start without asking — and two instances each running
+        the alert check would each email every recipient. On Postgres this is
+        an advisory lock, held by the connection and released if it drops. A
+        SQLite file belongs to one process, so there the caller's own lock is
+        the whole answer.
+        """
+        if not self.is_postgres:
+            return True
+        row = self._one("SELECT pg_try_advisory_lock(hashtext(?)) AS locked",
+                        (f"foci:{name}",))
+        return bool(row and row["locked"])
+
+    def unlock(self, name: str) -> None:
+        if self.is_postgres:
+            self._query("SELECT pg_advisory_unlock(hashtext(?)) AS unlocked",
+                        (f"foci:{name}",))
 
     def _one(self, sql: str, params: tuple = ()) -> dict | None:
         rows = self._query(sql, params)

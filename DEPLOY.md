@@ -2,6 +2,12 @@
 
 Concrete steps. Roughly 30 minutes, most of it waiting for the worker image to build.
 
+> **Moving to, or starting on, Google Cloud?** That has its own guide:
+> [docs/GOOGLE_CLOUD.md](docs/GOOGLE_CLOUD.md) — Cloud Run for the site, Cloud SQL for the
+> database, and a command that copies the data across from Render and checks it arrived.
+> The sections below on email alerts and on what to check before mailing anyone apply on
+> either host.
+
 ---
 
 ## 1. Push to GitHub

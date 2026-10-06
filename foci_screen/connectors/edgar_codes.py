@@ -7,13 +7,16 @@ so the mapping is the SEC's rather than one typed from memory.
 """
 
 # Two-letter US state and territory codes. Everything else is a country or a
-# Canadian province.
+# Canadian province. Three territories sit among the countries in the SEC's
+# table, under codes that do not look like states: 1V (Northern Mariana
+# Islands), 2J (U.S. Minor Outlying Islands) and B5 (American Samoa).
 US_CODES = frozenset({
     "AK", "AL", "AR", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "GU",
     "HI", "IA", "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD", "ME", "MI",
     "MN", "MO", "MS", "MT", "NC", "ND", "NE", "NH", "NJ", "NM", "NV", "NY",
     "OH", "OK", "OR", "PA", "PR", "RI", "SC", "SD", "TN", "TX", "UT", "VA",
     "VI", "VT", "WA", "WI", "WV", "WY", "X1",
+    "1V", "2J", "B5",
 })
 
 CODES: dict[str, str] = {

@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 _TRUE = {"1", "true", "yes", "on"}
 
@@ -27,6 +28,38 @@ def _switch(name: str) -> bool | None:
     """A flag that can also be left alone: True, False, or None for not set."""
     raw = _env(name)
     return raw.lower() in _TRUE if raw else None
+
+
+def _database_url() -> str:
+    """Where Postgres is, from DATABASE_URL or from Cloud SQL's separate values.
+
+    Render hands over one URL. Google Cloud's own convention for Cloud Run is
+    four values — the instance's connection name and a user, password and
+    database — with only the password kept as a secret. Both are accepted, so
+    a password with a `/` or `@` in it never has to be percent-encoded by hand
+    into a URL, which is the classic way that step goes wrong.
+
+    Cloud Run mounts each attached Cloud SQL instance as a Unix socket under
+    /cloudsql/<connection name>; `host=` with a path is how libpq is told to
+    use one.
+    """
+    url = _env("DATABASE_URL")
+    if url:
+        return url
+    instance = _env("INSTANCE_CONNECTION_NAME") or _env("CLOUD_SQL_CONNECTION_NAME")
+    user, name = _env("DB_USER"), _env("DB_NAME")
+    if not (instance and user and name):
+        return ""
+    socket = _env("INSTANCE_UNIX_SOCKET") or f"/cloudsql/{instance}"
+    password = os.environ.get("DB_PASS", "") or os.environ.get("DB_PASSWORD", "")
+    auth = quote(user, safe="") + (":" + quote(password, safe="") if password else "")
+    return f"postgresql://{auth}@/{quote(name, safe='')}?host={quote(socket, safe='/:')}"
+
+
+def _default_cache_mb() -> str:
+    # Cloud Run has no disk: files written inside the container are held in
+    # the instance's memory and count against its limit.
+    return "64" if os.environ.get("K_SERVICE") else "256"
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -57,9 +90,14 @@ class Config:
     db_path: str = field(default_factory=lambda: _env("FOCI_DB", "foci_screen.db"))
     cache_dir: str = field(default_factory=lambda: _env("FOCI_CACHE", ".cache"))
     out_dir: str = field(default_factory=lambda: _env("FOCI_OUT", "out"))
+    # The HTTP cache is a convenience, not storage, and is kept under this
+    # size: expired responses are deleted, then the oldest, as it fills.
+    cache_max_mb: int = field(
+        default_factory=lambda: int(_env("FOCI_CACHE_MAX_MB", _default_cache_mb())))
     # Postgres for any deployment with more than one process or an ephemeral
-    # filesystem. Empty means SQLite at `db_path`. Render injects DATABASE_URL.
-    database_url: str = field(default_factory=lambda: _env("DATABASE_URL"))
+    # filesystem. Empty means SQLite at `db_path`. Render injects DATABASE_URL;
+    # on Google Cloud the Cloud SQL values are read instead — see _database_url.
+    database_url: str = field(default_factory=_database_url)
 
     # --- job queue ---
     # Empty means run screens inline in a background thread — correct for the
@@ -74,6 +112,11 @@ class Config:
     # away, so keep screens small enough to finish.
     inprocess_screens_ok: bool = field(
         default_factory=lambda: _flag("FOCI_INPROCESS_SCREENS", False))
+    # While a screen runs inside the web process, keep one request open
+    # against the service itself, so the host neither starves the screen of
+    # processor time (Cloud Run) nor shuts the instance down as idle (Cloud
+    # Run, Render's free plan). Unset: on wherever a managed host is detected.
+    keep_awake: bool | None = field(default_factory=lambda: _switch("FOCI_KEEP_AWAKE"))
 
     # --- portfolio email alerts ---
     # Alerts go to the addresses typed into a portfolio as soon as a mail
