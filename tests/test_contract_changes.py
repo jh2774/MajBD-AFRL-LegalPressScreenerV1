@@ -153,3 +153,103 @@ def test_changes_are_scoped_to_the_tenant(store, tmp_path):
     assert other.contract_changes(entity_key="UEI555") == []
     assert store.contract_changes(entity_key="UEI555")
     other.close()
+
+
+# ------------------------------------------------- both sides, one event each
+
+def _novate(store, piid, award_id, from_key="UEI123", to_key="UEI555"):
+    """Screen one award under `from_key`, then again under `to_key`."""
+    _screen(store, "r1", entity_key=from_key, piid=piid, award_id=award_id,
+            recipient_uei=from_key)
+    _screen(store, "r2", entity_key=to_key, piid=piid, award_id=award_id,
+            recipient_uei=to_key, recipient_name="NEWCO HOLDINGS LLC")
+
+
+def test_a_novation_shows_on_the_contractor_that_lost_the_award(store):
+    """Changes are filed under the award's present holder, so the side that
+    lost the work used to show nothing at all."""
+    _novate(store, "N0001925C0001", "A1")
+
+    lost = store.contract_change_events("UEI123")
+    assert [(e["direction"], e["counterparty_key"]) for e in lost] == [
+        ("departed", "UEI555")]
+    assert lost[0]["counterparty_name"] == "NEWCO HOLDINGS LLC"
+    assert lost[0]["contracts"] == ["N0001925C0001"]
+
+
+def test_the_new_holder_sees_where_the_award_came_from(store):
+    _novate(store, "N0001925C0001", "A1")
+
+    gained = store.contract_change_events("UEI555")
+    moved = [e for e in gained if e["field"] == "entity_key"]
+    assert [(e["direction"], e["counterparty_key"]) for e in moved] == [
+        ("arrived", "UEI123")]
+    assert moved[0]["counterparty_name"] == "ACME DYNAMICS LLC"
+    # The UEI and name that came with the award are the same move, not two
+    # more events; the "moved here" row already names the previous holder.
+    assert [e["field"] for e in gained] == ["entity_key"]
+
+
+def test_a_name_change_without_a_move_is_still_its_own_event(store):
+    _screen(store, "r1", recipient_name="ACME DYNAMICS LLC")
+    _screen(store, "r2", recipient_name="ACME DYNAMICS HOLDINGS LLC")
+    assert [e["field"] for e in store.contract_change_events("UEI123")] == ["entity_name"]
+
+
+def test_the_losing_side_sees_only_the_move_not_the_new_holders_details(store):
+    _novate(store, "N0001925C0001", "A1")
+    assert [e["field"] for e in store.contract_change_events("UEI123")] == ["entity_key"]
+
+
+def test_one_re_registration_across_many_awards_is_one_event(store):
+    for run_id, country in (("r1", "USA"), ("r2", "CYM")):
+        store.start_run("DoD", {}, run_id=run_id)
+        for i in range(4):
+            store.save_contract(
+                make_contract(piid=f"N00019{i}", award_id=f"A{i}",
+                              country_of_incorporation=country), run_id, "UEI123")
+
+    events = [e for e in store.contract_change_events("UEI123")
+              if e["field"] == "country_of_incorporation"]
+    assert len(events) == 1
+    assert (events[0]["old_value"], events[0]["new_value"]) == ("USA", "CYM")
+    assert events[0]["contract_count"] == 4
+    assert sorted(events[0]["contracts"]) == [f"N00019{i}" for i in range(4)]
+
+
+def test_the_same_change_in_two_screens_is_two_events(store):
+    _screen(store, "r1", country_of_incorporation="USA")
+    _screen(store, "r2", country_of_incorporation="CYM")
+    _screen(store, "r3", country_of_incorporation="USA")
+
+    events = store.contract_change_events("UEI123")
+    assert [(e["old_value"], e["new_value"]) for e in events] == [
+        ("CYM", "USA"), ("USA", "CYM")]
+
+
+def test_a_contractor_whose_awards_all_left_still_has_a_page(tmp_path, monkeypatch):
+    """No awards and no finding used to mean 404 — for exactly the contractor
+    the move matters most to."""
+    monkeypatch.setenv("FOCI_API_KEYS", "acme:secret-key")
+    monkeypatch.setenv("FOCI_DB", str(tmp_path / "api.db"))
+    monkeypatch.setenv("FOCI_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("FOCI_OUT", str(tmp_path / "out"))
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+
+    import importlib
+
+    from fastapi.testclient import TestClient
+
+    from foci_screen.api import app as app_module
+    importlib.reload(app_module)
+    _novate(app_module.store_for("acme"), "N0001925C0001", "A1")
+    c = TestClient(app_module.app)
+    auth = {"X-API-Key": "secret-key"}
+
+    body = c.get("/v1/entities/UEI123", headers=auth).json()
+    assert body["contracts"] == [] and body["contract_count"] == 0
+    assert body["entity"]["name"] == "ACME DYNAMICS LLC"
+    assert body["record_changes"][0]["direction"] == "departed"
+
+    assert c.get("/v1/entities/NEVERSEEN", headers=auth).status_code == 404
