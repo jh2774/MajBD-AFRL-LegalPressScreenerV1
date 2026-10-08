@@ -339,6 +339,9 @@ td.num + td, th.num + th { padding-left: 18px; }
 .pill.warn { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
 
 .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
+
+/* Paging on a search tab: where you are, then the way back and the way on. */
+.pager { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin: 4px 0 16px; }
 .tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 .empty { color: var(--muted); padding: 28px 0; text-align: center; }

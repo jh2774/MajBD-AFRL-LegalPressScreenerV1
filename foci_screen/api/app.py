@@ -970,32 +970,54 @@ def suggest(q: str = Query("", max_length=120),
 
 # ----------------------------------------------------------------- search
 
+SEARCH_KINDS = {"entity": "entities", "contract": "contracts",
+                "officer": "officers", "agency": "agencies"}
+
+
 @app.get("/v1/search", tags=["search"])
 def search(q: str = Query("", max_length=200),
            kind: str = Query("all", pattern="^(all|entity|contract|officer|agency)$"),
            limit: int = Query(10, ge=1, le=100),
+           offset: int = Query(0, ge=0, le=100_000),
            store: Store = Depends(tenant_store)) -> dict:
     """One box over contractors, awards, contracting officers and agencies.
 
     An empty `q` is a browse rather than an error: it returns the largest of
     each kind, which is what an analyst opening the page for the first time
     wants to see.
+
+    Paged by `offset`. Each list comes with `more`, true when rows exist past
+    this page, rather than a total: a total would run every search twice, and
+    what a page needs to know is whether there is a next one. Each list is
+    asked for one row beyond `limit`, and that row is how `more` is known.
     """
     q = q.strip()
-    if kind == "entity":
-        return {"query": q, "entities": store.search_entities(q, limit)}
-    if kind == "contract":
-        return {"query": q, "contracts": store.search_contracts(q, limit)}
-    if kind == "officer":
-        return {"query": q, "officers": store.search_officers(q, limit)}
-    if kind == "agency":
-        return {"query": q, "agencies": store.search_agencies(q, limit)}
+    searches = {
+        "entities": store.search_entities,
+        "contracts": store.search_contracts,
+        "officers": store.search_officers,
+        "agencies": store.search_agencies,
+    }
+    if kind == "all":
+        wanted = list(searches)
+        if not q:
+            # A browse lists no awards: "the largest awards" is not a useful
+            # first screen, and every contractor row already leads to its own.
+            wanted.remove("contracts")
+    else:
+        wanted = [SEARCH_KINDS[kind]]
 
-    if not q:
-        return {"query": q, "entities": store.search_entities("", limit),
-                "contracts": [], "officers": store.search_officers("", limit),
-                "agencies": store.search_agencies("", limit)}
-    return {"query": q, **store.search_all(q, limit)}
+    body: dict = {"query": q, "offset": offset, "limit": limit}
+    more: dict[str, bool] = {}
+    for name in wanted:
+        rows = searches[name](q, limit + 1, offset)
+        more[name] = len(rows) > limit
+        body[name] = rows[:limit]
+    if kind == "all" and not q:
+        body["contracts"] = []
+        more["contracts"] = False
+    body["more"] = more
+    return body
 
 
 @app.get("/v1/overview", tags=["search"])
