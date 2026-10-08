@@ -933,6 +933,7 @@ async function viewEntity(key) {
         ${f ? sevTag(f.severity) + ` score ${esc((f.total_score ?? 0).toFixed ? f.total_score.toFixed(1) : f.total_score)}` : sevTag(null)}
         ${e.uei ? ` · UEI <span class="mono">${esc(e.uei)}</span>` : ""}
         ${e.cik ? ` · CIK <span class="mono">${esc(e.cik)}</span>` : ""}
+        ${e.cage ? ` · CAGE <span class="mono">${esc(e.cage)}</span>` : ""}
       </div>
     </div>
 

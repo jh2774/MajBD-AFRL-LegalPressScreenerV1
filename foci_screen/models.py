@@ -88,6 +88,11 @@ class Contract(Serialisable):
     state_of_incorporation: str = ""
     foreign_owned_and_located: bool = False
     foreign_funding: str = ""
+    # From the vendor's SAM registration, as FPDS carries it on each award.
+    cage_code: str = ""
+    is_sole_proprietor: bool | None = None    # None: FPDS did not say
+    is_foreign_government: bool = False
+    organizational_type: str = ""
     officer: ContractingOfficer = field(default_factory=ContractingOfficer)
     # FAR/DFARS data-rights clauses inferred from the requirement description.
     ip_clause_hits: list[str] = field(default_factory=list)
