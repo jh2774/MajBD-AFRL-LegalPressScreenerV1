@@ -323,6 +323,7 @@ class TestGather(unittest.TestCase):
         screener.iapd = IAPDConnector(http)
         screener.ofac = SimpleNamespace(screen=lambda name: [])
         screener.uspto = SimpleNamespace(available=False)
+        screener.patent_dataset = SimpleNamespace(available=False)
         screener.sam = SimpleNamespace(available=False)
         screener.alerts = SimpleNamespace(available=lambda: False)
         entity = Entity(name="THE BOEING COMPANY", cik=CIK, aliases=["BOEING CO"])

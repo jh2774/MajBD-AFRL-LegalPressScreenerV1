@@ -73,15 +73,16 @@ actually return, not what their docs claim.
 | **OFAC SDN** CSV | no | Sanctions name screening |
 | **SAM.gov** entity + opportunities | yes | Registered address, business types, solicitation point of contact |
 | **USPTO** assignments | yes | Recorded `SECURITY INTEREST` conveyances against the patent estate |
+| **USPTO Patent Assignment Dataset** (downloaded by hand) | no | The same liens, from the yearly research release — see [Patent liens without a key](#patent-liens-without-a-key) |
 | **Company IR / press / legal pages** | no | Announcements before they reach a filing |
 
 Three things worth knowing, all observed rather than assumed:
 
 - **The legacy keyless USPTO assignment API is gone.** Recorded IP liens are the single best
-  evidence of collateralisation, and without `USPTO_API_KEY` the screen cannot check them. It
-  prints `USPTO: skipped — IP liens NOT checked` rather than silently implying none exist.
-  (`bulkdata.uspto.gov` and `search.patentsview.org` were also unreachable from this network —
-  possibly proxy-blocked rather than down.)
+  evidence of collateralisation, and without `USPTO_API_KEY` — or the imported research
+  dataset below — the screen cannot check them. It prints `IP liens NOT checked` rather than
+  silently implying none exist. (`bulkdata.uspto.gov` and `search.patentsview.org` were also
+  unreachable from this network — possibly proxy-blocked rather than down.)
 - **Some investor-relations subdomains refuse automated clients, and are not read.**
   `investors.lockheedmartin.com` and `investors.leidos.com` sit behind Akamai bot management.
   They time out a plain HTTP client and return 403 to a browser that identifies itself. The
@@ -225,6 +226,43 @@ Capital Research all carry disclosures, so as a rule it would fire on nearly eve
 EDGAR gives places of organisation as codes (`DE`, `X1`, `E9`); `connectors/edgar_codes.py` is
 the SEC's published table, and the documents keep the code rather than the name so the prose
 jurisdiction rule never reads the tool's own words as a mention.
+
+### Patent liens without a key
+
+The live sources for recorded patent liens are closed to this tool without a key, and stay
+closed: the assignment search moved to `assignmentcenter.uspto.gov`, which answered even a
+request for its `robots.txt` with 403, and `data.uspto.gov` serves an AWS bot challenge.
+Neither is worked around, for the same reason the investor-relations pages are not.
+
+The USPTO publishes the same records as a research dataset — every assignment recorded since
+1970, 10.5 million of them in the 2023 release — for exactly this kind of use. Its download
+links hand a person a signed URL to open in a browser (a script gets the bot challenge, which
+was tried), so like the saved-alerts folder, this stops at files a person has downloaded:
+
+```bash
+# Download the full CSV set (csv.zip, 1.8 GB) by hand from
+#   https://www.uspto.gov/ip-policy/economic-research/research-datasets/patent-assignment-dataset
+foci-screen import-patent-assignments ~/Downloads/csv.zip
+```
+
+The import keeps only what a lien screen needs: records the dataset itself classifies as
+`security` or `release`, with their parties and the patents they cover. It streams the files
+and holds nothing larger than the list of kept record ids — 17 MB at peak, measured — and took
+19 seconds per 500,000 synthetic records, so roughly seven minutes for the full set. Screens
+then use the index (`patent_assignments.db`, or `FOCI_PATENT_ASSIGNMENTS`) whenever
+`USPTO_API_KEY` is not set, and fire the same `IPCOL-USPTO-01` rule as the API.
+
+- **The contractor is matched as the party pledging its patents**, by exact name once legal
+  suffixes are set aside, as IAPD holders are. "Acme Dynamics Europe GmbH" is not Acme
+  Dynamics.
+- **A released lien is not a lien.** A release recorded later, returning the same patents to
+  the contractor, removes them from the count; a lien released in full is not reported, and a
+  partial one says how much is left. A release recorded *before* a lien does not release it.
+- **The dataset's own classification decides what is a lien**, so wording the phrase list does
+  not know ("GRANT OF RIGHTS") still counts.
+- **It is a snapshot.** Each release runs to its last recorded date, refreshed about yearly.
+  A screen prints that date and says liens recorded later are **not checked**, rather than
+  reading as "no liens".
 
 ### How the contracting officer is resolved
 
@@ -1060,7 +1098,7 @@ foci_screen/
   store.py         SQLite snapshots, diffing, findings, notification log
   pipeline.py      orchestration (injected deps — same code serves an API)
   cli.py           argparse entry point
-  connectors/      usaspending, fpds, sec_edgar, registries, webwatch, edgar_codes
+  connectors/      usaspending, fpds, sec_edgar, registries, webwatch, edgar_codes, uspto_dataset
   risk/            lexicon (jurisdictions, terms, clauses), engine (rules, scoring)
   notify/          render (.eml, text, html), gmail (guarded delivery)
 tests/             45 offline tests

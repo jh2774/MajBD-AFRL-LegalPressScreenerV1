@@ -150,6 +150,12 @@ class Config:
     # subscribes, and a folder needs no credentials to read.
     alerts_dir: str = field(default_factory=lambda: _env("FOCI_ALERTS_DIR"))
 
+    # --- recorded patent liens, without a USPTO key ---
+    # The index built by `foci-screen import-patent-assignments` from the USPTO
+    # Patent Assignment Dataset. Used only when USPTO_API_KEY is not set.
+    patent_assignments_index: str = field(
+        default_factory=lambda: _env("FOCI_PATENT_ASSIGNMENTS", "patent_assignments.db"))
+
     # --- headless browser (investor-relations pages) ---
     browser_enabled: bool = field(default_factory=lambda: _flag("FOCI_BROWSER", True))
     browser_timeout: int = field(
@@ -224,6 +230,8 @@ class Config:
                                     and Path(self.alerts_dir).is_dir()),
             "samgov": bool(self.sam_api_key),
             "uspto": bool(self.uspto_api_key),
+            "uspto_assignment_dataset": bool(self.patent_assignments_index
+                                             and Path(self.patent_assignments_index).is_file()),
             "trade_gov_csl": bool(self.trade_gov_key),
             "headless_browser": self.browser_enabled and _playwright_installed(),
         }

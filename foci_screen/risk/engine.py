@@ -293,7 +293,10 @@ def rule_uspto_security_interest(doc: Document, ctx: RuleContext) -> list[Signal
     if doc.source != "uspto":
         return []
     conveyance = (doc.meta or {}).get("conveyance", "").upper()
-    if not any(k in conveyance for k in lex.USPTO_SECURITY_CONVEYANCES):
+    # The research dataset classifies each record itself; its "security" type
+    # covers wording the phrase list does not, such as "GRANT OF RIGHTS".
+    classified = (doc.meta or {}).get("conveyance_type") == "security"
+    if not classified and not any(k in conveyance for k in lex.USPTO_SECURITY_CONVEYANCES):
         return []
     assignee = (doc.meta or {}).get("assignee", "")
     address = (doc.meta or {}).get("assignee_address", "")

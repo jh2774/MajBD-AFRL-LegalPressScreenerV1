@@ -239,6 +239,28 @@ def cmd_copy_db(args, cfg) -> int:
     return 0
 
 
+def cmd_import_patent_assignments(args, cfg) -> int:
+    """Build the patent-lien index from the USPTO Patent Assignment Dataset."""
+    from .connectors import uspto_dataset
+
+    target = args.out or cfg.patent_assignments_index
+    print(f"From: {args.source}\nTo:   {target}")
+    try:
+        report = uspto_dataset.import_dataset(args.source, target)
+    except (uspto_dataset.DatasetError, FileNotFoundError) as exc:
+        print(f"\nNot imported: {exc}", file=sys.stderr)
+        return 2
+    print(f"\nDone. {report['records']:,} security interest and release record(s), "
+          f"{report['parties']:,} part(ies), {report['properties']:,} patent link(s).")
+    print(f"Recorded through {report['latest_recorded'] or 'an unknown date'}: liens "
+          f"recorded after that are not in this dataset.")
+    if target == cfg.patent_assignments_index:
+        print("Screens will use it from now on.")
+    else:
+        print(f"Set FOCI_PATENT_ASSIGNMENTS={target} so screens use it.")
+    return 0
+
+
 # --------------------------------------------------------------------- entry
 
 def build_parser() -> argparse.ArgumentParser:
@@ -303,6 +325,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="continue although the destination already has rows; only for "
                         "re-running an interrupted copy")
     c.set_defaults(func=cmd_copy_db)
+
+    u = sub.add_parser(
+        "import-patent-assignments",
+        help="index recorded patent liens from the USPTO Patent Assignment Dataset",
+        description="Reads the USPTO Patent Assignment Dataset, downloaded by hand from "
+                    "uspto.gov, and keeps its security interests and releases so screens "
+                    "can check for patent liens without a USPTO API key. Give it the "
+                    "combined csv.zip, or a folder of the per-table downloads.")
+    u.add_argument("source", help="csv.zip, or a folder of *.csv.zip / *.csv files")
+    u.add_argument("--out", metavar="PATH",
+                   help="where to write the index (default: $FOCI_PATENT_ASSIGNMENTS, "
+                        "or patent_assignments.db)")
+    u.set_defaults(func=cmd_import_patent_assignments)
     return p
 
 
