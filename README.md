@@ -412,7 +412,8 @@ every night on a deploy that was screening nothing.
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
 | `POST /v1/portfolio/edit` | Add or drop companies, returning a new key |
 | `POST /v1/portfolio` | Open a key into a dashboard of those companies |
-| `POST /v1/watchlists` | Agencies to re-screen on a schedule |
+| `POST /v1/watchlists` | Agencies to re-screen on a schedule, optionally with their own `policy` |
+| `PUT / DELETE /v1/watchlists/{id}/policy` | The screening-policy settings one watchlist changes — the rest follow the tenant |
 | `GET /v1/notices` | The review queue |
 | `POST /v1/notices/{id}/approve` | The human gate. Records a decision — does not send |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |

@@ -182,6 +182,54 @@ class ScreeningPolicy:
                    notice_always=always), notes
 
 
+# ----------------------------------------------------------- per watchlist
+
+POLICY_FIELDS = tuple(ScreeningPolicy.__dataclass_fields__)
+
+
+def merge(tenant: dict | None, override: dict | None) -> tuple[ScreeningPolicy, list[str]]:
+    """A watchlist's policy: the tenant's, with the watchlist's own settings on top.
+
+    A portfolio of high-priority primes can notify on "low" while a broad
+    agency sweep stays at the tenant's "high", without either touching the
+    other. The override holds only what it changes; everything else follows
+    the tenant policy, including later changes to it. The result goes through
+    the same normalising as a saved policy, so an override cannot produce a
+    combination the settings page would refuse — notices for a category the
+    watchlist does not screen, say.
+    """
+    base, _ = ScreeningPolicy.from_dict(tenant)
+    override = override or {}
+    unknown = sorted(set(override) - set(POLICY_FIELDS))
+    merged = {**base.to_dict(),
+              **{k: v for k, v in override.items() if k in POLICY_FIELDS}}
+    policy, notes = ScreeningPolicy.from_dict(merged)
+    if unknown:
+        notes.insert(0, f"Ignored unknown setting(s): {', '.join(unknown)}.")
+    return policy, notes
+
+
+def clean_override(tenant: dict | None,
+                   override: dict | None) -> tuple[dict, ScreeningPolicy, list[str]]:
+    """What to store for a watchlist: only the settings it gives, as normalised.
+
+    Stored as the settings named, not as a whole policy, so a watchlist that
+    only lowers the notice threshold keeps following the tenant on everything
+    else.
+    """
+    policy, notes = merge(tenant, override)
+    full = policy.to_dict()
+    return ({k: full[k] for k in (override or {}) if k in POLICY_FIELDS},
+            policy, notes)
+
+
+def policy_for(store, watchlist_id: str = "") -> ScreeningPolicy:
+    """The policy a run works under: its watchlist's, or else the tenant's."""
+    override = store.watchlist_policy(watchlist_id) if watchlist_id else None
+    policy, _ = merge(store.screening_policy(), override)
+    return policy
+
+
 # ------------------------------------------------------------------ screening
 
 def filter_signals(signals: list, policy: ScreeningPolicy) -> list:

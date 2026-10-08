@@ -361,7 +361,10 @@ CREATE TABLE IF NOT EXISTS watchlists (
     active       INTEGER NOT NULL DEFAULT 1,
     last_run_at  TEXT,
     last_run_id  TEXT,
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    -- Only the screening-policy settings this watchlist changes, as JSON.
+    -- Everything else follows the tenant's policy. NULL: follows it entirely.
+    policy       TEXT
 );
 """
 
@@ -390,6 +393,7 @@ CREATE INDEX IF NOT EXISTS idx_formd_index_filed ON formd_index(filed);
 # would keep its old shape and then fail on the first index over a new column.
 # Applied only where the column is genuinely absent.
 COLUMN_ADDITIONS = [
+    ("watchlists", "policy", "TEXT"),
     ("runs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
     ("runs", "status", "TEXT NOT NULL DEFAULT 'complete'"),
     ("runs", "progress", "TEXT"),
@@ -1780,14 +1784,39 @@ class Store:
             " ORDER BY status, confidence ASC LIMIT ?", (self.tenant_id, limit))
 
     # ------------------------------------------------------------ watchlists
-    def create_watchlist(self, name: str, params: dict) -> str:
+    def create_watchlist(self, name: str, params: dict,
+                         policy: dict | None = None) -> str:
         watchlist_id = uuid.uuid4().hex[:12]
         with self._tx() as c:
             c.execute("INSERT INTO watchlists (watchlist_id, tenant_id, name, params,"
-                      " active, created_at) VALUES (?,?,?,?,?,?)",
+                      " active, created_at, policy) VALUES (?,?,?,?,?,?,?)",
                       (watchlist_id, self.tenant_id, name,
-                       json.dumps(params, default=str), 1, _now()))
+                       json.dumps(params, default=str), 1, _now(),
+                       json.dumps(policy) if policy else None))
         return watchlist_id
+
+    def get_watchlist(self, watchlist_id: str) -> dict | None:
+        return self._one("SELECT * FROM watchlists WHERE watchlist_id=? AND tenant_id=?",
+                         (watchlist_id, self.tenant_id))
+
+    def watchlist_policy(self, watchlist_id: str) -> dict | None:
+        """The settings this watchlist overrides, or None to follow the tenant."""
+        row = self.get_watchlist(watchlist_id)
+        if not row or not row.get("policy"):
+            return None
+        try:
+            return json.loads(row["policy"]) or None
+        except (ValueError, TypeError):
+            return None
+
+    def set_watchlist_policy(self, watchlist_id: str, policy: dict | None) -> bool:
+        if self.get_watchlist(watchlist_id) is None:
+            return False
+        with self._tx() as c:
+            c.execute("UPDATE watchlists SET policy=? WHERE watchlist_id=? AND tenant_id=?",
+                      (json.dumps(policy) if policy else None, watchlist_id,
+                       self.tenant_id))
+        return True
 
     def list_watchlists(self, active_only: bool = False) -> list[dict]:
         sql = "SELECT * FROM watchlists WHERE tenant_id=?"
