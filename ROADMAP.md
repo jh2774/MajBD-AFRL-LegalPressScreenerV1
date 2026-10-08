@@ -194,6 +194,11 @@ Ordered by how much they limit the tool today.
 1. **Get a USPTO API key.** Recorded `SECURITY INTEREST` conveyances are the single strongest
    IP-collateralisation evidence available, and the screen currently cannot see them. This is
    free and is the highest value-per-effort item on the list by a wide margin.
+
+   **Partly covered without one:** `foci-screen import-patent-assignments` indexes the USPTO
+   Patent Assignment Dataset, the yearly research release of the same records, downloaded by
+   hand. Screens use it when no key is set. It is as current as its last release (2023 at the
+   time of writing), so the key is still what makes a lien recorded this year visible.
 2. **Get a SAM.gov API key.** Adds the registered ownership chain (immediate and highest-level
    owner) - the most direct FOCI structural signal there is - and an authoritative KO contact
    to corroborate FPDS.

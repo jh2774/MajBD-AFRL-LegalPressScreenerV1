@@ -17,6 +17,7 @@ from .connectors.fpds import FPDSConnector
 from .connectors.registries import IAPDConnector, OFACConnector, SAMConnector, USPTOConnector
 from .connectors.sec_edgar import EdgarConnector
 from .connectors.usaspending import USASpendingConnector, looks_like_an_individual
+from .connectors.uspto_dataset import PatentAssignmentDataset
 from .connectors.webwatch import WebWatchConnector
 from .models import Change, Contract, Document, Entity, Finding
 from .risk import engine
@@ -68,6 +69,8 @@ class Screener:
         self.iapd = IAPDConnector(http)
         self.ofac = OFACConnector(http)
         self.uspto = USPTOConnector(http, config.uspto_api_key)
+        self.patent_dataset = PatentAssignmentDataset(
+            getattr(config, "patent_assignments_index", ""))
         self.sam = SAMConnector(http, config.sam_api_key)
         self.web = WebWatchConnector(http, browser=browser)
         # Shares the web connector rather than holding an HTTP client, so
@@ -387,8 +390,21 @@ class Screener:
         if self.uspto.available:
             progress("  USPTO assignment records...")
             docs.extend(self.uspto.assignments(entity.parent_name or entity.name))
+        elif self.patent_dataset.available:
+            # The research dataset is a snapshot. Saying where it stops is the
+            # difference between "no liens" and "no liens recorded by then".
+            through = self.patent_dataset.latest_recorded() or "its last release"
+            progress(f"  USPTO Patent Assignment Dataset (recorded through {through}; "
+                     f"liens recorded later are NOT checked)...")
+            seen: set[str] = set()
+            for name in dict.fromkeys(filter(None, (entity.name, entity.parent_name))):
+                for doc in self.patent_dataset.security_interests(name):
+                    if doc.key not in seen:
+                        seen.add(doc.key)
+                        docs.append(doc)
         else:
-            progress("  USPTO: skipped (no USPTO_API_KEY — IP liens NOT checked)")
+            progress("  USPTO: skipped (no USPTO_API_KEY or imported Patent Assignment "
+                     "Dataset — IP liens NOT checked)")
 
         if self.sam.available and entity.uei:
             progress("  SAM.gov entity registration...")
