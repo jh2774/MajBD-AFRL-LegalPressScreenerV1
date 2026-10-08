@@ -152,9 +152,15 @@ before acting.
    they render. `contract_totals` and `agency_totals` count and sum in SQL over every matching
    row, and the UI says "showing the 200 largest of N".
 
-   Still open: those three pages show the 200 largest and stop. Paging them is the same
-   change as search's, if a contractor or an agency ever holds more than 200 awards worth
-   reading one by one.
+   ~~Still open: those three pages show the 200 largest and stop.~~ **Done.** A contractor's
+   and an officer's awards, and an agency's contractors and officers, page 200 at a time
+   with Previous / Next, ordered by amount and then a unique key so ties cannot repeat or
+   skip rows across a page boundary. The page position is in the address
+   (`#/entity/…?awards=200`), so a page can be linked to and Back works; an agency's two
+   lists page independently. Paging exposed three more one-page figures, now fixed: the
+   agency's officer count was the length of its first page of officers, and the "watch
+   these contractors" buttons on officer and agency pages added only the contractors on
+   the page open.
 
 5. ~~**Detect a novated award as an event, not just a new value.**~~ **Done.**
    `contract_changes` records what moved on an award between screens, and three rules read it:

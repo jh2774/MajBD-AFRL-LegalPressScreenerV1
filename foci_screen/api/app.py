@@ -372,12 +372,29 @@ def list_findings(severity: str = Query("", pattern="^(|info|low|medium|high|cri
         severity=severity, since=since, entity_key=entity_key, limit=limit)}
 
 
+PAGE_ROWS = 200
+
+
+def _paged(fetch, limit: int, offset: int) -> tuple[list[dict], bool]:
+    """One page of rows, and whether another follows.
+
+    Asked for one row beyond the page; that row says there is more without a
+    second query to count.
+    """
+    rows = fetch(limit + 1, offset)
+    return rows[:limit], len(rows) > limit
+
+
 @app.get("/v1/entities/{entity_key}", tags=["findings"])
-def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
+def get_entity(entity_key: str,
+               offset: int = Query(0, ge=0, le=1_000_000),
+               limit: int = Query(PAGE_ROWS, ge=1, le=500),
+               store: Store = Depends(tenant_store)) -> dict:
     # A company's name, as typed into a portfolio, finds the contractor it was
     # screened as. `entity_key` in the reply says which record answered.
     key = store.resolve_entity_key(entity_key)
-    contracts = store.contracts_where("entity_key", key)
+    contracts, more = _paged(
+        lambda n, off: store.contracts_where("entity_key", key, n, off), limit, offset)
     findings = store.search_findings(entity_key=key, limit=1)
     changes = store.contract_change_events(key, limit=50)
     # A contractor whose every award has been novated away has no awards and
@@ -405,6 +422,8 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
         "obligated": totals["obligated"],
         "contract_count": totals["contract_count"],
         "contracts_shown": len(contracts),
+        "contracts_offset": offset,
+        "contracts_more": more,
         "latest_finding": latest,
         "history": store.entity_history(key),
         # What moved in the award record, one row per event, including awards
@@ -1060,12 +1079,20 @@ def list_officers(q: str = "", limit: int = Query(50, ge=1, le=200),
 
 
 @app.get("/v1/officers/{email}", tags=["search"])
-def officer_profile(email: str, store: Store = Depends(tenant_store)) -> dict:
+def officer_profile(email: str,
+                    offset: int = Query(0, ge=0, le=1_000_000),
+                    limit: int = Query(PAGE_ROWS, ge=1, le=500),
+                    store: Store = Depends(tenant_store)) -> dict:
     """What one contracting officer holds — the view that decides who to notify."""
-    contracts = store.contracts_where("ko_email", email)
+    contracts, more = _paged(
+        lambda n, off: store.contracts_where("ko_email", email, n, off), limit, offset)
     if not contracts:
+        if offset:
+            raise HTTPException(404, "No more awards for that officer.")
         raise HTTPException(404, "No contracts recorded for that officer.")
-    entity_keys = {c["entity_key"] for c in contracts}
+    # Over every award the officer holds, not the page shown: which of their
+    # contractors have findings does not depend on which page is open.
+    entity_keys = set(store.entity_keys_where("ko_email", email))
     findings = [f for k in entity_keys
                 for f in store.search_findings(entity_key=k, limit=1)]
     return {
@@ -1079,6 +1106,9 @@ def officer_profile(email: str, store: Store = Depends(tenant_store)) -> dict:
         **store.contract_totals("ko_email", email),
         "contracts": contracts,
         "contracts_shown": len(contracts),
+        "contracts_offset": offset,
+        "contracts_more": more,
+        "entity_keys": sorted(entity_keys),
         "findings": sorted(findings, key=lambda f: -(f.get("total_score") or 0)),
     }
 
@@ -1090,12 +1120,22 @@ def list_agencies(q: str = "", limit: int = Query(50, ge=1, le=200),
 
 
 @app.get("/v1/agencies/{name:path}", tags=["search"])
-def agency_profile(name: str, store: Store = Depends(tenant_store)) -> dict:
-    contracts = store.contracts_where("agency", name)
+def agency_profile(name: str,
+                   entities_offset: int = Query(0, ge=0, le=1_000_000),
+                   officers_offset: int = Query(0, ge=0, le=1_000_000),
+                   limit: int = Query(PAGE_ROWS, ge=1, le=500),
+                   store: Store = Depends(tenant_store)) -> dict:
+    # Two lists on one page, each paged on its own: turning through an
+    # agency's contractors should not reset where its officer list was.
+    contracts = store.contracts_where("agency", name, 1)
     if not contracts:
-        contracts = store.contracts_where("sub_agency", name)
+        contracts = store.contracts_where("sub_agency", name, 1)
     if not contracts:
         raise HTTPException(404, "No contracts recorded for that agency.")
+    entities, entities_more = _paged(
+        lambda n, off: store.entities_for_agency(name, n, off), limit, entities_offset)
+    officers, officers_more = _paged(
+        lambda n, off: store.officers_for_agency(name, n, off), limit, officers_offset)
 
     # Totals, contractors and officers all come from SQL over the whole agency.
     # Aggregating the 200-row page above understated every figure on the page,
@@ -1104,9 +1144,14 @@ def agency_profile(name: str, store: Store = Depends(tenant_store)) -> dict:
     return {
         "agency": name,
         **store.agency_totals(name),
-        "contracts_shown": len(contracts),
-        "entities": store.entities_for_agency(name),
-        "officers": store.officers_for_agency(name),
+        "entities": entities,
+        "entities_offset": entities_offset,
+        "entities_more": entities_more,
+        "officers": officers,
+        "officers_offset": officers_offset,
+        "officers_more": officers_more,
+        # Every contractor, for "watch them all" — not the page shown.
+        "entity_keys": store.entity_keys_for_agency(name),
     }
 
 

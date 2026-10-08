@@ -2044,14 +2044,28 @@ class Store:
 
     FILTERABLE = {"entity_key", "ko_email", "agency", "sub_agency", "run_id"}
 
-    def contracts_where(self, column: str, value: str, limit: int = 200) -> list[dict]:
-        """Contracts filtered on one indexed column. `column` is never user input."""
+    def contracts_where(self, column: str, value: str, limit: int = 200,
+                        offset: int = 0) -> list[dict]:
+        """Contracts filtered on one indexed column. `column` is never user input.
+
+        Largest first, then by key: equal amounts are common, and without a
+        tiebreak a page boundary can repeat some awards and skip others.
+        """
         if column not in self.FILTERABLE:
             raise ValueError(f"not a filterable column: {column}")
         rows = self._query(
             f"SELECT * FROM contracts WHERE tenant_id=? AND {column}=?"
-            " ORDER BY amount DESC LIMIT ?", (self.tenant_id, value, limit))
+            " ORDER BY amount DESC, contract_key LIMIT ? OFFSET ?",
+            (self.tenant_id, value, limit, offset))
         return [_decode_contract(r) for r in rows]
+
+    def entity_keys_where(self, column: str, value: str) -> list[str]:
+        """Every contractor with an award matching, not only those on one page."""
+        if column not in self.FILTERABLE:
+            raise ValueError(f"not a filterable column: {column}")
+        return [r["entity_key"] for r in self._query(
+            f"SELECT DISTINCT entity_key FROM contracts WHERE tenant_id=? AND {column}=?",
+            (self.tenant_id, value))]
 
     def resolve_entity_key(self, key: str) -> str:
         """The key this database files a company under, given what a person typed.
@@ -2234,7 +2248,8 @@ class Store:
     # saw only the 200 best-funded officers in the tenant, and it compared
     # against `MAX(agency)`, which for an officer working across two agencies
     # is whichever sorted higher. A sub-agency matched nothing at all.
-    def officers_for_agency(self, name: str, limit: int = 200) -> list[dict]:
+    def officers_for_agency(self, name: str, limit: int = 200,
+                            offset: int = 0) -> list[dict]:
         return self._query(
             "SELECT ko_email, MAX(ko_name) AS ko_name,"
             " MAX(ko_confidence) AS ko_confidence, MAX(ko_source) AS ko_source,"
@@ -2243,17 +2258,18 @@ class Store:
             " MAX(agency) AS agency"
             " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)"
             " AND ko_email IS NOT NULL AND ko_email != ''"
-            " GROUP BY ko_email ORDER BY SUM(amount) DESC LIMIT ?",
-            (self.tenant_id, name, name, limit))
+            " GROUP BY ko_email ORDER BY SUM(amount) DESC, ko_email LIMIT ? OFFSET ?",
+            (self.tenant_id, name, name, limit, offset))
 
-    def entities_for_agency(self, name: str, limit: int = 200) -> list[dict]:
+    def entities_for_agency(self, name: str, limit: int = 200,
+                            offset: int = 0) -> list[dict]:
         """Contractors under an agency, aggregated in SQL over every award."""
         rows = self._query(
             "SELECT entity_key, MAX(entity_name) AS entity_name,"
             " COUNT(*) AS contract_count, SUM(amount) AS obligated"
             " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)"
-            " GROUP BY entity_key ORDER BY SUM(amount) DESC LIMIT ?",
-            (self.tenant_id, name, name, limit))
+            " GROUP BY entity_key ORDER BY SUM(amount) DESC, entity_key LIMIT ? OFFSET ?",
+            (self.tenant_id, name, name, limit, offset))
         for r in rows:
             latest = self._one(
                 "SELECT severity FROM findings WHERE tenant_id=? AND entity_key=?"
@@ -2261,15 +2277,25 @@ class Store:
             r["severity"] = latest["severity"] if latest else None
         return rows
 
+    def entity_keys_for_agency(self, name: str) -> list[str]:
+        """Every contractor under an agency, for watching them all at once."""
+        return [r["entity_key"] for r in self._query(
+            "SELECT DISTINCT entity_key FROM contracts WHERE tenant_id=?"
+            " AND (agency=? OR sub_agency=?)", (self.tenant_id, name, name))]
+
     def agency_totals(self, name: str) -> dict:
         row = self._one(
             "SELECT COUNT(*) AS contract_count, COALESCE(SUM(amount), 0) AS obligated,"
-            " COUNT(DISTINCT entity_key) AS entity_count"
+            " COUNT(DISTINCT entity_key) AS entity_count,"
+            # Counted here: the page used to report the length of its officer
+            # list, which stops at one page, as the agency's officer count.
+            " COUNT(DISTINCT NULLIF(ko_email, '')) AS officer_count"
             " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)",
             (self.tenant_id, name, name))
         return {"contract_count": int(row["contract_count"] or 0),
                 "obligated": float(row["obligated"] or 0.0),
-                "entity_count": int(row["entity_count"] or 0)}
+                "entity_count": int(row["entity_count"] or 0),
+                "officer_count": int(row["officer_count"] or 0)}
 
     def search_all(self, q: str, limit: int = 10, offset: int = 0) -> dict:
         return {
