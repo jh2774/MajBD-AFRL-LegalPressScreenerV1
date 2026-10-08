@@ -170,8 +170,11 @@ Subaward data is weaker than prime-award data, in ways established by querying t
 - **Some subawardees are people.** Sole proprietors appear in the data; `JOSHUA D GOODWIN` came
   back under a Navy prime. Screening a named individual, then writing to their customer's
   contracting officer about them, is a different act from screening a company, and the tool
-  declines by default. The test is a heuristic — a two-word company with no "Inc" can land in
-  it — so skipped names are listed in the run notes instead of disappearing.
+  declines by default. Where the subcontractor has held a prime award of its own, FPDS carries
+  its SAM registration, which says outright whether it is a sole proprietor, and that decides.
+  Otherwise the test is a heuristic — a two-word company with no "Inc" can land in it — so
+  skipped names are listed in the run notes instead of disappearing, with which test decided.
+  A *prime* registered as a sole proprietor is skipped the same way.
 
 A subcontractor has no contracting officer of its own, so a notice about one goes to the KO on
 the **prime** contract, and says so in its first sentence: the Government has no privity with

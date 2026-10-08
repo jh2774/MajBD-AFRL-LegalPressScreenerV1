@@ -362,6 +362,22 @@ def rule_contract_structural(contract: Contract, ctx: RuleContext) -> list[Signa
             evidence=f"isForeignOwnedAndLocated=true on {contract.piid or contract.award_id}",
             source="fpds", source_url=contract.usaspending_url, is_new=ctx.is_new))
 
+    if contract.is_foreign_government:
+        # A foreign government holding a US award directly is FOCI at its
+        # plainest: no ownership chain to trace, the government is the party.
+        # Some of these are legitimate (an allied ministry under an FMS case),
+        # which is why it asks rather than concludes.
+        score = _score("STRUCTURE", ctx, 2.5)
+        signals.append(Signal(
+            rule_id="STRUCT-FOREIGN-GOV-01", category="STRUCTURE", severity=_sev(score),
+            score=score, title="Awardee is registered as a foreign government",
+            rationale=("The awardee's SAM registration, as FPDS records it, identifies "
+                       "it as a foreign government. Confirm the basis for the award "
+                       "(for example a Foreign Military Sales case) and that it was "
+                       "made knowingly to a foreign government."),
+            evidence=f"isForeignGovernment=true on {contract.piid or contract.award_id}",
+            source="fpds", source_url=contract.usaspending_url, is_new=ctx.is_new))
+
     if contract.foreign_funding and "not applicable" not in contract.foreign_funding.lower():
         score = _score("STRUCTURE", ctx, 1.2)
         signals.append(Signal(

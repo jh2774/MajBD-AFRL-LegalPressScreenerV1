@@ -49,6 +49,32 @@ def _all_text(elem, path: str) -> list[str]:
     return out
 
 
+def _flag(elem, *names: str) -> bool | None:
+    """An FPDS true/false field, or None when the record does not carry it."""
+    for name in names:
+        value = _text(elem, name).lower()
+        if value in ("true", "y", "yes"):
+            return True
+        if value in ("false", "n", "no"):
+            return False
+    return None
+
+
+def _registration(entry) -> dict:
+    """The vendor's SAM registration details, as FPDS copies them onto an award.
+
+    FPDS spells the sole-proprietor field `isSolePropreitorship`; the correct
+    spelling is tried too, in case it is ever fixed.
+    """
+    return {
+        "cage": _text(entry, "cageCode"),
+        "sole_proprietor": _flag(entry, "isSolePropreitorship", "isSoleProprietorship"),
+        "foreign_government": bool(_flag(entry, "isForeignGovernment")),
+        "organizational_type": _text(entry, "organizationalType"),
+        "name": _text(entry, "UEILegalBusinessName") or _text(entry, "vendorName"),
+    }
+
+
 def _pretty_name(email: str) -> str:
     """JANE.DOEBAKEWELL.N00019@JSF.MIL -> 'Jane Doebakewell'.
 
@@ -134,10 +160,48 @@ class FPDSConnector:
         ff = _text(latest, "foreignFunding")
         if ff and not contract.foreign_funding:
             contract.foreign_funding = ff
+        self._apply_registration(contract, _registration(latest))
         desc = _text(latest, "descriptionOfContractRequirement")
         if desc and len(desc) > len(contract.description):
             contract.description = desc
         return contract
+
+    @staticmethod
+    def _apply_registration(contract: Contract, reg: dict) -> None:
+        if reg["cage"]:
+            contract.cage_code = reg["cage"]
+        if reg["sole_proprietor"] is not None:
+            contract.is_sole_proprietor = reg["sole_proprietor"]
+        if reg["foreign_government"]:
+            contract.is_foreign_government = True
+        if reg["organizational_type"]:
+            contract.organizational_type = reg["organizational_type"]
+
+    def vendor_registration(self, uei: str) -> dict | None:
+        """What FPDS records about a vendor's registration, from its own awards.
+
+        A subcontractor has no FPDS record under the prime's award, but one
+        that has ever held a prime contract has records of its own, and those
+        carry its SAM registration — including whether it is a sole
+        proprietor. None when FPDS holds no award to this UEI.
+        """
+        if not uei:
+            return None
+        resp = self.http.get(FEED, params={"FEEDNAME": "PUBLIC",
+                                           "q": f'VENDOR_UEI:"{uei}"'})
+        if resp.get("status") != 200 or not resp.get("text"):
+            return None
+        try:
+            root = ET.fromstring(resp["text"])
+        except ET.ParseError:
+            return None
+        entries = list(root.iter(f"{ATOM_NS}entry"))
+        # The feed matches loosely enough that the UEI is checked, not assumed.
+        entries = [e for e in entries if _text(e, "UEI").upper() == uei.upper()]
+        if not entries:
+            return None
+        entries.sort(key=lambda e: _text(e, "signedDate") or "", reverse=True)
+        return _registration(entries[0])
 
     def _officer_from_entry(self, entry) -> ContractingOfficer:
         """Prefer the approver (warranted official) over the last editor."""
