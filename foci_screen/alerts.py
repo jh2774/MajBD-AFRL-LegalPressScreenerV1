@@ -1,12 +1,15 @@
 """Email the people watching a portfolio when something about it changes.
 
-Three kinds of item go into an alert:
+Four kinds of item go into an alert:
 
   * **Form ADV changes** for the investment firms in the portfolio — a new
     fund, a change in how much of a fund foreign investors own, a new filing.
   * **Form D filings** by the contractors themselves — the notice a company
     files when it raises money privately. Only for contractors whose SEC
     record a person has picked (see `Store.confirmed_ciks`).
+  * **Investment funds named after a contractor** filing a Form D of their
+    own — money being pooled to buy its shares. Only where a person has
+    switched that on for the contractor, and only filings made since.
   * **Flagged contractors** — a notice the screening policy raised for a
     contractor in the portfolio.
 
@@ -26,9 +29,11 @@ import html as html_lib
 import logging
 from datetime import datetime, timedelta, timezone
 
+from . import vehicles as vehicles_engine
 from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
 from .connectors.formd import FormDConnector, FormDUnavailable, IssuerSnapshot
+from .connectors.vehicles import VehicleConnector
 from .notify.mailer import Mailer
 
 log = logging.getLogger("foci.alerts")
@@ -194,8 +199,19 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     items += [formd_item(c, base_url, ciks.get(str(c.get("cik")), ""))
               for c in store.formd_changes(list(ciks), limit=200)]
     items += [notice_item(n, base_url) for n in store.notices_for_entities(entities)]
+    # Funds named after a contractor: an item exists only for a filing made
+    # after both the watch and this list began, whenever the index learns of it.
+    started = str(subscription.get("created_at") or "")[:10]
+    for watch in watched_vehicles(store, entities):
+        items += vehicles_engine.alert_items(store, watch, base_url, since=started)
     fresh = [i for i in items if i["item_id"] not in sent]
     return sorted(fresh, key=lambda i: -i["importance"])
+
+
+def watched_vehicles(store, entities: list[str]) -> list[dict]:
+    """The switched-on fund watches among a portfolio's contractors."""
+    watches = (store.vehicle_watch(key) for key in dict.fromkeys(entities))
+    return [w for w in watches if w and w["watching"]]
 
 
 def baseline(store, subscription_id: str, companies: list[str]) -> int:
@@ -206,6 +222,10 @@ def baseline(store, subscription_id: str, companies: list[str]) -> int:
     ciks = list(store.confirmed_ciks(entities))
     ids += [f"formd:{c['change_id']}" for c in store.formd_changes(ciks, limit=5000)]
     ids += [f"notice:{n['notice_id']}" for n in store.notices_for_entities(entities, 5000)]
+    # A contractor added to a list that already existed: the fund filings made
+    # since its watch began were news before it joined, not now.
+    for watch in watched_vehicles(store, entities):
+        ids += [i["item_id"] for i in vehicles_engine.alert_items(store, watch)]
     store.mark_alert_sent(subscription_id, ids)
     return len(ids)
 
@@ -312,7 +332,8 @@ def is_due(store, hours: float = DUE_AFTER_HOURS) -> bool:
 
 
 def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
-               formd: FormDConnector | None = None) -> dict:
+               formd: FormDConnector | None = None,
+               vehicles: VehicleConnector | None = None) -> dict:
     """Refresh every watched firm and company, then email each portfolio what is new."""
     subscriptions = store.alert_subscriptions(active_only=True)
     all_crds: list[str] = []
@@ -326,9 +347,18 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
     companies = (refresh_issuers(store, formd, list(store.confirmed_ciks(all_entities)))
                  if formd is not None else {})
 
+    funds: dict = {}
+    watching = watched_vehicles(store, all_entities)
+    if vehicles is not None and watching:
+        try:
+            funds = vehicles_engine.refresh_for_alerts(store, vehicles, watching)
+        except Exception as exc:        # noqa: BLE001 - the rest of the alert still goes
+            log.warning("could not update the index of fund filings: %s", exc)
+            funds = {"error": f"{type(exc).__name__}: {exc}"}
+
     summary = {"subscriptions": len(subscriptions), "firms_checked": len(firms),
                "firms": firms, "companies_checked": len(companies),
-               "companies": companies, "emails": []}
+               "companies": companies, "funds": funds, "emails": []}
     for s in subscriptions:
         items = pending_items(store, s, base_url)
         store.touch_alert_subscription(s["subscription_id"])

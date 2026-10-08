@@ -164,6 +164,50 @@ CREATE TABLE IF NOT EXISTS formd_changes (
     payload      TEXT NOT NULL,
     detected_at  TEXT NOT NULL
 );
+-- Every Form D and D/A seen, by the filer's name: from EDGAR's daily index
+-- (source 'daily') and from looking a name up (source 'lookup'). Global, and
+-- kept for every filer rather than only the names being watched today, so
+-- that a company added to a watch next month has its recent history already
+-- here. `facts` is the parsed filing, filled in when someone has reason to
+-- read it.
+CREATE TABLE IF NOT EXISTS formd_index (
+    accession    TEXT PRIMARY KEY,
+    cik          TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    form         TEXT NOT NULL,
+    filed        TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT 'daily',
+    facts        TEXT
+);
+-- Which days of the daily index have been read.
+CREATE TABLE IF NOT EXISTS edgar_days (
+    day          TEXT PRIMARY KEY,
+    filings      INTEGER NOT NULL DEFAULT 0,
+    processed_at TEXT NOT NULL
+);
+-- Entities found by name whose filings have not been listed yet. Global.
+CREATE TABLE IF NOT EXISTS edgar_entities (
+    cik          TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    found_at     TEXT NOT NULL,
+    listed_at    TEXT
+);
+-- Per tenant: the words to match investment vehicles on for one contractor,
+-- which vehicles a person has said are unrelated, and whether to alert.
+-- `watching_since` is the line between history and news: only a filing made
+-- on or after it is ever sent to anyone.
+CREATE TABLE IF NOT EXISTS vehicle_watches (
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    entity_key   TEXT NOT NULL,
+    phrase       TEXT NOT NULL,
+    watching     INTEGER NOT NULL DEFAULT 0,
+    watching_since TEXT,
+    unrelated    TEXT,
+    looked_at    TEXT,
+    more_exist   INTEGER NOT NULL DEFAULT 0,
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, entity_key)
+);
 -- Who is emailed about which companies. `companies` holds portfolio keys:
 -- contractor UEIs or names, and CRD:<number> for investment firms.
 CREATE TABLE IF NOT EXISTS alert_subscriptions (
@@ -336,6 +380,8 @@ CREATE INDEX IF NOT EXISTS idx_disp_rule ON dispositions(tenant_id, rule_id);
 CREATE INDEX IF NOT EXISTS idx_disp_entity ON dispositions(tenant_id, entity_key);
 CREATE INDEX IF NOT EXISTS idx_cchanges ON contract_changes(tenant_id, entity_key);
 CREATE INDEX IF NOT EXISTS idx_cchanges_run ON contract_changes(tenant_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_formd_index_cik ON formd_index(cik);
+CREATE INDEX IF NOT EXISTS idx_formd_index_filed ON formd_index(filed);
 """
 
 # Columns added after the first single-user release. `CREATE TABLE IF NOT
@@ -1239,6 +1285,124 @@ class Store:
                 except ValueError:
                     continue
         return out
+
+    # ------------------------------------------- the index of Form D filers
+    def add_formd_index(self, rows: list[dict], source: str = "daily") -> int:
+        """Record filings by filer name. One already known is left as it is."""
+        with self._tx() as c:
+            for r in rows:
+                c.execute(
+                    "INSERT INTO formd_index (accession, cik, name, form, filed, source)"
+                    " VALUES (?,?,?,?,?,?) ON CONFLICT (accession) DO NOTHING",
+                    (r["accession"], str(int(r["cik"])), r["name"], r["form"], r["filed"],
+                     source))
+        return len(rows)
+
+    def formd_index_named(self, word: str, since: str = "") -> list[dict]:
+        """Filings whose filer name contains `word`, newest first.
+
+        A coarse filter on one word; the caller decides what really matches.
+        """
+        sql = (f"SELECT accession, cik, name, form, filed, source, facts FROM formd_index"
+               f" WHERE LOWER(name) LIKE ? {ESC}")
+        params: list = [_like(word)]
+        if since:
+            sql += " AND filed >= ?"
+            params.append(since)
+        rows = self._query(sql + " ORDER BY filed DESC, accession DESC", tuple(params))
+        for r in rows:
+            try:
+                r["facts"] = json.loads(r["facts"]) if r["facts"] else None
+            except (ValueError, TypeError):
+                r["facts"] = None
+        return rows
+
+    def set_formd_facts(self, accession: str, facts: dict) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE formd_index SET facts=? WHERE accession=?",
+                      (json.dumps(facts), accession))
+
+    def edgar_days(self) -> set[str]:
+        """Days of the daily index already read, as YYYYMMDD."""
+        return {r["day"] for r in self._query("SELECT day FROM edgar_days")}
+
+    def mark_edgar_day(self, day: str, filings: int) -> None:
+        with self._tx() as c:
+            c.execute("INSERT INTO edgar_days (day, filings, processed_at) VALUES (?,?,?)"
+                      " ON CONFLICT (day) DO NOTHING", (day, filings, _now()))
+
+    def add_edgar_entities(self, entities: list[dict]) -> None:
+        with self._tx() as c:
+            for e in entities:
+                c.execute("INSERT INTO edgar_entities (cik, name, found_at) VALUES (?,?,?)"
+                          " ON CONFLICT (cik) DO NOTHING",
+                          (str(int(e["cik"])), e["name"], _now()))
+
+    def edgar_entities_named(self, word: str) -> list[dict]:
+        return self._query(
+            f"SELECT cik, name, found_at, listed_at FROM edgar_entities"
+            f" WHERE LOWER(name) LIKE ? {ESC}", (_like(word),))
+
+    def mark_entity_listed(self, cik: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE edgar_entities SET listed_at=? WHERE cik=?",
+                      (_now(), str(int(cik))))
+
+    # ------------------------------------------ what to match for a contractor
+    def vehicle_watch(self, entity_key: str) -> dict | None:
+        row = self._one("SELECT * FROM vehicle_watches WHERE tenant_id=? AND entity_key=?",
+                        (self.tenant_id, entity_key.upper()))
+        if not row:
+            return None
+        try:
+            row["unrelated"] = [str(x) for x in json.loads(row["unrelated"] or "[]")]
+        except (ValueError, TypeError):
+            row["unrelated"] = []
+        row["watching"] = bool(row["watching"])
+        row["more_exist"] = bool(row["more_exist"])
+        return row
+
+    def save_vehicle_watch(self, entity_key: str, *, phrase: str | None = None,
+                           watching: bool | None = None, unrelated: list[str] | None = None,
+                           looked: bool = False, more_exist: bool | None = None) -> dict:
+        """Create or change a watch. Anything not given is left as it was.
+
+        `watching_since` is set at the moment watching is switched on, and
+        again whenever the phrase changes while it is on: different words
+        match different vehicles, and their past filings are not news either.
+        """
+        key = entity_key.upper()
+        old = self.vehicle_watch(key) or {}
+        new_phrase = (phrase if phrase is not None else old.get("phrase", "")).strip()
+        now_watching = bool(old.get("watching")) if watching is None else bool(watching)
+        since = old.get("watching_since")
+        turned_on = now_watching and not old.get("watching")
+        reworded = now_watching and new_phrase != (old.get("phrase") or "")
+        if turned_on or reworded or (now_watching and not since):
+            since = _now()[:10]
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO vehicle_watches (tenant_id, entity_key, phrase, watching,"
+                " watching_since, unrelated, looked_at, more_exist, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT (tenant_id, entity_key) DO UPDATE SET"
+                " phrase=excluded.phrase, watching=excluded.watching,"
+                " watching_since=excluded.watching_since, unrelated=excluded.unrelated,"
+                " looked_at=excluded.looked_at, more_exist=excluded.more_exist,"
+                " updated_at=excluded.updated_at",
+                (self.tenant_id, key, new_phrase, int(now_watching), since,
+                 json.dumps(sorted(set(unrelated if unrelated is not None
+                                       else old.get("unrelated", [])))),
+                 _now() if looked else old.get("looked_at"),
+                 int(old.get("more_exist", False) if more_exist is None else more_exist),
+                 _now()))
+        return self.vehicle_watch(key)
+
+    def vehicle_watches(self, watching_only: bool = True) -> list[dict]:
+        rows = self._query(
+            "SELECT entity_key FROM vehicle_watches WHERE tenant_id=?"
+            + (" AND watching=1" if watching_only else ""), (self.tenant_id,))
+        return [w for w in (self.vehicle_watch(r["entity_key"]) for r in rows) if w]
 
     # ---------------------------------------------------------- email alerts
     def alert_subscriptions(self, active_only: bool = False) -> list[dict]:

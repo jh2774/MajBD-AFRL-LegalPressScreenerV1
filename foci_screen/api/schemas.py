@@ -98,6 +98,24 @@ class AlertSubscriptionRequest(BaseModel):
         return self
 
 
+class VehicleRequest(BaseModel):
+    """One change to how investment funds named after a contractor are followed.
+
+    `look` and `more` go to EDGAR; the others only record a decision.
+    """
+    phrase: str = Field("", max_length=120)
+    # Ask EDGAR which filers are named after `phrase`. Names only.
+    look: bool = False
+    # Read what the next few funds found have filed.
+    more: bool = False
+    # Email the portfolio's alert list when a matching fund files from now on.
+    watching: bool | None = None
+    # A fund's SEC number, to mark it as not connected to this contractor —
+    # or, in `related`, to undo that.
+    unrelated: str = Field("", pattern=r"^\d{0,10}$")
+    related: str = Field("", pattern=r"^\d{0,10}$")
+
+
 class PortfolioEdit(BaseModel):
     """Add or drop companies, returning a new key.
 

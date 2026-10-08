@@ -366,6 +366,8 @@ every night on a deploy that was screening nothing.
 | `GET /v1/advisers/{crd}` | One firm's Form ADV funds, in plain terms, and changes seen |
 | `GET /v1/edgar/companies?q=` | Companies, vehicles and people on EDGAR by name, labelled, to pick from |
 | `GET /v1/entities/{key}/formd` | A contractor's Form D fundraising notices, once its SEC record is picked |
+| `GET /v1/entities/{key}/vehicles` | Investment funds named after a contractor, as last looked up |
+| `POST /v1/entities/{key}/vehicles` | Look the name up (`look`), read the next few funds (`more`), switch alerts (`watching`), or rule a fund out (`unrelated`) |
 | `POST /v1/alerts/subscriptions` | Save who is emailed about a portfolio |
 | `POST /v1/alerts/run` | Check every watched firm and company now and email what is new |
 | `POST /v1/policy/preview` | What a proposed policy would do over past findings — saves nothing |
@@ -681,12 +683,66 @@ archive (`/Archives/edgar/data`, which robots.txt allows; `/cgi-bin` is disallow
 used). A filing never changes once made, so each is read once and kept. Checked against Shield
 AI (10 notices, 2016–2026) and Saronic (3), every field of all 13 filings parsed.
 
+## Money pooled to invest in a contractor: funds named after it
+
+Most money going into a private contractor never shows up on the contractor's own Form D.
+Existing shares change hands, and the company files nothing. What does get filed is the
+**fund set up to buy them**: a small entity — "HII Shield AI-05, a Series of HII Shield AI-A
+LLC", "Moringa x Anduril LLC" — that collects money from a group of investors and puts it into
+one company. Each files its own Form D: how much it raised, from how many investors, who runs
+it and where they are. These are often the first public sign that money is moving into a
+contractor, and the only public record of who is organising it.
+
+On a contractor's page, **Money pooled to invest in this company** looks these up. Checked on
+7 October 2026: Shield AI has 26, whose latest notices report $56.1 million from 751
+investors; Anduril has about 80.
+
+**The only link is the fund's name.** A Form D does not say what a fund invests in. So:
+
+* **A person chooses the words to match.** The page suggests the name people call the company
+  by ("Anduril", not "ANDURIL INDUSTRIES, INC."), and it can be changed. Words on their own
+  that hundreds of filers share — "Defense Systems", "Capital Partners" — are refused.
+* **Whole words, in order.** "Shield AI" matches "CDT Shield.AI SPV LLC" and not "SHIELDS AIDAN
+  H".
+* **Any fund can be marked "Not related"**, which hides it and stops alerts about it. It can be
+  undone.
+* **The company itself is set aside, not counted.** A filer whose name is the contractor's own
+  ("Shield AI Inc") is most likely the contractor, whose fundraising is the Form D section
+  above. It is named under the list and left out of the totals.
+* Everything is described as "named after", in the page and in the email.
+
+Looking a name up returns the names first, then reads what each fund filed a few at a time and
+shows them as they arrive. Nothing is read from EDGAR until someone presses the button.
+
+**Alerts.** "Alert me when a new one files" tells the email list of any portfolio the
+contractor is in when a matching fund files a new notice or updates one. Only a filing made on
+or after the day that was switched on is ever sent — the years of history a look brings back
+are not news, and neither is anything filed before the email list itself existed. Changing the
+words starts the clock again.
+
+Where it comes from, since no single EDGAR source is enough:
+
+* **EDGAR's daily index** lists every filing made on a day, with the filer's name: one file of
+  about 350 KB, whatever the number of contractors watched. It includes a fund's *first*
+  filing, which is the event worth an alert. The first use reads the last 15 business days;
+  each check after that reads the days since. A day that cannot be read stops the catch-up
+  there rather than being skipped, so it is tried again next time. Every Form D filer is kept,
+  not only the names watched today, so a contractor added next month already has its recent
+  history: about 270 short rows a day, some 70,000 a year.
+* **EDGAR's company-name lookup** finds funds that filed before the index was being kept. It
+  returns ten names at a time, so when the first answer is full it is asked again with each
+  possible next letter. That brings back most of the rest, not provably all, which is why the
+  page says "at least".
+* **EDGAR's full-text search is not used.** It turned out to index amended notices only and
+  never a fund's first, so it misses exactly what this is for.
+
 ## Email alerts on a portfolio
 
 A portfolio can carry a list of email addresses. Whenever something changes for one of its
-companies — a Form ADV change at a firm, a contractor filing a Form D, or a contractor being
-flagged under the screening policy — the list gets one email with every new item: what
-changed, what it is, and where to look. **No analysis**; the reader decides.
+companies — a Form ADV change at a firm, a contractor filing a Form D, a new fund named after a
+contractor, or a contractor being flagged under the screening policy — the list gets one email
+with every new item: what changed, what it is, and where to look. **No analysis**; the reader
+decides.
 
 * Everything already known when a list is saved is treated as sent, so the first email is about
   something that happens *next*, not the firm's history presented as news.
@@ -987,6 +1043,10 @@ columns are added explicitly.
 - **Beneficial ownership behind a secrecy-jurisdiction vehicle is not resolvable from public
   data.** The tool flags the vehicle; identifying who is behind it needs commercial registry
   data or DCSA.
+- **A fund "named after" a contractor is a name match and nothing more.** Form D does not say
+  what a fund invests in, a fund need not carry the company's name at all, and funds that sell
+  only outside the United States may not file one. The list is a set of leads, and its total
+  is a floor on money that names the company, not a measure of who owns it.
 - **Government sources have real latency.** FPDS lags award execution; SAM registration data is
   self-certified.
 

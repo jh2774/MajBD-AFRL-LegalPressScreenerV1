@@ -16,7 +16,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 
-from foci_screen import dbcopy
+from foci_screen import dbcopy, vehicles
 from foci_screen.store import Store
 
 DSN = os.environ.get("FOCI_TEST_DATABASE_URL", "").strip()
@@ -127,6 +127,53 @@ def test_postgres_to_postgres_is_the_move_itself(pg, second_pg):
     with pytest.raises(dbcopy.CopyRefused):
         dbcopy.copy_database(pg, second_pg)
     assert dbcopy.mismatches(dbcopy.copy_database(pg, second_pg, allow_nonempty=True)) == []
+
+
+def test_the_index_of_fund_filings_and_a_watch_behave_the_same_here(pg):
+    """The tables behind "funds named after a contractor": a filing seen twice
+    is kept as first recorded, a name is searched literally, and a watch is
+    changed in place."""
+    store = Store(pg, tenant_id="acme")
+    rows = [{"accession": "0009000001-26-000001", "cik": "9000001",
+             "name": "MW LSVC Northwind, LLC", "form": "D", "filed": "2026-02-01"},
+            {"accession": "0009000002-26-000002", "cik": "9000002",
+             "name": "Northwind Co-Invest II LP", "form": "D/A", "filed": "2026-05-02"}]
+    store.add_formd_index(rows, "lookup")
+    store.set_formd_facts(rows[0]["accession"], {"read_ok": True, "amount_sold": 4_500_000})
+    store.add_formd_index(rows, "daily")                # seen again in the daily list
+    found = store.formd_index_named("Northwind")
+    assert [r["cik"] for r in found] == ["9000002", "9000001"], "newest first"
+    assert found[1]["facts"] == {"read_ok": True, "amount_sold": 4_500_000}
+    assert found[1]["source"] == "lookup" and found[0]["facts"] is None
+    assert store.formd_index_named("northwind", since="2026-03-01") == [found[0]]
+    assert store.formd_index_named("n_rthwind") == [], "an underscore is not a wildcard"
+
+    store.mark_edgar_day("20261006", 2)
+    store.mark_edgar_day("20261006", 2)
+    assert store.edgar_days() == {"20261006"}
+    store.add_edgar_entities([{"cik": "9000003", "name": "Northwind Fund 3 LLC"}] * 2)
+    [entity] = store.edgar_entities_named("northwind")
+    assert entity["listed_at"] is None
+    store.mark_entity_listed("9000003")
+    assert store.edgar_entities_named("northwind")[0]["listed_at"]
+
+    watch = store.save_vehicle_watch("uei777", phrase="Northwind")
+    assert (watch["watching"], watch["unrelated"], watch["watching_since"]) == (False, [], None)
+    watch = store.save_vehicle_watch("UEI777", watching=True, unrelated=["9000001"],
+                                     looked=True, more_exist=True)
+    assert watch["watching"] is True and watch["more_exist"] is True
+    assert watch["unrelated"] == ["9000001"] and watch["watching_since"] and watch["looked_at"]
+    assert [w["entity_key"] for w in store.vehicle_watches()] == ["UEI777"]
+
+    page = vehicles.view(store, "UEI777")
+    assert [f["cik"] for f in page["vehicles"]] == ["9000002"]
+    assert page["unrelated"] == [{"cik": "9000001", "name": "MW LSVC Northwind, LLC"}]
+    assert page["index_through"] == "20261006"
+
+    other = Store(pg, tenant_id="globex")
+    assert other.vehicle_watch("UEI777") is None and other.vehicle_watches() == []
+    other.close()
+    store.close()
 
 
 def test_a_connection_the_server_closes_is_replaced(pg):

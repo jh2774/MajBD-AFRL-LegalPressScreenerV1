@@ -880,6 +880,8 @@ async function viewEntity(key) {
 
     ${formdPlaceholder()}
 
+    ${vehiclesPlaceholder()}
+
     ${f ? `<div class="card"><h2>Signals</h2>
       <div class="muted" style="font-size:12px;margin-bottom:10px">
         Marking these is what makes rule weights measurable rather than assumed —
@@ -917,6 +919,7 @@ async function viewEntity(key) {
   // After the page is drawn: a company's first Form D check reads each of its
   // filings from EDGAR, and the rest of the page should not wait for that.
   loadFormD(key, e.name || key);
+  loadVehicles(key);
 }
 
 /* A company someone put in a portfolio by name, which this database has never
@@ -965,12 +968,234 @@ async function viewUnscreened(key, identity) {
 
     ${formdPlaceholder()}
 
+    ${vehiclesPlaceholder()}
+
     ${inPortfolio ? "" : addToPortfolioButton([key], "Watch this company on your dashboard.")}`;
 
   wireScreenFirm(name);
   wireIdentity(view, key);
   wireAddToPortfolio();
   loadFormD(key, name);
+  loadVehicles(key);
+}
+
+/* ------------------------------ investment funds named after a contractor */
+
+/* A private company's shares change hands without the company filing a thing.
+ * What is filed is the fund set up to buy them — "Moringa x Anduril LLC" — and
+ * its Form D says how much was pooled, from how many investors, and who runs
+ * it. The fund is tied to the contractor by its name and nothing else, so the
+ * words to match are the reader's to choose, every result is a lead rather
+ * than a fact, and any fund can be marked as unrelated. */
+const VEHICLES_TITLE = "Money pooled to invest in this company";
+
+function vehiclesPlaceholder() {
+  return `<div class="card" id="vehicles-card"><h2>${VEHICLES_TITLE}</h2>
+    <p class="muted">Checking…</p></div>`;
+}
+
+async function loadVehicles(key) {
+  const card = document.getElementById("vehicles-card");
+  if (!card) return;
+  try {
+    drawVehicles(card, key, await api(`/v1/entities/${encodeURIComponent(key)}/vehicles`));
+  } catch (e) {
+    card.innerHTML = `<h2>${VEHICLES_TITLE}</h2><p class="muted">${esc(e.message || String(e))}</p>`;
+  }
+}
+
+function vehicleRow(f) {
+  const latest = f.latest || {};
+  const facts = latest.facts;
+  const people = facts ? (facts.people || []) : [];
+  const shown = people.slice(0, 2).map((p) =>
+    `${esc(p.name)}${p.role ? ` <span class="muted">(${esc(p.role)})</span>` : ""}${
+      p.outside_us ? ` <span class="pill warn">${esc(p.place || "outside the U.S.")}</span>` : ""}`);
+  const raised = !facts ? '<span class="muted">not read yet</span>'
+    : facts.read_ok === false ? '<span class="muted">unreadable</span>'
+    : facts.amount_sold ? `<strong>${money(facts.amount_sold)}</strong>` : "none yet";
+  return `<tr>
+    <td>${esc(f.name)}
+      ${facts && facts.outside_us ? `<span class="pill warn">based in ${esc(facts.place || "another country")}</span>` : ""}
+      <div class="muted" style="font-size:11.5px">${num(f.filings)} filing${f.filings === 1 ? "" : "s"}
+        since ${esc(f.first_filed)}</div></td>
+    <td>${esc(latest.filed || "—")}<div class="muted" style="font-size:11.5px">${
+      latest.form === "D/A" ? "update to an earlier notice" : "new notice"}</div></td>
+    <td class="num">${raised}</td>
+    <td class="num">${facts && facts.investors !== null && facts.investors !== undefined ? num(facts.investors) : "—"}</td>
+    <td style="font-size:12.5px">${shown.join("<br>") || "—"}${
+      people.length > 2 ? `<div class="muted">and ${people.length - 2} more</div>` : ""}</td>
+    <td style="white-space:nowrap;text-align:right">
+      <a class="linkish" href="${esc(latest.url || f.url)}" target="_blank" rel="noopener noreferrer">Open →</a>
+      <button class="ghost vh-unrelated" data-cik="${esc(f.cik)}"
+        title="This fund has nothing to do with this contractor; hide it and never alert on it"
+        style="margin-left:6px">Not related</button></td>
+  </tr>`;
+}
+
+/* Looking a name up is one request for the names and then one per handful of
+ * funds, each a few seconds, drawn as it arrives. A company like Anduril has
+ * eighty of these funds and each costs two requests to EDGAR; done in one go
+ * the card sat on "Asking EDGAR…" for a minute and a half. */
+const VEHICLE_STEPS = 4;
+
+async function vehicleSteps(card, key, first, waiting) {
+  const url = `/v1/entities/${encodeURIComponent(key)}/vehicles`;
+  const left = (d) => d.pending_names.length + d.unread;
+  let d = null;
+  drawBusy(card, waiting);
+  try {
+    d = await apiPost(url, first);
+    // Stop when nothing is left, when a step read nothing (EDGAR is failing
+    // on what remains), or when the reader has moved to another page.
+    let before = Infinity;
+    for (let step = first.more ? 1 : 0;
+      step < VEHICLE_STEPS && left(d) && left(d) < before && card.isConnected; step++) {
+      before = left(d);
+      drawVehicles(card, key, d, `Reading what each fund filed — ${num(before)} to go…`);
+      d = await apiPost(url, { more: true });
+    }
+    drawVehicles(card, key, d);
+  } catch (e) {
+    if (d) drawVehicles(card, key, d);
+    else card.querySelectorAll("button, input").forEach((el) => { el.disabled = false; });
+    const status = card.querySelector("#vh-status");
+    if (status) status.innerHTML = `<span class="error">${esc(e.message || String(e))}</span>`;
+  }
+}
+
+/* The day a watch began is kept in UTC, which in a U.S. evening is already
+ * tomorrow: "files from 2026-10-08 on", read on the 7th, looks like a mistake.
+ * A date is only shown once it is in the past where the reader is. */
+function sinceWords(day) {
+  const here = new Date();
+  const today = `${here.getFullYear()}-${String(here.getMonth() + 1).padStart(2, "0")}-${
+    String(here.getDate()).padStart(2, "0")}`;
+  return day && day < today ? `from ${esc(day)} on` : "from now on";
+}
+
+function drawBusy(card, text) {
+  const status = card.querySelector("#vh-status");
+  if (status) status.textContent = text;
+  card.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
+}
+
+function drawVehicles(card, key, d, busy = "") {
+  const w = d.watch;
+  const t = d.totals || {};
+  const phrase = w ? w.phrase : d.suggested_phrase;
+  const through = d.index_through
+    ? `${d.index_through.slice(0, 4)}-${d.index_through.slice(4, 6)}-${d.index_through.slice(6)}` : "";
+  const found = (t.funds || 0) + d.pending_names.length;
+  const unreadYet = d.pending_names.length + (d.unread || 0);
+
+  card.innerHTML = `
+    <h2>${VEHICLES_TITLE}</h2>
+    <p class="muted">When shares in a private company change hands, the company itself
+    files nothing. What is filed is the <strong>investment fund set up to buy them</strong>:
+    a small entity, usually named after the company, that collects money from a group of
+    investors. Each files a Form D saying how much it raised, from how many investors,
+    and who runs it.</p>
+    <p class="muted" style="font-size:12.5px"><strong>The only link to this contractor is
+    the fund's name.</strong> The filing does not say what the fund invests in, so each of
+    these is a lead to check, not a finding. Mark any that has nothing to do with this
+    company as “Not related”.</p>
+
+    <label class="field" style="display:block;font-size:12.5px">Words to look for in a fund's name
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
+        <input id="vh-phrase" value="${esc(phrase)}"
+          style="flex:1;min-width:200px;padding:8px;border:1px solid var(--border);
+          border-radius:8px;background:var(--surface-2);color:var(--text)">
+        <button id="vh-look" ${w ? "" : 'class="primary"'}>${w ? "Look again" : "Look on EDGAR"}</button>
+      </div></label>
+    <p class="muted" style="font-size:12px">Use the name people call the company by. Shorter
+    finds more: “Anduril” rather than “Anduril Industries”. The names come back first; what
+    each fund filed is then read a few at a time.</p>
+    <p class="muted" id="vh-status" style="font-size:12.5px"></p>
+
+    ${w && w.looked_at ? `
+      <p>${found
+        ? `<strong>${w.more_exist ? "At least " : ""}${num(found)}</strong>
+           fund${found === 1 ? "" : "s"} named after “${esc(w.phrase)}”
+           ${found === 1 ? "has" : "have"} filed with the
+           SEC${w.more_exist ? " (EDGAR's name lookup returns ten at a time, so there may be more)" : ""}.
+           ${t.read ? `${unreadYet
+               ? `The latest notices of the ${num(t.read)} read so far report`
+               : (found === 1 ? "Its latest notice reports" : "Their latest notices report")}
+             <strong>${money(t.raised)}</strong> raised from ${num(t.investors)}
+             investor${t.investors === 1 ? "" : "s"}.` : ""}
+           ${t.abroad ? `<span class="pill warn">${num(t.abroad)} based or run from outside the U.S.</span>` : ""}`
+        : `No fund named after “${esc(w.phrase)}” has filed with the SEC, as far as EDGAR's
+           name lookup shows.`}</p>
+
+      ${d.vehicles.length ? `<table>
+        <thead><tr><th>Fund</th><th>Latest notice</th><th class="num">Raised</th>
+          <th class="num">Investors</th><th>Run by</th><th></th></tr></thead>
+        <tbody>${d.vehicles.map(vehicleRow).join("")}</tbody></table>` : ""}
+
+      ${d.pending_names.length ? `<p class="muted" style="font-size:12.5px;margin-top:10px">
+        <strong>${num(d.pending_names.length)} more</strong> found by name, not read yet:
+        ${d.pending_names.slice(0, 6).map((p) => esc(p.name)).join("; ")}${
+          d.pending_names.length > 6 ? "; …" : ""}</p>` : ""}
+      ${unreadYet ? `<div class="actions"><button id="vh-more">Read the next ${
+          num(Math.min(VEHICLE_STEPS * 6, unreadYet))}</button></div>` : ""}
+
+      ${d.same_name.length ? `<p class="muted" style="font-size:12.5px">Left out of the list:
+        ${d.same_name.map((s) => `<a class="linkish" href="${esc(s.url)}" target="_blank"
+          rel="noopener noreferrer">${esc(s.name)}</a>`).join(", ")}, which
+        ${d.same_name.length === 1 ? "has" : "have"} this company's own name and so
+        ${d.same_name.length === 1 ? "is" : "are"} most likely the company itself rather than a
+        fund. Its own fundraising is followed in the card above, once its SEC record is
+        picked there.</p>` : ""}
+
+      <div class="actions" style="margin-top:12px">
+        <button id="vh-watch" class="${w.watching ? "" : "primary"}">${
+          w.watching ? "Stop alerts for new funds" : "Alert me when a new one files"}</button>
+        <span class="muted" style="font-size:12.5px;align-self:center">${
+          w.watching
+            ? `The portfolio's email list is told about any fund named after “${esc(w.phrase)}”
+               that files ${sinceWords(w.watching_since)}.`
+            : "Sends to the email list of any portfolio this contractor is in. Past filings are never sent."}</span>
+      </div>
+      <p class="muted" style="font-size:12px">New filings are picked up from EDGAR's daily list
+        of every filing${through ? `, read up to ${esc(through)}` : ""}.</p>
+
+      ${d.unrelated.length ? `<p class="muted" style="font-size:12.5px">Marked not related:
+        ${d.unrelated.map((u) => `${esc(u.name)}
+          <button class="ghost vh-related" data-cik="${esc(u.cik)}">undo</button>`).join(" · ")}</p>` : ""}
+    ` : ""}`;
+
+  if (busy) { drawBusy(card, busy); return; }
+
+  // A decision recorded, not a look: one request, nothing read from EDGAR.
+  const send = async (body) => {
+    drawBusy(card, "");
+    try {
+      drawVehicles(card, key, await apiPost(`/v1/entities/${encodeURIComponent(key)}/vehicles`, body));
+    } catch (e) {
+      card.querySelectorAll("button, input").forEach((el) => { el.disabled = false; });
+      card.querySelector("#vh-status").innerHTML =
+        `<span class="error">${esc(e.message || String(e))}</span>`;
+    }
+  };
+  const typed = () => card.querySelector("#vh-phrase").value.trim();
+
+  card.querySelector("#vh-look").onclick = () =>
+    vehicleSteps(card, key, { look: true, phrase: typed() },
+      "Asking EDGAR which funds carry this name…");
+  card.querySelector("#vh-phrase").onkeydown = (e) => {
+    if (e.key === "Enter") { e.preventDefault(); card.querySelector("#vh-look").click(); }
+  };
+  const more = card.querySelector("#vh-more");
+  if (more) more.onclick = () => vehicleSteps(card, key, { more: true }, "Reading more…");
+  const watch = card.querySelector("#vh-watch");
+  if (watch) watch.onclick = () => send({ watching: !w.watching });
+  card.querySelectorAll(".vh-unrelated").forEach((b) => {
+    b.onclick = () => send({ unrelated: b.dataset.cik });
+  });
+  card.querySelectorAll(".vh-related").forEach((b) => {
+    b.onclick = () => send({ related: b.dataset.cik });
+  });
 }
 
 /* --------------------------------------------- a contractor's own Form D */
@@ -2085,13 +2310,14 @@ async function alertsCard(key, portfolioName) {
       <h2>Email alerts</h2>
       <p class="muted">Anyone on this list gets an email when something changes for a
       company in this portfolio — a new fund or a change in foreign ownership at an
-      investment firm, a contractor filing a notice that it raised money (Form D), or a
-      contractor being flagged. Each email says <strong>what changed and where to
-      look</strong>. It does not judge what the change means; that is left to the person
-      reading it.</p>
-      <p class="muted" style="font-size:12.5px">Fundraising notices are watched only for
-      contractors whose SEC record has been picked — on the contractor's page, under
-      "${FORMD_TITLE}".</p>
+      investment firm, a contractor filing a notice that it raised money (Form D), a new
+      investment fund named after a contractor, or a contractor being flagged. Each email
+      says <strong>what changed and where to look</strong>. It does not judge what the
+      change means; that is left to the person reading it.</p>
+      <p class="muted" style="font-size:12.5px">Two of these are switched on per contractor,
+      on its page: fundraising notices once its SEC record has been picked under
+      "${FORMD_TITLE}", and funds named after it once someone has looked them up under
+      "${VEHICLES_TITLE}" and asked to be alerted.</p>
 
       <div class="${mode === "send" ? "muted" : "error"}" style="font-size:12.5px;margin:8px 0">
         ${esc(d.sending.explanation)}</div>
@@ -2122,8 +2348,11 @@ async function alertsCard(key, portfolioName) {
 function describeCheck(r, portfolioName) {
   if (r.status === "already running") return r.detail;
   const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
+  const funds = r.funds || {};
   const checked = `Checked ${r.firms_checked} investment firm(s) and `
-    + `${r.companies_checked || 0} contractor(s) with an SEC record.`;
+    + `${r.companies_checked || 0} contractor(s) with an SEC record`
+    + (funds.watched ? `, and looked for new funds named after ${funds.watched} contractor(s)` : "")
+    + (funds.error ? ". The list of new fund filings could not be read this time" : "") + ".";
   if (mine.status === "nothing new" || !mine.status) {
     return `${checked} Nothing new since the last alert.`;
   }

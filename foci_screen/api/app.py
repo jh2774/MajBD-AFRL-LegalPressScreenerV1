@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from .. import alerts as alerts_engine
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
+from .. import vehicles as vehicles_engine
 from ..config import get_config
 from ..connectors.adv import PDF_URL as ADV_PDF_URL
 from ..connectors.adv import SUMMARY_URL as ADV_SUMMARY_URL
@@ -37,6 +38,7 @@ from ..connectors.formd import COMPANY_URL as EDGAR_COMPANY_URL
 from ..connectors.formd import READABLE_URL as FORMD_READABLE_URL
 from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
+from ..connectors.vehicles import VehicleConnector, default_phrase, phrase_problem
 from ..jobs import HOLD_SECONDS, JobQueue
 from ..notify import render as render_notice
 from ..notify.mailer import LABEL as LABEL_OF_MAIL
@@ -53,6 +55,7 @@ from .schemas import (
     RuleSetting,
     ScreenRequest,
     SignalDisposition,
+    VehicleRequest,
     WatchlistRequest,
 )
 
@@ -701,6 +704,82 @@ def entity_formd(entity_key: str, refresh: bool = Query(False),
             "refreshed": bool(result), "refresh_detail": result.get("detail")}
 
 
+# ------------------------------ investment funds named after a contractor
+
+def _vehicles() -> VehicleConnector:
+    """A connector that asks EDGAR a little faster than a screen does.
+
+    Looking one company up is sixty-odd small requests with a person waiting.
+    The SEC's stated limit is ten a second for everything from one address; a
+    screen running at the same time uses up to FOCI_QPS (three by default),
+    so six here stays under it.
+    """
+    import dataclasses
+
+    from ..httpclient import HttpClient
+
+    quicker = dataclasses.replace(cfg, rate_limit_qps=max(cfg.rate_limit_qps, 6.0))
+    return VehicleConnector(HttpClient(quicker))
+
+
+@app.get("/v1/entities/{entity_key}/vehicles", tags=["fundraising"])
+def entity_vehicles(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
+    """Investment funds named after a contractor, as last looked up.
+
+    Reads the database only. `suggested_phrase` is the contractor's name
+    without its legal ending — the words a first look would match on.
+    """
+    key = entity_key.upper()
+    name = vehicles_engine.contractor_name(store, key)
+    return {"entity_key": key, "suggested_phrase": default_phrase(name),
+            **vehicles_engine.view(store, key)}
+
+
+@app.post("/v1/entities/{entity_key}/vehicles", tags=["fundraising"])
+def change_entity_vehicles(entity_key: str, body: VehicleRequest,
+                           store: Store = Depends(tenant_store)) -> dict:
+    """Look a name up on EDGAR, switch alerts on or off, or mark a fund unrelated.
+
+    The words to match are a person's choice, never worked out silently: a
+    fund is tied to a contractor by its name alone, and which words make that
+    tie is a judgement.
+
+    `look` finds the names and `more` reads what the next few funds filed.
+    They are separate requests, each short, so that whoever is asking can
+    show what has arrived and ask again while `pending_names` or `unread`
+    say there is more.
+    """
+    key = entity_key.upper()
+    watch = store.vehicle_watch(key)
+
+    try:
+        if body.look:
+            phrase = body.phrase.strip() or (watch or {}).get("phrase", "")
+            problem = phrase_problem(phrase)
+            if problem:
+                raise HTTPException(422, problem)
+            vehicles_engine.find(store, _vehicles(), key, phrase)
+            watch = store.vehicle_watch(key)
+        if watch is None:
+            raise HTTPException(409, "Look this company up first, so there are words to "
+                                     "match on.")
+        if body.more:
+            vehicles_engine.read_more(store, _vehicles(), key)
+    except HTTPException:
+        raise
+    except Exception as exc:            # noqa: BLE001 - say so rather than 500
+        log.warning("fund lookup for %s failed: %s", key, exc)
+        raise HTTPException(502, "EDGAR did not answer. Try again in a moment.") from exc
+
+    unrelated = set(watch["unrelated"])
+    if body.unrelated:
+        unrelated.add(str(int(body.unrelated)))
+    if body.related:
+        unrelated.discard(str(int(body.related)))
+    store.save_vehicle_watch(key, watching=body.watching, unrelated=sorted(unrelated))
+    return entity_vehicles(key, store)
+
+
 # ------------------------------------------------------------ email alerts
 
 @app.get("/v1/alerts", tags=["alerts"])
@@ -782,7 +861,8 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
             return busy
         try:
             result = alerts_engine.run_alerts(store, _adv(), Mailer(cfg),
-                                              _base_url(request), formd=_formd())
+                                              _base_url(request), formd=_formd(),
+                                              vehicles=_vehicles())
         finally:
             store.unlock("alerts")
     finally:
