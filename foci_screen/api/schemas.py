@@ -56,6 +56,9 @@ class ScreenRequest(BaseModel):
 class WatchlistRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=120)
     screen: ScreenRequest
+    # Screening-policy settings this watchlist changes, e.g.
+    # {"notice_min_severity": "low"}. Anything not named follows the tenant.
+    policy: dict | None = None
 
 
 class PortfolioRequest(BaseModel):

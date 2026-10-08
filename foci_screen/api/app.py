@@ -1395,16 +1395,52 @@ def document_diff(source: str, key: str, from_sha: str = "", to_sha: str = "",
 @app.post("/v1/watchlists", status_code=201, tags=["watchlists"])
 def create_watchlist(body: WatchlistRequest,
                      store: Store = Depends(tenant_store)) -> dict:
-    watchlist_id = store.create_watchlist(body.name, body.screen.model_dump())
-    return {"watchlist_id": watchlist_id, "name": body.name, "active": True}
+    override, policy, notes = screening.clean_override(store.screening_policy(),
+                                                       body.policy)
+    watchlist_id = store.create_watchlist(body.name, body.screen.model_dump(),
+                                          policy=override or None)
+    return {"watchlist_id": watchlist_id, "name": body.name, "active": True,
+            "policy_override": override, "policy": policy.to_dict(), "notes": notes}
 
 
 @app.get("/v1/watchlists", tags=["watchlists"])
 def list_watchlists(store: Store = Depends(tenant_store)) -> dict:
+    tenant_policy = store.screening_policy()
     rows = store.list_watchlists()
     for r in rows:
         r["params"] = _json(r.get("params"))
+        override = _json(r.pop("policy", None)) or {}
+        r["policy_override"] = override
+        r["policy"] = screening.merge(tenant_policy, override)[0].to_dict()
     return {"watchlists": rows}
+
+
+@app.put("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
+def set_watchlist_policy(watchlist_id: str, body: dict,
+                         store: Store = Depends(tenant_store)) -> dict:
+    """Replace the settings this watchlist overrides. Takes effect on its next run.
+
+    Name only what differs from the tenant policy — `{"notice_min_severity":
+    "low"}` for a portfolio of high-priority primes. Unnamed settings keep
+    following the tenant, including later changes to it. Inconsistencies are
+    corrected and reported, as for the tenant policy.
+    """
+    override, policy, notes = screening.clean_override(store.screening_policy(), body)
+    if not store.set_watchlist_policy(watchlist_id, override or None):
+        raise HTTPException(404, "No such watchlist.")
+    return {"watchlist_id": watchlist_id, "policy_override": override,
+            "policy": policy.to_dict(), "notes": notes}
+
+
+@app.delete("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
+def clear_watchlist_policy(watchlist_id: str,
+                           store: Store = Depends(tenant_store)) -> dict:
+    """Back to the tenant policy for everything."""
+    if not store.set_watchlist_policy(watchlist_id, None):
+        raise HTTPException(404, "No such watchlist.")
+    policy, _ = screening.merge(store.screening_policy(), None)
+    return {"watchlist_id": watchlist_id, "policy_override": {},
+            "policy": policy.to_dict()}
 
 
 @app.post("/v1/watchlists/{watchlist_id}/run", status_code=202, tags=["watchlists"])
@@ -1414,11 +1450,19 @@ def run_watchlist(watchlist_id: str, request: Request,
     rows = [w for w in store.list_watchlists() if w["watchlist_id"] == watchlist_id]
     if not rows:
         raise HTTPException(404, "No such watchlist.")
-    options = _json(rows[0]["params"])
+    options = {**_json(rows[0]["params"]), "watchlist_id": watchlist_id}
     run_id = store.start_run(options.get("agency", ""), options, status="queued")
     store.mark_watchlist_run(watchlist_id, run_id)
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
     return {"run_id": run_id, "status": "queued"}
+
+
+@app.post("/v1/watchlists/{watchlist_id}/resume", tags=["watchlists"])
+def resume_watchlist(watchlist_id: str, store: Store = Depends(tenant_store)) -> dict:
+    """Put a paused watchlist back on the nightly sweep."""
+    if not store.set_watchlist_active(watchlist_id, True):
+        raise HTTPException(404, "No such watchlist.")
+    return {"watchlist_id": watchlist_id, "active": True}
 
 
 @app.delete("/v1/watchlists/{watchlist_id}", tags=["watchlists"])

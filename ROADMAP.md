@@ -131,9 +131,23 @@ before acting.
    notifies once, a rejection counts as notified, and a newer draft supersedes an undecided
    older one.
 
-   Still open on this: **per-watchlist policies**, so a portfolio of high-priority primes can
-   notify on "low" while a broad agency sweep stays at "high"; and **per-person attribution**
-   of policy changes, which records `api-key:<tenant>` for the same reason decisions do.
+   ~~Still open on this: per-watchlist policies.~~ **Done.** A watchlist can carry its own
+   policy — only the settings it changes, stored as given (`{"notice_min_severity": "low"}`),
+   so everything else keeps following the tenant, including later changes to it. A portfolio
+   of high-priority primes notifies on "low" while an agency sweep stays at "high". The merged
+   policy goes through the same normalising as a saved one, so an override cannot ask for
+   notices about a category it does not screen. Runs now record the watchlist that started
+   them (`watchlist_id` in their options), which they could not before, and both halves of
+   the policy follow it: what is screened for, and what raises a notice.
+
+   Still open on this: **per-person attribution** of policy changes, which records
+   `api-key:<tenant>` for the same reason decisions do.
+
+   **Built on it: a Watchlists page** (`#/watchlists`). Scheduled screening had no page at
+   all — watchlists could only be created, run or paused through the API, and a paused one
+   could not be resumed by any route. The page lists each watchlist with what it screens, its
+   last run and its policy in words; runs one now; pauses and resumes; and edits the policy,
+   where "Follow Screening settings" means not overriding that setting at all.
 4. ~~**Server-side pagination.**~~ **Done for search.** `/v1/search` takes an `offset` and
    returns `more` per kind; the "All" tab links to a kind's own tab when it has another page,
    and that tab pages with Previous / Next. The decision the roadmap left open went to the flag

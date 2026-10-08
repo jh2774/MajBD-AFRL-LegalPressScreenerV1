@@ -46,6 +46,9 @@ class ScreenOptions:
     fetch_filing_bodies: bool = True
     min_severity: str = "low"
     skip_web: bool = False
+    # The watchlist that started this run, if one did. Its policy, laid over
+    # the tenant's, decides what is screened for and what raises a notice.
+    watchlist_id: str = ""
 
 
 @dataclass
@@ -88,6 +91,10 @@ class Screener:
         # run's lifecycle and this method must not close it out.
         owns_run = not run_id
         subject = opts.recipient or opts.agency
+        # Each run reads its own policy: a Screener reused across runs must
+        # not carry one watchlist's settings into the next.
+        self._watchlist_id = opts.watchlist_id
+        self._cached_policy = None
         if owns_run:
             run_id = self.store.start_run(subject, opts.__dict__)
         result = ScreenResult(run_id=run_id, options=opts)
@@ -517,10 +524,11 @@ class Screener:
         return finding
 
     def _policy(self) -> screening.ScreeningPolicy:
-        """This tenant's screening policy, read once per run."""
+        """The policy this run screens under, read once per run: the tenant's,
+        with the watchlist's own settings on top when a watchlist started it."""
         cached = getattr(self, "_cached_policy", None)
         if cached is None:
-            cached, _ = screening.ScreeningPolicy.from_dict(
-                self.store.screening_policy())
+            cached = screening.policy_for(self.store,
+                                          getattr(self, "_watchlist_id", ""))
             self._cached_policy = cached
         return cached
