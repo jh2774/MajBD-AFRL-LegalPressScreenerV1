@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 from datetime import date, datetime, timedelta, timezone
 
+from . import fund_managers
 from .connectors.adv import money
 from .connectors.vehicles import (
     VehicleConnector,
@@ -229,7 +230,8 @@ def view(store, entity_key: str) -> dict:
     watch = store.vehicle_watch(key)
     if not watch:
         return {"watch": None, "vehicles": [], "unrelated": [], "pending_names": [],
-                "same_name": [], "unread": 0, "totals": None,
+                "same_name": [], "unread": 0, "managers": [], "reported_only": [],
+                "totals": None,
                 "index_through": max(store.edgar_days(), default="")}
 
     own = own_ciks(store, key)
@@ -255,17 +257,24 @@ def view(store, entity_key: str) -> dict:
                  for c, n in sorted(names.items(), key=lambda kv: -int(kv[0]))
                  if bare_name(n) in itself and c not in own and c not in watch["unrelated"]]
 
+    # What the firms managing these funds say about them on their own Form ADV.
+    firms = fund_managers.reported(
+        store, watch, funds,
+        hidden={fund_managers.squash(u["name"]) for u in unrelated})
+
     known = [f["latest"]["facts"] for f in funds if f["latest"].get("facts")]
     return {
         "watch": watch, "vehicles": funds, "unrelated": unrelated,
         "pending_names": pending, "same_name": same_name,
         "unread": len(funds) - len(known),
+        "managers": firms["managers"], "reported_only": firms["reported_only"],
         "totals": {
             "funds": len(funds),
             "read": len(known),
             "raised": sum(k.get("amount_sold") or 0 for k in known),
             "investors": sum(k.get("investors") or 0 for k in known),
             "abroad": sum(1 for f in funds if f["abroad"]),
+            "reported": sum(1 for f in funds if f["reported"] or f["reported_parent"]),
         },
         "index_through": max(store.edgar_days(), default=""),
     }

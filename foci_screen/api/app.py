@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import alerts as alerts_engine
+from .. import fund_managers
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from .. import vehicles as vehicles_engine
@@ -48,6 +49,7 @@ from . import auth
 from .schemas import (
     AlertSubscriptionRequest,
     IdentityDecision,
+    ManagerRequest,
     NoticeDecision,
     PortfolioEdit,
     PortfolioKey,
@@ -642,7 +644,11 @@ def get_adviser(crd: str, refresh: bool = Query(False),
             raise HTTPException(502, result.get("detail") or
                                 "The SEC's adviser database did not answer.")
     snapshot = store.adv_snapshot(crd)
-    return {"crd": crd, "snapshot": snapshot,
+    # Which of its funds carry the name of a contractor whose funds someone
+    # here has looked up: the same link the contractor's page shows.
+    named_after = fund_managers.funds_named_after(
+        (snapshot or {}).get("funds") or [], store.vehicle_watches(watching_only=False))
+    return {"crd": crd, "snapshot": snapshot, "named_after": named_after,
             "changes": store.adv_changes([crd], limit=50),
             "links": {"summary": ADV_SUMMARY_URL.format(crd=crd),
                       "form": ADV_PDF_URL.format(crd=crd)},
@@ -788,6 +794,51 @@ def change_entity_vehicles(entity_key: str, body: VehicleRequest,
         unrelated.discard(str(int(body.related)))
     store.save_vehicle_watch(key, watching=body.watching, unrelated=sorted(unrelated))
     return entity_vehicles(key, store)
+
+
+@app.post("/v1/entities/{entity_key}/vehicles/managers", tags=["fundraising"])
+def find_fund_managers(entity_key: str, body: ManagerRequest,
+                       store: Store = Depends(tenant_store)) -> dict:
+    """Find the investment firms that manage a contractor's funds.
+
+    A firm is the manager when its own Form ADV lists the fund by name, and
+    for no other reason. `find` returns `candidates` — firms worth reading,
+    found by name or through a fund's officers, and nothing more than that.
+    `check` reads one firm's Form ADV and answers with the page again, in
+    which any fund that firm lists now carries what the firm reports about
+    it; `checked.lists` says how many it did.
+    """
+    key = entity_key.upper()
+    watch = store.vehicle_watch(key)
+    if watch is None:
+        raise HTTPException(409, "Look this company's funds up first.")
+
+    checked = None
+    if body.check:
+        crd = str(int(body.check))
+        stored = store.adv_snapshot(crd)
+        if fund_managers.worth_reading(stored):
+            # The same path the alerts use, so a change found by looking is
+            # recorded and still reaches whoever watches that firm.
+            alerts_engine.refresh_advisers(store, _adv(), [crd])
+            stored = store.adv_snapshot(crd)
+        checked = {"crd": crd, "name": (stored or {}).get("name", ""),
+                   "funds_read": bool((stored or {}).get("funds_read"))}
+
+    page = entity_vehicles(key, store)
+    if checked:
+        firm = next((m for m in page["managers"] if m["crd"] == checked["crd"]), None)
+        checked["lists"] = (firm["funds"] + firm["series"] + firm["only"]) if firm else 0
+        page["checked"] = checked
+    if body.find:
+        try:
+            page["candidates"] = fund_managers.find_candidates(
+                _adv(), page["vehicles"], watch["phrase"])
+        except Exception as exc:        # noqa: BLE001 - say so rather than 500
+            log.warning("manager lookup for %s failed: %s", key, exc)
+            raise HTTPException(502, "The SEC's adviser database did not answer. "
+                                     "Try again in a moment.") from exc
+    return page
 
 
 # ------------------------------------------------------------ email alerts

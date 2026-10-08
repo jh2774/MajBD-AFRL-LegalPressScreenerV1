@@ -116,6 +116,17 @@ class VehicleRequest(BaseModel):
     related: str = Field("", pattern=r"^\d{0,10}$")
 
 
+class ManagerRequest(BaseModel):
+    """One step of finding which investment firms manage a contractor's funds.
+
+    `find` asks the SEC's adviser database which firms are worth reading;
+    `check` reads one firm's Form ADV. Separate requests, because reading a
+    firm is a download of up to 40 MB and there may be a dozen.
+    """
+    find: bool = False
+    check: str = Field("", pattern=r"^\d{0,10}$")
+
+
 class PortfolioEdit(BaseModel):
     """Add or drop companies, returning a new key.
 

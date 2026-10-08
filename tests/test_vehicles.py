@@ -306,7 +306,7 @@ def test_looking_a_name_up_finds_its_funds_and_reads_what_each_last_said(store):
         "/9000002/000900000226000003/xslFormDX01/primary_doc.xml")
     assert newest["url"] == "https://www.sec.gov/edgar/browse/?CIK=9000002"
     assert page["totals"] == {"funds": 2, "read": 2, "raised": 34_500_000,
-                              "investors": 67, "abroad": 1}
+                              "investors": 67, "abroad": 1, "reported": 0}
     assert len(edgar.reads) == 2, "each fund's latest filing only, not its history"
     assert page["watch"]["phrase"] == "Northwind" and page["watch"]["watching"] is False
     assert page["pending_names"] == [] and page["watch"]["more_exist"] is False

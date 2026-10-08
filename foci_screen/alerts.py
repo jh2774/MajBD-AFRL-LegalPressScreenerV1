@@ -29,6 +29,7 @@ import html as html_lib
 import logging
 from datetime import datetime, timedelta, timezone
 
+from . import fund_managers
 from . import vehicles as vehicles_engine
 from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
@@ -120,18 +121,21 @@ def refresh_issuers(store, formd: FormDConnector, ciks: list[str]) -> dict[str, 
 
 # ------------------------------------------------------------------- items
 
-def adv_item(change: dict) -> dict:
+def adv_item(change: dict, watches: list[dict] | tuple = ()) -> dict:
+    """`watches` are the fund watches of the contractors in the same portfolio:
+    a change to a fund named after one of them says so, and goes up the list."""
+    tie = fund_managers.tie_to_contractor(change, list(watches))
     return {
         "item_id": f"adv:{change['change_id']}",
         "kind": "adv",
         "company": change.get("firm", ""),
         "headline": change.get("headline", ""),
-        "detail": change.get("detail", ""),
+        "detail": " ".join(x for x in (change.get("detail", ""), tie) if x),
         "explainer": change.get("explainer", ""),
         "where": change.get("where", ""),
         "links": [("Firm summary on the SEC's adviser site", change["links"]["summary"]),
                   ("Full Form ADV (PDF)", change["links"]["form"])],
-        "importance": change.get("importance", 1),
+        "importance": change.get("importance", 1) + (1 if tie else 0),
     }
 
 
@@ -195,7 +199,8 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     entities = watched_keys(store, entities)
     ciks = store.confirmed_ciks(entities)
     sent = store.alert_already_sent(subscription["subscription_id"])
-    items = [adv_item(c) for c in store.adv_changes(crds, limit=200)]
+    looked_up = [w for w in (store.vehicle_watch(k) for k in dict.fromkeys(entities)) if w]
+    items = [adv_item(c, looked_up) for c in store.adv_changes(crds, limit=200)]
     items += [formd_item(c, base_url, ciks.get(str(c.get("cik")), ""))
               for c in store.formd_changes(list(ciks), limit=200)]
     items += [notice_item(n, base_url) for n in store.notices_for_entities(entities)]

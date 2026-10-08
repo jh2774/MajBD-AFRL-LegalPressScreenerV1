@@ -1184,6 +1184,26 @@ class Store:
         except (ValueError, TypeError):
             return None
 
+    def adv_snapshots_mentioning(self, words: list[str]) -> list[dict]:
+        """Stored Form ADV readings whose text contains any of `words`, as
+        [{crd, snapshot}].
+
+        A coarse filter, so that finding which firms list a fund does not mean
+        parsing every firm on file; the caller decides what really matches.
+        """
+        wanted = [w for w in dict.fromkeys(words) if w][:40]
+        if not wanted:
+            return []
+        where = " OR ".join(f"LOWER(snapshot) LIKE ? {ESC}" for _ in wanted)
+        out = []
+        for row in self._query(f"SELECT crd, snapshot FROM adv_snapshots WHERE {where}"
+                               " ORDER BY crd", tuple(_like(w) for w in wanted)):
+            try:
+                out.append({"crd": row["crd"], "snapshot": json.loads(row["snapshot"])})
+            except (ValueError, TypeError):
+                continue
+        return out
+
     def save_adv_snapshot(self, crd: str, snapshot: dict, filing_date: str) -> None:
         with self._tx() as c:
             c.execute(

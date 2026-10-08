@@ -165,8 +165,23 @@ def test_the_index_of_fund_filings_and_a_watch_behave_the_same_here(pg):
     assert watch["unrelated"] == ["9000001"] and watch["watching_since"] and watch["looked_at"]
     assert [w["entity_key"] for w in store.vehicle_watches()] == ["UEI777"]
 
+    # A firm's Form ADV on file, found by a word in it and joined to the fund
+    # of the same name.
+    store.save_adv_snapshot("283630", {
+        "crd": "283630", "name": "MANHATTAN WEST", "filing_date": "07/14/2026",
+        "funds": [{"fund_id": "805-1", "name": "NORTHWIND CO-INVEST II, L.P.",
+                   "owned_by_non_us_pct": 21}]}, "07/14/2026")
+    store.save_adv_snapshot("999001", {"crd": "999001", "name": "HARBORLIGHT", "funds": []},
+                            "03/31/2026")
+    found = store.adv_snapshots_mentioning(["zzzz", "Northwind"])
+    assert [r["crd"] for r in found] == ["283630"]
+    assert store.adv_snapshots_mentioning(["n_rthwind"]) == []
+    assert store.adv_snapshots_mentioning([]) == []
+
     page = vehicles.view(store, "UEI777")
     assert [f["cik"] for f in page["vehicles"]] == ["9000002"]
+    assert page["vehicles"][0]["reported"][0]["non_us_pct"] == 21
+    assert [m["name"] for m in page["managers"]] == ["MANHATTAN WEST"]
     assert page["unrelated"] == [{"cik": "9000001", "name": "MW LSVC Northwind, LLC"}]
     assert page["index_through"] == "20261006"
 

@@ -406,6 +406,7 @@ every night on a deploy that was screening nothing.
 | `GET /v1/entities/{key}/formd` | A contractor's Form D fundraising notices, once its SEC record is picked |
 | `GET /v1/entities/{key}/vehicles` | Investment funds named after a contractor, as last looked up |
 | `POST /v1/entities/{key}/vehicles` | Look the name up (`look`), read the next few funds (`more`), switch alerts (`watching`), or rule a fund out (`unrelated`) |
+| `POST /v1/entities/{key}/vehicles/managers` | Find the firms worth reading (`find`), or read one firm's Form ADV and join it to the funds (`check`) |
 | `POST /v1/alerts/subscriptions` | Save who is emailed about a portfolio |
 | `POST /v1/alerts/run` | Check every watched firm and company now and email what is new |
 | `POST /v1/policy/preview` | What a proposed policy would do over past findings — saves nothing |
@@ -773,6 +774,54 @@ Where it comes from, since no single EDGAR source is enough:
   page says "at least".
 * **EDGAR's full-text search is not used.** It turned out to index amended notices only and
   never a fund's first, so it misses exactly what this is for.
+
+### Who manages those funds, and how much of each is owned outside the U.S.
+
+A fund's Form D names its officers, not the investment firm behind it. The firm says so
+itself: Form ADV, Schedule D, Section 7.B.(1) lists every private fund a firm manages, by
+name, with — question 16 — **the share owned by people and organisations outside the United
+States**. So the two filings can be joined, and the join answers the question this tool
+exists for: how much of the money pooled into a contractor is foreign.
+
+Under the list of funds, **Who manages these funds** does this. Checked on 8 October 2026
+for Shield AI, six of its 26 funds came back with their manager's own figures:
+
+| Fund (Form D) | Managed by (Form ADV) | Owned outside the U.S. |
+|---|---|---|
+| MW LSVC Shield AI, LLC | Manhattan West Asset Management | 21% |
+| MW LSVC Shield AI-II, LLC | Manhattan West Asset Management | 0% |
+| GSBackers Shield AI Fund I a Series of CGF2021 LLC | GSBackers, LLC | 22% |
+| Fuel Venture Capital Shield AI, LLC … | Fuel Venture Capital Partners | 30% *of the whole series company* |
+| Greenbird Intelligence Fund, LLC, Series W and Series U | Greenbird Intelligence Management | 0% *of the whole series company* |
+
+**A firm is the manager when its own Form ADV lists a fund of exactly that name, and for no
+other reason.** Names are compared letter for letter (punctuation and capitals aside); a
+firm whose name merely resembles the fund's is never shown.
+
+* **Finding which firms to read is guesswork, and is kept out of sight.** "Look for the firms
+  that manage them" searches the SEC's adviser database (IAPD) for the companies named on
+  the funds' filings, for the sponsor's part of each fund's own name, and for the firms the
+  funds' officers are registered with. Each firm found is then read; only those whose form
+  lists a fund are named. For Shield AI nine firms were read: four list its funds, two do
+  not, and three could not be read.
+* **An officer's firm is used only when IAPD holds exactly one person of that first and last
+  name.** Its search is loose — asked for "Christopher DeLap" it answers with five people
+  named Delaney — so near-matches are ignored, and two people of one name count as nobody.
+  Nothing about the person is kept.
+* **Many funds are one series of a larger company**, and a firm may report the company
+  without each series. That is shown and said for what it is: the firm's figure then covers
+  every series together, not the one named after the contractor.
+* **A fund on a Form ADV with no Form D** under the same name — sold abroad, say — is listed
+  separately.
+* **"Watch this firm"** adds the firm to the portfolio, so its Form ADV is checked with the
+  others. An alert about a fund named after a contractor in the same portfolio then says
+  so, and is listed first. The firm's own page marks those funds too.
+* If the lookup finds nothing, a firm can be searched by name and checked the same way.
+
+Limits: Form ADV is refiled once a year, so a fund set up since a firm's last filing is not
+on it yet — no match does not mean no manager. A firm that files no Form ADV cannot be found
+this way. A form larger than 40 MB is not read, and is not downloaded again for a week.
+Question 16 says how much is owned outside the U.S., not by whom or from where.
 
 ## Email alerts on a portfolio
 

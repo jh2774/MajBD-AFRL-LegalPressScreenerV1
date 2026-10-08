@@ -1077,6 +1077,93 @@ async function loadVehicles(key) {
   }
 }
 
+/* What the firm managing a fund says about it on its own Form ADV. Shown only
+ * when a firm's filing lists a fund of exactly this name — or the company this
+ * fund is one series of, in which case the firm's figure covers every series
+ * together and the sentence has to say so. */
+function outsideUs(e, whole) {
+  if (e.non_us_pct === null || e.non_us_pct === undefined) {
+    return `The firm gives no figure for how much of ${whole} is owned outside the U.S.`;
+  }
+  return `The firm reports <strong>${num(e.non_us_pct)}%</strong> of ${whole} owned by
+    people and organisations outside the U.S.`;
+}
+
+function firmLink(e) {
+  return `<a href="#/adviser/${esc(e.crd)}">${esc(e.firm)}</a>`;
+}
+
+function managedBy(f) {
+  const line = (html) => `<div style="font-size:12px;margin-top:4px;padding-left:8px;
+    border-left:2px solid var(--accent)">${html}</div>`;
+  const filed = (e) => `<span class="muted">(its Form ADV of ${esc(e.filing_date || "unknown date")})</span>`;
+  if ((f.reported || []).length) {
+    return f.reported.map((e) => line(`Managed by ${firmLink(e)}.
+      ${outsideUs(e, "this fund")} ${filed(e)}`)).join("");
+  }
+  return (f.reported_parent || []).map((e) => line(`One series of ${esc(e.name)}, which
+    ${firmLink(e)} manages. ${outsideUs(e,
+      "that whole company (all of its series together, not this one alone)")}
+    ${filed(e)}`)).join("");
+}
+
+function managersSection(d) {
+  if (!d.vehicles.length && !d.reported_only.length) return "";
+  const counted = (m) => [
+    m.funds ? `Lists ${num(m.funds)} of these funds by name.` : "",
+    m.series ? `Lists the company that ${num(m.series)} of these funds
+      ${m.series === 1 ? "is a series" : "are series"} of.` : "",
+    m.only ? `Lists ${num(m.only)} more fund${m.only === 1 ? "" : "s"} named after this
+      company, with no Form D found under the same name.` : "",
+  ].filter(Boolean).join(" ");
+  return `
+    <h3 style="margin-top:18px">Who manages these funds</h3>
+    <p class="muted" style="font-size:12.5px">A fund's own filing names its officers, not the
+    investment firm behind it. The firm says so itself: an investment firm that reports to
+    the SEC lists every fund it manages on its <strong>Form ADV</strong>, with the share of
+    each owned outside the United States. <strong>A firm is named here only when its own
+    Form ADV lists the fund by exactly this name</strong> — never because the names look
+    alike.</p>
+
+    ${d.managers.length ? `<table>
+      <thead><tr><th>Investment firm</th><th>What its Form ADV lists</th><th></th></tr></thead>
+      <tbody>${d.managers.map((m) => `<tr>
+        <td><a href="#/adviser/${esc(m.crd)}">${esc(m.name)}</a>
+          <div class="muted" style="font-size:11.5px">CRD ${esc(m.crd)}
+            · Form ADV of ${esc(m.filing_date || "unknown date")}</div></td>
+        <td>${counted(m)}</td>
+        <td style="text-align:right;white-space:nowrap">
+          <button class="vm-watch" data-crd="${esc(m.crd)}" data-name="${esc(m.name)}"
+            title="Add this firm to your portfolio, so its email list hears when the firm's Form ADV changes">Watch this firm</button></td>
+      </tr>`).join("")}</tbody></table>` : ""}
+
+    ${d.reported_only.length ? `<p class="muted" style="font-size:12.5px">Also on a firm's
+      Form ADV, with no Form D found under the same name:
+      ${d.reported_only.map((e) => `<strong>${esc(e.name)}</strong> (${firmLink(e)}${
+        e.non_us_pct === null || e.non_us_pct === undefined ? ""
+          : `, ${num(e.non_us_pct)}% owned outside the U.S.`})`).join("; ")}.</p>` : ""}
+
+    <div class="actions">
+      <button id="vm-find">${d.managers.length ? "Look again for the firms that manage them"
+        : "Look for the firms that manage them"}</button>
+      <span class="muted" id="vm-status" style="font-size:12.5px;align-self:center"></span>
+    </div>
+    <p class="muted" style="font-size:12px">Looks in the SEC's adviser database for the
+    companies and officers named on these funds' filings, then reads each likely firm's Form
+    ADV, which takes a few seconds a firm. Form ADV is refiled once a year, so a fund set up
+    since a firm's last filing is not on it yet: no match here does not mean no manager.</p>
+
+    <label class="field" style="display:block;font-size:12.5px">Know which firm it is? Check its
+      Form ADV directly
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
+        <input id="vm-q" placeholder="Firm name, e.g. Manhattan West"
+          style="flex:1;min-width:200px;padding:8px;border:1px solid var(--border);
+          border-radius:8px;background:var(--surface-2);color:var(--text)">
+        <button id="vm-search">Search firms</button>
+      </div></label>
+    <div id="vm-results" class="muted" style="font-size:12.5px"></div>`;
+}
+
 function vehicleRow(f) {
   const latest = f.latest || {};
   const facts = latest.facts;
@@ -1091,7 +1178,8 @@ function vehicleRow(f) {
     <td>${esc(f.name)}
       ${facts && facts.outside_us ? `<span class="pill warn">based in ${esc(facts.place || "another country")}</span>` : ""}
       <div class="muted" style="font-size:11.5px">${num(f.filings)} filing${f.filings === 1 ? "" : "s"}
-        since ${esc(f.first_filed)}</div></td>
+        since ${esc(f.first_filed)}</div>
+      ${managedBy(f)}</td>
     <td>${esc(latest.filed || "—")}<div class="muted" style="font-size:11.5px">${
       latest.form === "D/A" ? "update to an earlier notice" : "new notice"}</div></td>
     <td class="num">${raised}</td>
@@ -1147,13 +1235,92 @@ function sinceWords(day) {
   return day && day < today ? `from ${esc(day)} on` : "from now on";
 }
 
-function drawBusy(card, text) {
-  const status = card.querySelector("#vh-status");
+function drawBusy(card, text, where = "#vh-status") {
+  const status = card.querySelector(where) || card.querySelector("#vh-status");
   if (status) status.textContent = text;
   card.querySelectorAll("button, input").forEach((el) => { el.disabled = true; });
 }
 
-function drawVehicles(card, key, d, busy = "") {
+/* Finding the managers: one request for which firms are worth reading, then
+ * one per firm, because reading a firm's Form ADV is a download of up to 40 MB.
+ * `firms` given means a person chose the firm, and nothing is looked up. */
+async function managerSteps(card, key, firms = null) {
+  const url = `/v1/entities/${encodeURIComponent(key)}/vehicles/managers`;
+  const at = "#vm-status";
+  const chosen = firms && firms.length === 1 ? firms[0].name : "";
+  let d = null;
+  let note = "";
+  drawBusy(card, chosen ? `Reading the Form ADV of ${chosen}…`
+    : "Looking in the SEC's adviser database for the firms and officers named on these funds…", at);
+  try {
+    if (!firms) {
+      d = await apiPost(url, { find: true });
+      firms = d.candidates || [];
+    }
+    let listing = 0;
+    let unreadable = 0;
+    for (let i = 0; i < firms.length && card.isConnected; i++) {
+      const doing = `Reading the Form ADV of ${firms[i].name} (${i + 1} of ${firms.length})…`;
+      if (d) drawVehicles(card, key, d, doing, at); else drawBusy(card, doing, at);
+      d = await apiPost(url, { check: firms[i].crd });
+      if (!d.checked.funds_read) unreadable++;
+      else if (d.checked.lists) listing++;
+    }
+    const none = firms.length - listing - unreadable;
+    if (chosen) {
+      note = listing ? `${chosen}'s Form ADV lists funds named here — see the table above.`
+        : unreadable ? `${chosen}'s Form ADV could not be read here.`
+          : `${chosen}'s Form ADV does not list a fund under any of these names.`;
+    } else {
+      note = !firms.length
+        ? "No investment firm was found under the names on these funds' filings."
+        : `Read the Form ADV of ${num(firms.length)} firm${firms.length === 1 ? "" : "s"}: `
+          + `${num(listing)} list${listing === 1 ? "s" : ""} these funds`
+          + (none ? `, ${num(none)} ${none === 1 ? "does" : "do"} not` : "")
+          + (unreadable ? `, and ${num(unreadable)} could not be read here` : "") + ".";
+    }
+  } catch (e) {
+    note = e.message || String(e);
+  }
+  if (d) drawVehicles(card, key, d);
+  else card.querySelectorAll("button, input").forEach((el) => { el.disabled = false; });
+  const status = card.querySelector(at);
+  if (status) status.textContent = note;
+}
+
+/* The fallback when the lookup finds nothing: the reader names the firm. It is
+ * checked the same way — its Form ADV either lists these funds or it does not. */
+function wireManagerSearch(card, key) {
+  const input = card.querySelector("#vm-q");
+  const out = card.querySelector("#vm-results");
+  const search = async () => {
+    const q = input.value.trim();
+    if (q.length < 2) return;
+    out.textContent = "Searching the SEC's adviser database…";
+    try {
+      const d = await api(`/v1/advisers/search?q=${encodeURIComponent(q)}`);
+      if (!d.firms.length) {
+        out.textContent = d.detail || "No registered investment firm by that name.";
+        return;
+      }
+      out.innerHTML = `<table><tbody>${d.firms.map((f) => `
+        <tr><td>${esc(f.name)} <span class="muted" style="font-size:12px">· CRD ${esc(f.crd)}${
+          f.status ? " · " + esc(f.status.toLowerCase()) : ""}</span></td>
+        <td style="text-align:right"><button class="vm-check" data-crd="${esc(f.crd)}"
+          data-name="${esc(f.name)}">Check its Form ADV</button></td></tr>`).join("")}
+        </tbody></table>`;
+      out.querySelectorAll(".vm-check").forEach((b) => {
+        b.onclick = () => managerSteps(card, key, [{ crd: b.dataset.crd, name: b.dataset.name }]);
+      });
+    } catch (e) {
+      out.textContent = e.message || String(e);
+    }
+  };
+  card.querySelector("#vm-search").onclick = search;
+  input.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); search(); } };
+}
+
+function drawVehicles(card, key, d, busy = "", busyAt = "#vh-status") {
   const w = d.watch;
   const t = d.totals || {};
   const phrase = w ? w.phrase : d.suggested_phrase;
@@ -1197,7 +1364,10 @@ function drawVehicles(card, key, d, busy = "") {
                : (found === 1 ? "Its latest notice reports" : "Their latest notices report")}
              <strong>${money(t.raised)}</strong> raised from ${num(t.investors)}
              investor${t.investors === 1 ? "" : "s"}.` : ""}
-           ${t.abroad ? `<span class="pill warn">${num(t.abroad)} based or run from outside the U.S.</span>` : ""}`
+           ${t.abroad ? `<span class="pill warn">${num(t.abroad)} based or run from outside the U.S.</span>` : ""}
+           ${t.reported ? `${num(t.reported)} ${t.reported === 1 ? "is" : "are"} on the Form ADV
+             of the investment firm that manages ${t.reported === 1 ? "it" : "them"}; what the
+             firm reports is noted under each.` : ""}`
         : `No fund named after “${esc(w.phrase)}” has filed with the SEC, as far as EDGAR's
            name lookup shows.`}</p>
 
@@ -1221,6 +1391,8 @@ function drawVehicles(card, key, d, busy = "") {
         fund. Its own fundraising is followed in the card above, once its SEC record is
         picked there.</p>` : ""}
 
+      ${managersSection(d)}
+
       <div class="actions" style="margin-top:12px">
         <button id="vh-watch" class="${w.watching ? "" : "primary"}">${
           w.watching ? "Stop alerts for new funds" : "Alert me when a new one files"}</button>
@@ -1238,7 +1410,30 @@ function drawVehicles(card, key, d, busy = "") {
           <button class="ghost vh-related" data-cik="${esc(u.cik)}">undo</button>`).join(" · ")}</p>` : ""}
     ` : ""}`;
 
-  if (busy) { drawBusy(card, busy); return; }
+  if (busy) { drawBusy(card, busy, busyAt); return; }
+
+  const find = card.querySelector("#vm-find");
+  if (find) {
+    find.onclick = () => managerSteps(card, key);
+    wireManagerSearch(card, key);
+    card.querySelectorAll(".vm-watch").forEach((b) => {
+      b.onclick = async () => {
+        b.disabled = true;
+        const firm = `CRD:${b.dataset.crd}`;
+        try {
+          const r = await apiPost("/v1/portfolio/edit", {
+            key: savedPortfolioKey(), add: [firm], names: { [firm]: b.dataset.name },
+          });
+          rememberPortfolioKey(r.key);
+          await syncAlertList(r.key);
+          b.outerHTML = '<a href="#/portfolio">In your portfolio →</a>';
+        } catch (e) {
+          b.disabled = false;
+          card.querySelector("#vm-status").textContent = e.message || String(e);
+        }
+      };
+    });
+  }
 
   // A decision recorded, not a look: one request, nothing read from EDGAR.
   const send = async (body) => {
@@ -2628,7 +2823,11 @@ async function viewAdviser(crd) {
           <th class="num">Investors</th><th>Set up in</th>
           <th class="num">Owned outside the U.S.</th></tr></thead>
         <tbody>${funds.map((f) => `<tr>
-          <td>${esc(f.name)}<div class="muted" style="font-size:11.5px">${esc(f.fund_id)}</div></td>
+          <td>${esc(f.name)}<div class="muted" style="font-size:11.5px">${esc(f.fund_id)}</div>
+            ${((d.named_after || {})[f.fund_id] || []).map((c) => `<div style="font-size:12px;
+              margin-top:4px;padding-left:8px;border-left:2px solid var(--accent)">Named after
+              <a href="#/entity/${encodeURIComponent(c.entity_key)}">${esc(c.phrase)}</a>, a
+              contractor whose funds were looked up here. The link is the name only.</div>`).join("")}</td>
           <td class="num">${f.gross_asset_value === null || f.gross_asset_value === undefined
             ? "—" : money(f.gross_asset_value)}</td>
           <td class="num">${f.investors === null ? "—" : num(f.investors)}</td>

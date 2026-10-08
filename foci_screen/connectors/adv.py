@@ -62,6 +62,7 @@ from dataclasses import asdict, dataclass, field
 log = logging.getLogger("foci.adv")
 
 SEARCH_API = "https://api.adviserinfo.sec.gov/search/firm"
+PEOPLE_API = "https://api.adviserinfo.sec.gov/search/individual"
 FIRM_API = "https://api.adviserinfo.sec.gov/search/firm/{crd}"
 PDF_URL = "https://reports.adviserinfo.sec.gov/reports/ADV/{crd}/PDF/{crd}.pdf"
 SUMMARY_URL = "https://adviserinfo.sec.gov/firm/summary/{crd}"
@@ -676,6 +677,43 @@ class AdvConnector:
                 ) if x),
             })
         return out
+
+    def employers_of(self, person: str) -> list[dict]:
+        """The investment firms a person is registered with, as [{crd, name}] —
+        but only when the SEC's database holds exactly one person of that
+        first and last name.
+
+        A fund's Form D names its officers and not the firm they work for,
+        and this is the one public record that joins the two. The search
+        behind it is loose: "Christopher DeLap" brings back five people named
+        Delaney. So anything but the same first and last name is ignored, and
+        two people of one name are treated as nobody, because which of them
+        is meant cannot be told from a name. Nothing about the person is kept;
+        the firm is only ever a place to look, never an answer in itself.
+        """
+        wanted = re.findall(r"[a-z]+", (person or "").casefold())
+        if len(wanted) < 2:
+            return []
+        first, last = wanted[0], wanted[-1]
+        resp = self.http.get(PEOPLE_API, params={
+            "query": person.strip(), "hl": "true", "nrows": 10, "start": 0,
+            "r": 25, "sort": "score+desc", "wt": "json"}, use_cache=False)
+
+        def bare(text) -> str:
+            return re.sub(r"[^a-z]", "", str(text or "").casefold())
+
+        same_name = [hit.get("_source", {}) for hit in
+                     (((resp.get("json") or {}).get("hits") or {}).get("hits") or [])
+                     if bare(hit.get("_source", {}).get("ind_firstname")) == first
+                     and bare(hit.get("_source", {}).get("ind_lastname")) == last]
+        if len(same_name) != 1:
+            return []
+        firms: dict[str, dict] = {}
+        for job in same_name[0].get("ind_ia_current_employments") or []:
+            crd = str(job.get("firm_id") or "").strip()
+            if crd.isdigit() and job.get("firm_name"):
+                firms.setdefault(crd, {"crd": crd, "name": job["firm_name"]})
+        return list(firms.values())
 
     def refresh(self, crd: str, previous: AdviserSnapshot | None = None) -> AdviserSnapshot:
         """Current state of a firm. Schedule D is read only when the filing is new."""
