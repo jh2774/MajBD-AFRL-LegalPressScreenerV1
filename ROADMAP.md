@@ -165,10 +165,15 @@ before acting.
    * **An officer reassignment is logged, not signalled.** It changes who to notify, not
      whether there is anything to notify about.
 
-   Still open here: a change is filed under the contractor that holds the award *now*, so a
-   novation does not appear on the losing contractor's page. And the audit trail is per-award;
-   an entity-level "this contractor re-registered" roll-up would read better than three
-   identical rows on three awards.
+   ~~Still open here: a novation not appearing on the losing contractor's page, and the audit
+   trail being per-award.~~ **Done.** `contract_change_events` reads a contractor's changes
+   one row per event: rows from the same screen with the same field and the same before and
+   after are one event carrying the awards it touched, so a re-registration across twelve
+   awards is one line. A novation shows on both sides — "moved away" on the contractor that
+   lost the award, "moved here" on the one that gained it — and the UEI and name that move with
+   the award fold into that row instead of reading as two more events. A contractor whose every
+   award has left used to 404 (no awards, no finding); its page now opens and shows where the
+   work went, under the name the move recorded.
 
 ## Phase 3 - Native program
 

@@ -380,6 +380,7 @@ CREATE INDEX IF NOT EXISTS idx_disp_rule ON dispositions(tenant_id, rule_id);
 CREATE INDEX IF NOT EXISTS idx_disp_entity ON dispositions(tenant_id, entity_key);
 CREATE INDEX IF NOT EXISTS idx_cchanges ON contract_changes(tenant_id, entity_key);
 CREATE INDEX IF NOT EXISTS idx_cchanges_run ON contract_changes(tenant_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_cchanges_old ON contract_changes(tenant_id, field, old_value);
 CREATE INDEX IF NOT EXISTS idx_formd_index_cik ON formd_index(cik);
 CREATE INDEX IF NOT EXISTS idx_formd_index_filed ON formd_index(filed);
 """
@@ -1941,6 +1942,100 @@ class Store:
         for r in rows:
             r["label"] = labels.get(r["field"], r["field"])
         return rows
+
+    def contract_change_events(self, entity_key: str, limit: int = 50) -> list[dict]:
+        """What moved in this contractor's award record, one row per event.
+
+        Two things `contract_changes` alone gets wrong for a contractor's page.
+
+        A change is filed under the contractor that holds the award *now*, so
+        a novation from A to B appeared only on B's page — and A, the side
+        that lost the work, showed nothing. Here a contractor also sees awards
+        whose previous holder it was, marked as departed.
+
+        And one event recorded per award reads as many events. A contractor
+        that re-registers in another country does so once, but with twelve
+        awards it showed twelve identical rows. Rows from the same screen with
+        the same field and the same before and after are one event here,
+        carrying the awards it touched.
+        """
+        key = entity_key.upper().strip()
+        rows = self._query(
+            "SELECT * FROM contract_changes WHERE tenant_id=?"
+            " AND (entity_key=? OR (field='entity_key' AND old_value=?))"
+            " ORDER BY id DESC LIMIT ?",
+            (self.tenant_id, key, key, limit * 20))
+        labels = dict(self.WATCHED_FIELDS)
+
+        events: dict[tuple, dict] = {}
+        for r in rows:
+            moved = r["field"] == "entity_key"
+            departed = moved and r["old_value"] == key and r["entity_key"] != key
+            if not departed and r["entity_key"] != key:
+                continue
+            group = (r["run_id"], r["field"], r["old_value"], r["new_value"], departed)
+            ev = events.get(group)
+            if ev is None:
+                if len(events) >= limit:
+                    continue
+                ev = events[group] = {
+                    "field": r["field"], "label": labels.get(r["field"], r["field"]),
+                    "old_value": r["old_value"], "new_value": r["new_value"],
+                    "run_id": r["run_id"], "observed_at": r["observed_at"],
+                    "direction": ("departed" if departed
+                                  else "arrived" if moved else ""),
+                    "contracts": []}
+            if r["contract_key"] not in ev["contracts"]:
+                ev["contracts"].append(r["contract_key"])
+
+        # An award arriving brings its UEI and contractor name with it. Shown
+        # separately those read as three events; they are one, and the
+        # "moved here" row already names and links the previous holder.
+        arrivals = {(ev["run_id"], c) for ev in events.values()
+                    if ev["direction"] == "arrived" for c in ev["contracts"]}
+        events = {g: ev for g, ev in events.items()
+                  if not (ev["field"] in ("recipient_uei", "entity_name")
+                          and all((ev["run_id"], c) in arrivals for c in ev["contracts"]))}
+
+        for ev in events.values():
+            ev["contract_count"] = len(ev["contracts"])
+            if ev["direction"]:
+                # The other party, by name. A departed award's row names its
+                # new holder; an arrived award's change of name names the old.
+                ev["counterparty_key"] = (ev["new_value"] if ev["direction"] == "departed"
+                                          else ev["old_value"])
+                ev["counterparty_name"] = self._name_at_move(
+                    ev["contracts"][0], ev["run_id"],
+                    "new" if ev["direction"] == "departed" else "old")
+        return list(events.values())
+
+    def departed_entity_name(self, entity_key: str, departed: list[dict]) -> str:
+        """The name a contractor went by, from the awards that left it.
+
+        Its contract rows now carry the new holder's name, so the only place
+        the old one survives is the name change recorded with the move.
+        """
+        for ev in departed:
+            for contract_key in ev["contracts"]:
+                name = self._name_at_move(contract_key, ev["run_id"], "old")
+                if name:
+                    return name
+        return ""
+
+    def _name_at_move(self, contract_key: str, run_id: str, side: str) -> str:
+        """The contractor name on one side of a recorded move, if it was recorded."""
+        row = self._one(
+            "SELECT old_value, new_value FROM contract_changes WHERE tenant_id=?"
+            " AND contract_key=? AND run_id=? AND field='entity_name'",
+            (self.tenant_id, contract_key, run_id))
+        if row:
+            return row["new_value" if side == "new" else "old_value"] or ""
+        if side == "new":
+            current = self._one(
+                "SELECT entity_name FROM contracts WHERE tenant_id=? AND contract_key=?",
+                (self.tenant_id, contract_key))
+            return (current or {}).get("entity_name") or ""
+        return ""
 
     def get_contract(self, contract_key: str) -> dict | None:
         row = self._one("SELECT * FROM contracts WHERE tenant_id=? AND contract_key=?",

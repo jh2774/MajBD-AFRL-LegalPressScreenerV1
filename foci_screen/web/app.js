@@ -242,28 +242,58 @@ const CHANGE_IS_RISK = new Set([
   "recipient_country", "foreign_owned",
 ]);
 
-function recordChanges(changes) {
+/* One row per event. A change seen on several awards in one screen — a
+ * contractor re-registering in another country, say — is one event listing the
+ * awards, not a row per award. An award that moved to another contractor shows
+ * on both sides: "moved away" here, "moved here" on the new holder's page. */
+function changedAwards(ch) {
+  const links = (ch.contracts || []).slice(0, 3).map(
+    (k) => `<a href="#/contract/${encodeURIComponent(k)}" class="mono">${esc(k)}</a>`);
+  const rest = (ch.contract_count || 0) - links.length;
+  return links.join(", ") + (rest > 0 ? ` and ${num(rest)} more` : "");
+}
+
+function recordChanges(changes, selfKey) {
   if (!changes.length) return "";
-  const rows = changes.map((ch) => `
+  const side = (k, name) =>
+    k && k !== selfKey ? linkEntity(k, name || k) : '<span class="muted">this contractor</span>';
+  const rows = changes.map((ch) => {
+    let what = esc(ch.label || ch.field);
+    let was = `<span class="mono">${esc(ch.old_value || "—")}</span>`;
+    let now = `<span class="mono">${esc(ch.new_value || "—")}</span>`;
+    if (ch.direction === "departed") {
+      what = "Award moved away";
+      was = side(selfKey);
+      now = side(ch.counterparty_key, ch.counterparty_name);
+    } else if (ch.direction === "arrived") {
+      what = "Award moved here";
+      was = side(ch.counterparty_key, ch.counterparty_name);
+      now = side(selfKey);
+    }
+    return `
     <tr>
       <td>${day(ch.observed_at)}</td>
-      <td>${esc(ch.label || ch.field)}</td>
-      <td class="mono">${esc(ch.old_value || "—")}</td>
-      <td class="mono">${esc(ch.new_value || "—")}</td>
+      <td>${what}</td>
+      <td>${was}</td>
+      <td>${now}</td>
+      <td>${changedAwards(ch)}</td>
       <td>${CHANGE_IS_RISK.has(ch.field)
              ? '<span class="pill warn">structural</span>'
              : '<span class="pill">administrative</span>'}</td>
-    </tr>`).join("");
+    </tr>`;
+  }).join("");
   return `
     <div class="card">
       <h2>Changes to the award record</h2>
       <div class="muted" style="font-size:12px;margin-bottom:10px">
-        What moved between screens. A contractor or UEI changing is a novation;
-        a country of incorporation changing is the most direct structural
-        indicator in the contract record. Both are written over in place, so
-        this is the only place the previous value survives.</div>
+        What moved between screens. A contractor or UEI changing is a novation,
+        and shows on both contractors' pages; a country of incorporation
+        changing is the most direct structural indicator in the contract
+        record. Both are written over in place, so this is the only place the
+        previous value survives.</div>
       <table>
-        <thead><tr><th>Seen</th><th>Field</th><th>Was</th><th>Now</th><th></th></tr></thead>
+        <thead><tr><th>Seen</th><th>Change</th><th>Was</th><th>Now</th>
+          <th>Awards</th><th></th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
@@ -905,7 +935,7 @@ async function viewEntity(key) {
 
     ${addToPortfolioButton([key], "Watch this contractor on your dashboard.")}
 
-    ${recordChanges(d.record_changes || [])}
+    ${recordChanges(d.record_changes || [], d.entity_key || key.toUpperCase())}
 
     <div class="card">
       <h2>Awards</h2>

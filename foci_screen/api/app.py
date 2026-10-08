@@ -379,16 +379,25 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
     key = store.resolve_entity_key(entity_key)
     contracts = store.contracts_where("entity_key", key)
     findings = store.search_findings(entity_key=key, limit=1)
-    if not contracts and not findings:
+    changes = store.contract_change_events(key, limit=50)
+    # A contractor whose every award has been novated away has no awards and
+    # may have no finding, but it is the side of the move a reviewer most
+    # needs to see. Its page shows where the work went.
+    departed = [ch for ch in changes if ch["direction"] == "departed"]
+    if not contracts and not findings and not departed:
         raise HTTPException(404, "Nothing recorded for that entity.")
 
     latest = findings[0] if findings else None
     totals = store.contract_totals("entity_key", key)
+    if latest:
+        entity = latest.get("entity") or {}
+    elif contracts:
+        entity = {"name": contracts[0]["entity_name"], "uei": contracts[0]["recipient_uei"]}
+    else:
+        entity = {"name": store.departed_entity_name(key, departed) or key, "uei": key}
     return {
         "entity_key": key,
-        "entity": (latest or {}).get("entity", {"name": contracts[0]["entity_name"],
-                                                "uei": contracts[0]["recipient_uei"]}
-                                     if contracts else {}),
+        "entity": entity,
         # From the contracts table, not the finding payload: an entity screened
         # again with no new signal still has its awards.
         "contracts": contracts,
@@ -398,9 +407,10 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
         "contracts_shown": len(contracts),
         "latest_finding": latest,
         "history": store.entity_history(key),
-        # What moved in the award record since the last screen. The contracts
-        # rows above hold only the present state.
-        "record_changes": store.contract_changes(entity_key=key, limit=50),
+        # What moved in the award record, one row per event, including awards
+        # that have since moved to another contractor. The contracts rows
+        # above hold only the present state.
+        "record_changes": changes,
     }
 
 
