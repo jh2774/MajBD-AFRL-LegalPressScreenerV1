@@ -264,6 +264,81 @@ def test_search_rejects_unknown_kind(client):
     assert c.get("/v1/search?q=x&kind=planets", headers=AUTH).status_code == 422
 
 
+# ------------------------------------------------------------------ paging
+
+def _many_equal_contractors(store, n=7):
+    """`n` contractors with identical totals: every row ties on the sort."""
+    store.start_run("DoD", {}, run_id="r9")
+    for i in range(n):
+        store.save_contract(
+            make_contract(piid=f"P{i:03d}", award_id=f"T{i}", award_amount=1_000_000.0,
+                          recipient_name=f"TIED CONTRACTOR {i}", recipient_uei=f"TIE{i}",
+                          ko_email=f"ko{i}@mail.mil", ko_name=f"Officer {i}",
+                          description="Tied work"),
+            "r9", f"TIE{i}")
+
+
+@pytest.mark.parametrize("search", ["search_entities", "search_contracts",
+                                    "search_officers"])
+def test_pages_over_tied_rows_neither_repeat_nor_skip(store, search):
+    """Equal amounts sort in no particular order unless something breaks the
+    tie, and then paging repeats some rows and never shows others."""
+    _many_equal_contractors(store)
+    fn = getattr(store, search)
+    q = "tied" if search == "search_contracts" else ""
+    key = {"search_entities": "entity_key", "search_contracts": "contract_key",
+           "search_officers": "ko_email"}[search]
+
+    everything = [r[key] for r in fn(q, 100, 0)]
+    paged = [r[key] for off in range(0, 9, 3) for r in fn(q, 3, off)]
+
+    assert len(everything) == 7
+    assert paged == everything
+
+
+def test_agency_search_pages(populated):
+    first = populated.search_agencies("", 1, 0)
+    second = populated.search_agencies("", 1, 1)
+    assert len(first) == len(second) == 1
+    assert first[0]["agency"] != second[0]["agency"]
+
+
+def test_search_endpoint_says_when_there_is_another_page(client):
+    c, module = client
+    _many_equal_contractors(module.store_for("acme"))
+
+    page1 = c.get("/v1/search?q=tied&kind=entity&limit=5", headers=AUTH).json()
+    page2 = c.get("/v1/search?q=tied&kind=entity&limit=5&offset=5", headers=AUTH).json()
+
+    assert len(page1["entities"]) == 5 and page1["more"] == {"entities": True}
+    assert len(page2["entities"]) == 2 and page2["more"] == {"entities": False}
+    assert not ({r["entity_key"] for r in page1["entities"]}
+                & {r["entity_key"] for r in page2["entities"]})
+    assert (page2["offset"], page2["limit"]) == (5, 5)
+
+
+def test_search_all_reports_more_per_kind(client):
+    c, module = client
+    _many_equal_contractors(module.store_for("acme"))
+    body = c.get("/v1/search?q=tied&limit=5", headers=AUTH).json()
+    assert body["more"]["entities"] is True
+    assert body["more"]["agencies"] is False
+    assert len(body["entities"]) == 5
+
+
+def test_browse_lists_no_awards_and_still_pages(client):
+    c, module = client
+    _many_equal_contractors(module.store_for("acme"))
+    body = c.get("/v1/search?q=&limit=3", headers=AUTH).json()
+    assert body["contracts"] == [] and body["more"]["contracts"] is False
+    assert body["more"]["entities"] is True
+
+
+def test_search_rejects_a_negative_offset(client):
+    c, _ = client
+    assert c.get("/v1/search?q=x&offset=-1", headers=AUTH).status_code == 422
+
+
 def test_overview_endpoint(client):
     c, _ = client
     body = c.get("/v1/overview", headers=AUTH).json()

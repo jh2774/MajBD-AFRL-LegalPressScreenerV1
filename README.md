@@ -388,7 +388,7 @@ every night on a deploy that was screening nothing.
 |---|---|
 | `POST /v1/screens` | Start a screen; returns `run_id` (202) |
 | `GET /v1/screens/{id}` | Status, progress, findings when complete |
-| `GET /v1/search?q=&kind=` | One query over contractors, awards, officers, agencies |
+| `GET /v1/search?q=&kind=&offset=` | One query over contractors, awards, officers, agencies; paged, with `more` per kind |
 | `GET /v1/overview` | Everything the dashboard charts, in one call |
 | `GET /v1/findings` | The change feed, filterable by severity and date |
 | `GET /v1/entities/{key}` | Profile, contracts, signal history |

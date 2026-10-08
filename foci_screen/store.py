@@ -2101,7 +2101,12 @@ class Store:
     # injection — it was a wrong answer: "SPACE_SYSTEMS" matched
     # "SPACEXSYSTEMS", and a search for "%" returned the whole table as though
     # everything in it matched.
-    def search_contracts(self, q: str, limit: int = 25) -> list[dict]:
+    #
+    # Every search orders by a unique column last. Ties on amount are common
+    # (equal awards, agencies with zero-value rows), and without a tiebreak the
+    # database may return them in a different order on each query — so paging
+    # by offset would repeat some rows and skip others.
+    def search_contracts(self, q: str, limit: int = 25, offset: int = 0) -> list[dict]:
         like = _like(q)
         rows = self._query(
             "SELECT * FROM contracts WHERE tenant_id=? AND ("
@@ -2109,8 +2114,8 @@ class Store:
             f" OR LOWER(solicitation_id) LIKE ? {ESC} OR LOWER(description) LIKE ? {ESC}"
             f" OR LOWER(psc_description) LIKE ? {ESC}"
             f" OR LOWER(naics_description) LIKE ? {ESC})"
-            " ORDER BY amount DESC LIMIT ?",
-            (self.tenant_id, like, like, like, like, like, like, limit))
+            " ORDER BY amount DESC, contract_key LIMIT ? OFFSET ?",
+            (self.tenant_id, like, like, like, like, like, like, limit, offset))
         return [_decode_contract(r) for r in rows]
 
     def _all_tokens_clause(self, q: str, columns: tuple[str, ...]) -> tuple[str, list]:
@@ -2134,7 +2139,7 @@ class Store:
             return ("1=0", [])
         return (" AND ".join(clauses), params)
 
-    def search_entities(self, q: str = "", limit: int = 25) -> list[dict]:
+    def search_entities(self, q: str = "", limit: int = 25, offset: int = 0) -> list[dict]:
         """Contractors, with their latest severity attached."""
         params: list = [self.tenant_id]
         sql = ("SELECT entity_key, MAX(entity_name) AS entity_name,"
@@ -2158,8 +2163,8 @@ class Store:
             params.append(_prefix(q))
         else:
             sql += " ORDER BY SUM(amount) DESC"
-        sql += " LIMIT ?"
-        params.append(limit)
+        sql += ", entity_key LIMIT ? OFFSET ?"
+        params += [limit, offset]
 
         rows = self._query(sql, tuple(params))
         for r in rows:
@@ -2172,7 +2177,7 @@ class Store:
             r["last_screened"] = latest["created_at"] if latest else None
         return rows
 
-    def search_officers(self, q: str = "", limit: int = 25) -> list[dict]:
+    def search_officers(self, q: str = "", limit: int = 25, offset: int = 0) -> list[dict]:
         params: list = [self.tenant_id]
         sql = ("SELECT ko_email, MAX(ko_name) AS ko_name,"
                " MAX(ko_confidence) AS ko_confidence, MAX(ko_source) AS ko_source,"
@@ -2197,11 +2202,11 @@ class Store:
             params.append(_prefix(q))
         else:
             sql += " ORDER BY SUM(amount) DESC"
-        sql += " LIMIT ?"
-        params.append(limit)
+        sql += ", ko_email LIMIT ? OFFSET ?"
+        params += [limit, offset]
         return self._query(sql, tuple(params))
 
-    def search_agencies(self, q: str = "", limit: int = 25) -> list[dict]:
+    def search_agencies(self, q: str = "", limit: int = 25, offset: int = 0) -> list[dict]:
         params: list = [self.tenant_id]
         sql = ("SELECT agency, sub_agency, COUNT(*) AS contract_count,"
                " SUM(amount) AS obligated, COUNT(DISTINCT entity_key) AS entity_count,"
@@ -2219,8 +2224,9 @@ class Store:
             sql += f" AND ({ors})"
             for spelling in spellings:
                 params += [_like(spelling), _like(spelling)]
-        sql += " GROUP BY agency, sub_agency ORDER BY SUM(amount) DESC LIMIT ?"
-        params.append(limit)
+        sql += (" GROUP BY agency, sub_agency"
+                " ORDER BY SUM(amount) DESC, agency, sub_agency LIMIT ? OFFSET ?")
+        params += [limit, offset]
         return self._query(sql, tuple(params))
 
     # An agency page is reached by either name, so both have to match. Doing
@@ -2265,12 +2271,12 @@ class Store:
                 "obligated": float(row["obligated"] or 0.0),
                 "entity_count": int(row["entity_count"] or 0)}
 
-    def search_all(self, q: str, limit: int = 10) -> dict:
+    def search_all(self, q: str, limit: int = 10, offset: int = 0) -> dict:
         return {
-            "entities": self.search_entities(q, limit),
-            "contracts": self.search_contracts(q, limit),
-            "officers": self.search_officers(q, limit),
-            "agencies": self.search_agencies(q, limit),
+            "entities": self.search_entities(q, limit, offset),
+            "contracts": self.search_contracts(q, limit, offset),
+            "officers": self.search_officers(q, limit, offset),
+            "agencies": self.search_agencies(q, limit, offset),
         }
 
     # ------------------------------------------------------------- dashboards

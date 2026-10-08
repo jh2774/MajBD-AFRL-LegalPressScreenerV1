@@ -134,15 +134,27 @@ before acting.
    Still open on this: **per-watchlist policies**, so a portfolio of high-priority primes can
    notify on "low" while a broad agency sweep stays at "high"; and **per-person attribution**
    of policy changes, which records `api-key:<tenant>` for the same reason decisions do.
-4. **Server-side pagination.** Search caps at 100 rows and the UI renders all of them. Fine at
-   current volumes, wrong after a few thousand awards.
+4. ~~**Server-side pagination.**~~ **Done for search.** `/v1/search` takes an `offset` and
+   returns `more` per kind; the "All" tab links to a kind's own tab when it has another page,
+   and that tab pages with Previous / Next. The decision the roadmap left open went to the flag
+   rather than a total: a total would run every search twice, and what the page needs to know
+   is whether there is a next one. Each list is asked for one row beyond the page, and that
+   row answers it.
 
-   Partly addressed: entity, officer and agency pages no longer *aggregate* the page they
-   render. `contract_totals` and `agency_totals` count and sum in SQL over every matching row,
-   and the UI says "showing the 200 largest of N". Those pages used to sum a 200-row list and
-   publish the result as an obligated total, which understated silently. What remains is
-   paging through the rows themselves — an offset, a next link, and a decision about whether
-   search should report a total count or just a "more" flag.
+   Two things paging exposed. Every search now ends its `ORDER BY` with a unique column:
+   amounts tie often, and without a tiebreak Postgres may return tied rows in a different
+   order per query, so an offset repeats some and skips others. (SQLite happens to be stable
+   here, which is why it never showed locally.) And the search page's match count counted
+   only the rows on screen, so a search with hundreds of matches said "25"; it now says
+   "25+".
+
+   Earlier, and still true: entity, officer and agency pages no longer *aggregate* the page
+   they render. `contract_totals` and `agency_totals` count and sum in SQL over every matching
+   row, and the UI says "showing the 200 largest of N".
+
+   Still open: those three pages show the 200 largest and stop. Paging them is the same
+   change as search's, if a contractor or an agency ever holds more than 200 awards worth
+   reading one by one.
 
 5. ~~**Detect a novated award as an event, not just a new value.**~~ **Done.**
    `contract_changes` records what moved on an award between screens, and three rules read it:

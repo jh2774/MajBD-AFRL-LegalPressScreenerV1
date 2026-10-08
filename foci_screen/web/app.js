@@ -709,12 +709,26 @@ function wireScreenFirm(q) {
   };
 }
 
-async function viewSearch(q, kind) {
+const SEARCH_PAGE = 25;
+
+/* Search is paged on the server. The "All" tab shows the first page of each
+ * kind and links to that kind's own tab when there is more; a kind's tab pages
+ * through every match with Previous / Next. The count says "25+" rather than
+ * "25" when there is more — it used to count only the rows on screen, so a
+ * search with hundreds of matches reported twenty-five. */
+async function viewSearch(q, kind, offset) {
+  kind = kind || "all";
+  offset = Math.max(0, parseInt(offset, 10) || 0);
   document.getElementById("search-input").value = q;
   setBusy(`Searching for “${q}”…`);
   const d = await api(
-    `/v1/search?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kind || "all")}&limit=25`
+    `/v1/search?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kind)}` +
+    `&limit=${SEARCH_PAGE}&offset=${offset}`
   );
+  const more = d.more || {};
+  const anyMore = Object.values(more).some(Boolean);
+  const searchHash = (k, off) =>
+    `#/search/${encodeURIComponent(q)}/${k}${off ? `/${off}` : ""}`;
 
   const tabs = [
     ["all", "All"],
@@ -725,32 +739,61 @@ async function viewSearch(q, kind) {
   ]
     .map(
       ([k, lbl]) =>
-        `<button data-kind="${k}" class="${(kind || "all") === k ? "active" : ""}">${lbl}</button>`
+        `<button data-kind="${k}" class="${kind === k ? "active" : ""}">${lbl}</button>`
     )
     .join("");
 
-  const total =
+  const shown =
     (d.entities || []).length + (d.contracts || []).length +
     (d.officers || []).length + (d.agencies || []).length;
 
-  const section = (title, html, rows) =>
-    rows && rows.length ? `<div class="card"><h2>${title}</h2>${html}</div>` : "";
+  // On "All", a kind with more than one page links to its own tab.
+  const seeAll = (key, k, label) =>
+    kind === "all" && more[key]
+      ? `<div class="actions"><a class="linkish" href="${searchHash(k)}">See all ${label} →</a></div>`
+      : "";
+  const section = (title, html, rows, key, k, label) =>
+    rows && rows.length
+      ? `<div class="card"><h2>${title}</h2>${html}${seeAll(key, k, label)}</div>`
+      : "";
+
+  // On a single kind's tab, page through every match.
+  const pager = () => {
+    if (kind === "all" || (!offset && !anyMore)) return "";
+    const first = shown ? offset + 1 : offset;
+    return `
+      <div class="pager">
+        <span class="muted">Showing ${num(first)}–${num(offset + shown)}${anyMore ? "" : " (end)"}</span>
+        ${offset ? `<a class="linkish" href="${searchHash(kind, Math.max(0, offset - SEARCH_PAGE))}">← Previous</a>` : ""}
+        ${anyMore ? `<a class="linkish" href="${searchHash(kind, offset + SEARCH_PAGE)}">Next →</a>` : ""}
+      </div>`;
+  };
+
+  const count = offset
+    ? `Page ${Math.floor(offset / SEARCH_PAGE) + 1}`
+    : `${shown}${anyMore ? "+" : ""} match${shown === 1 && !anyMore ? "" : "es"}`;
 
   view.innerHTML = `
     <div class="page-head">
       <h1>${q ? `Results for “${esc(q)}”` : "Browse"}</h1>
-      <div class="sub">${total} match${total === 1 ? "" : "es"}${q ? "" : " — showing the largest of each"}</div>
+      <div class="sub">${count}${q ? "" : " — largest first"}</div>
     </div>
     <div class="tabs">${tabs}</div>
-    ${total === 0 ? screenThisFirm(q) : ""}
-    ${section("Contractors", entitiesTable(d.entities || []), d.entities)}
-    ${section("Awards", contractsTable(d.contracts || []), d.contracts)}
-    ${section("Contracting officers", officersTable(d.officers || []), d.officers)}
-    ${section("Agencies", agenciesTable(d.agencies || []), d.agencies)}`;
+    ${shown === 0 && !offset ? screenThisFirm(q) : ""}
+    ${section("Contractors", entitiesTable(d.entities || []), d.entities,
+              "entities", "entity", "contractors")}
+    ${section("Awards", contractsTable(d.contracts || []), d.contracts,
+              "contracts", "contract", "awards")}
+    ${section("Contracting officers", officersTable(d.officers || []), d.officers,
+              "officers", "officer", "contracting officers")}
+    ${section("Agencies", agenciesTable(d.agencies || []), d.agencies,
+              "agencies", "agency", "agencies")}
+    ${shown === 0 && offset ? `<div class="card empty">No more results on this page.</div>` : ""}
+    ${pager()}`;
 
   view.querySelectorAll(".tabs button").forEach((b) => {
     b.onclick = () => {
-      location.hash = `#/search/${encodeURIComponent(q)}/${b.dataset.kind}`;
+      location.hash = searchHash(b.dataset.kind);
     };
   });
   wireScreenFirm(q);
@@ -2990,7 +3033,8 @@ async function viewScreening(notes) {
 
 const ROUTES = [
   [/^\/?$/, () => viewOverview()],
-  [/^\/search\/([^/]*)(?:\/([^/]*))?$/, (q, k) => viewSearch(decodeURIComponent(q), k)],
+  [/^\/search\/([^/]*)(?:\/([^/]*))?(?:\/(\d+))?$/,
+   (q, k, off) => viewSearch(decodeURIComponent(q), k, off)],
   [/^\/entity\/(.+)$/, (k) => viewEntity(decodeURIComponent(k))],
   [/^\/officer\/(.+)$/, (e) => viewOfficer(decodeURIComponent(e))],
   [/^\/agency\/(.+)$/, (n) => viewAgency(decodeURIComponent(n))],
