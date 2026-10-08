@@ -414,6 +414,7 @@ every night on a deploy that was screening nothing.
 | `POST /v1/portfolio` | Open a key into a dashboard of those companies |
 | `POST /v1/watchlists` | Agencies to re-screen on a schedule, optionally with their own `policy` |
 | `PUT / DELETE /v1/watchlists/{id}/policy` | The screening-policy settings one watchlist changes — the rest follow the tenant |
+| `POST /v1/watchlists/{id}/resume` | Put a paused watchlist back on the nightly sweep (`DELETE /v1/watchlists/{id}` pauses it) |
 | `GET /v1/notices` | The review queue |
 | `POST /v1/notices/{id}/approve` | The human gate. Records a decision — does not send |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |

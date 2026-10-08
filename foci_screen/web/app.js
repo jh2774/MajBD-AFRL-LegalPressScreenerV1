@@ -3029,6 +3029,212 @@ async function viewScreening(notes) {
   };
 }
 
+/* -------------------------------------------------------------- watchlists
+ *
+ * Screens that re-run on the nightly sweep. Each can carry its own policy —
+ * only the settings it changes from the Screening page — so a short list of
+ * high-priority primes can raise notices at "low" while an agency sweep stays
+ * quiet. "Follow Screening settings" means not overriding that setting at
+ * all, so a later change on the Screening page reaches this watchlist too. */
+
+function watchlistSubject(p) {
+  const what = p.recipient ? `Contractor ${p.recipient}`
+    : [p.agency, p.sub_agency].filter(Boolean).join(" › ") || "—";
+  const scope = `${num(p.months_back ?? 12)} months · up to ${num(p.max_entities ?? 5)}` +
+    ` contractor(s)` +
+    (p.max_subaward_entities ? ` + ${num(p.max_subaward_entities)} subcontractor(s)` : "");
+  return `${esc(what)}<div class="muted" style="font-size:12px">${esc(scope)}</div>`;
+}
+
+function watchlistPolicySummary(override) {
+  const o = override || {};
+  const parts = [];
+  if (o.notice_min_severity) parts.push(`notices at ${o.notice_min_severity}`);
+  if (o.notice_mode) parts.push(o.notice_mode.replace(/_/g, " "));
+  if (o.categories) parts.push(`screens ${o.categories.length ? o.categories.join(", ") : "nothing"}`);
+  const other = Object.keys(o).filter(
+    (k) => !["notice_min_severity", "notice_mode", "categories"].includes(k));
+  if (other.length) parts.push(`${other.length} other setting(s)`);
+  return parts.length ? esc(parts.join(" · "))
+    : '<span class="muted">Follows Screening settings</span>';
+}
+
+function watchlistPolicyForm(w, cat) {
+  const o = w.policy_override || {};
+  const sev = ["", ...cat.notice_severities].map((s) =>
+    `<option value="${s}" ${s === (o.notice_min_severity || "") ? "selected" : ""}>${
+      s || "Follow Screening settings"}</option>`).join("");
+  const mode = ["", ...Object.keys(cat.notice_modes)].map((m) =>
+    `<option value="${m}" ${m === (o.notice_mode || "") ? "selected" : ""}>${
+      m ? m.replace(/_/g, " ") : "Follow Screening settings"}</option>`).join("");
+  const ownCats = Array.isArray(o.categories);
+  return `
+    <form class="wl-policy" data-id="${esc(w.watchlist_id)}" hidden>
+      <label class="field">Notify for findings at or above
+        <select name="notice_min_severity">${sev}</select></label>
+      <label class="field" style="margin-top:8px">When
+        <select name="notice_mode">${mode}</select></label>
+      <label class="check" style="margin-top:8px">
+        <input type="checkbox" name="own_categories" ${ownCats ? "checked" : ""}>
+        <span>Screen a different set of categories from the Screening page</span></label>
+      <div class="checks wl-cats" ${ownCats ? "" : "hidden"}>
+        ${checkboxes("categories", cat.categories,
+                     ownCats ? o.categories : w.policy.categories)}</div>
+      <div class="actions">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" class="ghost wl-cancel">Cancel</button>
+      </div>
+    </form>`;
+}
+
+function readWatchlistPolicy(form) {
+  const override = {};
+  const sev = form.querySelector('[name="notice_min_severity"]').value;
+  const mode = form.querySelector('[name="notice_mode"]').value;
+  if (sev) override.notice_min_severity = sev;
+  if (mode) override.notice_mode = mode;
+  if (form.querySelector('[name="own_categories"]').checked) {
+    override.categories = [...form.querySelectorAll('input[name="categories"]:checked')]
+      .map((i) => i.value);
+  }
+  return override;
+}
+
+async function viewWatchlists(notes) {
+  setBusy("Loading watchlists…");
+  const [d, pol] = await Promise.all([api("/v1/watchlists"), api("/v1/policy")]);
+  const cat = pol.catalogue;
+  const lists = d.watchlists || [];
+
+  const rows = lists.map((w) => `
+    <tr class="${w.active ? "" : "rule-off"}">
+      <td><strong>${esc(w.name)}</strong>
+        ${w.active ? "" : '<div class="muted" style="font-size:12px">paused</div>'}</td>
+      <td>${watchlistSubject(w.params || {})}</td>
+      <td>${w.last_run_id
+        ? `<a href="#/screens/${encodeURIComponent(w.last_run_id)}">${day(w.last_run_at)}</a>`
+        : '<span class="muted">never</span>'}</td>
+      <td>${watchlistPolicySummary(w.policy_override)}
+        ${watchlistPolicyForm(w, cat)}</td>
+      <td class="wl-actions">
+        <button type="button" class="linkish" data-act="run" data-id="${esc(w.watchlist_id)}">Run now</button>
+        <button type="button" class="linkish" data-act="policy" data-id="${esc(w.watchlist_id)}">Policy</button>
+        <button type="button" class="linkish" data-act="${w.active ? "pause" : "resume"}"
+          data-id="${esc(w.watchlist_id)}">${w.active ? "Pause" : "Resume"}</button>
+      </td>
+    </tr>`).join("");
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Watchlists</h1>
+      <div class="sub">Screens that re-run on the nightly sweep. Each can raise
+        notices on its own terms; anything it does not set follows the
+        <a href="#/screening">Screening</a> page.</div>
+    </div>
+
+    ${policyNotes(notes)}
+
+    <div class="card">
+      ${lists.length ? `<table>
+        <thead><tr><th>Name</th><th>Screens</th><th>Last run</th><th>Policy</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table>`
+        : `<div class="empty">No watchlists yet. Add one below and it joins the
+           nightly sweep.</div>`}
+    </div>
+
+    <form id="wl-new" class="card">
+      <h2>New watchlist</h2>
+      <div class="form-grid">
+        <label>Name <input name="name" required maxlength="120"
+          placeholder="Navy primes"></label>
+        <label>Agency <input name="agency" placeholder="Department of Defense"></label>
+        <label>Sub-agency <input name="sub_agency" placeholder="Department of the Navy (optional)"></label>
+        <label>Or one contractor <input name="recipient"
+          placeholder="Name or UEI — instead of an agency"></label>
+        <label>Months to look back <input name="months_back" type="number" min="1" max="60" value="12"></label>
+        <label>Awards to read <input name="max_awards" type="number" min="1" max="500" value="25"></label>
+        <label>Contractors to screen <input name="max_entities" type="number" min="1" max="100" value="5"></label>
+        <label>Subcontractors too <input name="max_subaward_entities" type="number" min="0" max="50" value="0"></label>
+        <label>Notify at or above
+          <select name="notice_min_severity">
+            <option value="">Follow Screening settings</option>
+            ${cat.notice_severities.map((s) => `<option value="${s}">${s}</option>`).join("")}
+          </select></label>
+      </div>
+      <div class="actions"><button type="submit" class="primary">Add watchlist</button></div>
+    </form>`;
+
+  view.querySelectorAll(".wl-actions button").forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.id;
+      try {
+        if (b.dataset.act === "run") {
+          const r = await apiPost(`/v1/watchlists/${encodeURIComponent(id)}/run`, {});
+          location.hash = `#/screens/${encodeURIComponent(r.run_id)}`;
+        } else if (b.dataset.act === "pause") {
+          await apiSend("DELETE", `/v1/watchlists/${encodeURIComponent(id)}`);
+          viewWatchlists();
+        } else if (b.dataset.act === "resume") {
+          await apiPost(`/v1/watchlists/${encodeURIComponent(id)}/resume`, {});
+          viewWatchlists();
+        } else {
+          const form = view.querySelector(`form.wl-policy[data-id="${CSS.escape(id)}"]`);
+          form.hidden = !form.hidden;
+        }
+      } catch (err) {
+        showError(err);
+      }
+    };
+  });
+
+  view.querySelectorAll("form.wl-policy").forEach((form) => {
+    const own = form.querySelector('[name="own_categories"]');
+    own.onchange = () => { form.querySelector(".wl-cats").hidden = !own.checked; };
+    form.querySelector(".wl-cancel").onclick = () => { form.hidden = true; };
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const id = encodeURIComponent(form.dataset.id);
+      const override = readWatchlistPolicy(form);
+      try {
+        const r = Object.keys(override).length
+          ? await apiSend("PUT", `/v1/watchlists/${id}/policy`, override)
+          : await apiSend("DELETE", `/v1/watchlists/${id}/policy`);
+        viewWatchlists(r.notes);
+      } catch (err) {
+        showError(err);
+      }
+    };
+  });
+
+  document.getElementById("wl-new").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const text = (k) => String(f.get(k) || "").trim();
+    const int = (k) => parseInt(f.get(k), 10);
+    if (!text("agency") && !text("recipient")) {
+      showError({ title: "Nothing to screen", message: "Give an agency or a contractor." });
+      return;
+    }
+    const body = {
+      name: text("name"),
+      screen: {
+        agency: text("agency"), sub_agency: text("sub_agency"), recipient: text("recipient"),
+        months_back: int("months_back"), max_awards: int("max_awards"),
+        max_entities: int("max_entities"), max_subaward_entities: int("max_subaward_entities"),
+      },
+    };
+    if (text("notice_min_severity")) {
+      body.policy = { notice_min_severity: text("notice_min_severity") };
+    }
+    try {
+      const r = await apiPost("/v1/watchlists", body);
+      viewWatchlists(r.notes);
+    } catch (err) {
+      showError(err);
+    }
+  };
+}
+
 /* ------------------------------------------------------------------ router */
 
 const ROUTES = [
@@ -3047,6 +3253,7 @@ const ROUTES = [
   [/^\/rules$/, () => viewRules()],
   [/^\/portfolio$/, () => viewPortfolio()],
   [/^\/screening$/, () => viewScreening()],
+  [/^\/watchlists$/, () => viewWatchlists()],
   [/^\/adviser\/(\d+)$/, (crd) => viewAdviser(crd)],
   [/^\/screens\/(.+)$/, (id) => viewScreen(decodeURIComponent(id))],
 ];
