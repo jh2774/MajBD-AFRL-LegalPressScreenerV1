@@ -641,3 +641,84 @@ def test_static_mount_does_not_shadow_the_api(client):
     c, _ = client
     assert c.get("/v1/overview", headers=AUTH).status_code == 200
     assert c.get("/health").status_code == 200
+
+
+# ---------------------------------------------- paging the profile pages
+#
+# All 205 bulk awards are worth the same, so every row ties on the sort: the
+# case where an unordered tie repeats some rows across a page boundary and
+# never shows others.
+
+def test_an_entitys_awards_page_through_every_award_once(client):
+    c, app_module = client
+    _load_many(app_module.store_for("acme"))
+
+    first = c.get("/v1/entities/UEI777", headers=AUTH).json()
+    second = c.get("/v1/entities/UEI777?offset=200", headers=AUTH).json()
+
+    assert (len(first["contracts"]), first["contracts_more"]) == (200, True)
+    assert (len(second["contracts"]), second["contracts_more"]) == (5, False)
+    keys = [x["contract_key"] for x in first["contracts"] + second["contracts"]]
+    assert len(keys) == len(set(keys)) == BULK
+    assert second["contract_count"] == BULK          # totals do not page
+
+
+def test_an_officers_awards_page_and_watch_all_covers_every_contractor(client):
+    c, app_module = client
+    store = app_module.store_for("acme")
+    _load_many(store)
+    # A small award from another contractor, which sorts onto the last page.
+    store.save_contract(
+        make_contract(piid="TINY0001", award_id="T1", recipient_uei="UEI888",
+                      recipient_name="TINY LLC", award_amount=1.0,
+                      ko_email="bulk.officer@mail.mil"), "rbulk", "UEI888")
+
+    first = c.get("/v1/officers/bulk.officer@mail.mil", headers=AUTH).json()
+    assert first["contracts_more"] is True
+    assert "UEI888" not in {x["entity_key"] for x in first["contracts"]}
+    # "Watch these contractors" is about the officer, not the page open.
+    assert first["entity_keys"] == ["UEI777", "UEI888"]
+
+    last = c.get("/v1/officers/bulk.officer@mail.mil?offset=200", headers=AUTH).json()
+    assert last["contracts"][-1]["contract_key"] == "TINY0001"
+    assert last["contracts_more"] is False
+
+
+def test_an_agencys_officer_count_is_not_the_length_of_one_page(client):
+    c, app_module = client
+    store = app_module.store_for("acme")
+    store.start_run("officers", {}, run_id="rko")
+    for i in range(205):
+        store.save_contract(
+            make_contract(piid=f"KO{i:04d}", award_id=f"K{i}", recipient_uei=f"U{i:03d}",
+                          recipient_name=f"VENDOR {i}", awarding_agency="Department of Labor",
+                          award_amount=10.0, ko_email=f"ko{i:03d}@dol.gov"),
+            "rko", f"U{i:03d}")
+
+    body = c.get("/v1/agencies/Department of Labor", headers=AUTH).json()
+    assert body["officer_count"] == 205
+    assert (len(body["officers"]), body["officers_more"]) == (200, True)
+    assert (len(body["entities"]), body["entities_more"]) == (200, True)
+    assert len(body["entity_keys"]) == 205
+
+
+def test_an_agencys_two_lists_page_independently(client):
+    c, app_module = client
+    store = app_module.store_for("acme")
+    store.start_run("officers", {}, run_id="rko")
+    for i in range(205):
+        store.save_contract(
+            make_contract(piid=f"KO{i:04d}", award_id=f"K{i}", recipient_uei=f"U{i:03d}",
+                          recipient_name=f"VENDOR {i}", awarding_agency="Department of Labor",
+                          award_amount=10.0, ko_email=f"ko{i:03d}@dol.gov"),
+            "rko", f"U{i:03d}")
+
+    body = c.get("/v1/agencies/Department of Labor?entities_offset=200",
+                 headers=AUTH).json()
+    assert (len(body["entities"]), body["entities_more"]) == (5, False)
+    assert (len(body["officers"]), body["officers_offset"]) == (200, 0)
+
+
+def test_a_negative_offset_is_refused(client):
+    c, _ = client
+    assert c.get("/v1/entities/UEI123?offset=-1", headers=AUTH).status_code == 422

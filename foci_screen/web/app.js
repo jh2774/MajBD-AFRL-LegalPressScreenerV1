@@ -227,12 +227,26 @@ function statCard(label, value) {
 /* The API returns the 200 best-funded awards and the true count alongside.
  * Rendering the page without saying it is a page invites the reader to count
  * the rows and believe the answer. */
-function truncationNote(shown, total) {
-  if (!total || !shown || shown >= total) return "";
-  return `<div class="muted" style="font-size:12px;margin-bottom:10px">
-    Showing the ${num(shown)} largest of ${num(total)} awards. The totals above
-    cover all ${num(total)}.</div>`;
+/* Where a long list is, and the way back and on. `hrefFor(offset)` builds
+ * the address of another page, so a page can be linked to and Back works.
+ * Says nothing when everything fits on one page. */
+function listPager(offset, shown, more, total, noun, hrefFor) {
+  offset = offset || 0;
+  if (!offset && !more) return "";
+  const first = shown ? offset + 1 : offset;
+  const of = total ? ` of ${num(total)}` : "";
+  return `
+    <div class="pager">
+      <span class="muted">Showing ${num(first)}–${num(offset + shown)}${of} ${esc(noun)}, largest first</span>
+      ${offset ? `<a class="linkish" href="${hrefFor(Math.max(0, offset - PAGE_ROWS))}">← Previous</a>` : ""}
+      ${more ? `<a class="linkish" href="${hrefFor(offset + shown)}">Next →</a>` : ""}
+    </div>`;
 }
+
+const PAGE_ROWS = 200;
+
+const pageParam = (params, name) =>
+  Math.max(0, parseInt((params && params.get(name)) || "0", 10) || 0);
 
 /* The award record as it moved, not as it stands. The contracts table holds
  * only the present value — once a novation is written over the old contractor,
@@ -895,12 +909,13 @@ function wireScreenRemove(runId) {
   };
 }
 
-async function viewEntity(key) {
+async function viewEntity(key, params) {
   setBusy("Loading contractor…");
+  const awardsFrom = pageParam(params, "awards");
   const [d, docs, verdicts, identity] = await Promise.all([
     // Nothing recorded is an answer, not a failure: a company named in a
     // portfolio but never screened still has a page — see viewUnscreened.
-    api(`/v1/entities/${encodeURIComponent(key)}`)
+    api(`/v1/entities/${encodeURIComponent(key)}?offset=${awardsFrom}`)
       .catch((e) => { if (e.status === 404) return null; throw e; }),
     api(`/v1/documents?entity_key=${encodeURIComponent(key)}`).catch(() => ({ documents: [] })),
     api(`/v1/entities/${encodeURIComponent(key)}/dispositions`)
@@ -980,10 +995,12 @@ async function viewEntity(key) {
 
     ${recordChanges(d.record_changes || [], d.entity_key || key.toUpperCase())}
 
-    <div class="card">
+    <div class="card" id="awards">
       <h2>Awards</h2>
-      ${truncationNote(d.contracts_shown, d.contract_count)}
       ${contractsTable(d.contracts || [])}
+      ${listPager(d.contracts_offset, (d.contracts || []).length, d.contracts_more,
+                  d.contract_count, "awards",
+                  (off) => `#/entity/${encodeURIComponent(key)}${off ? `?awards=${off}` : ""}`)}
     </div>`;
 
   wireVerdicts(view, key, f ? f.run_id : "");
@@ -1977,9 +1994,10 @@ async function viewDiff(source, key, fromSha, entityKey) {
     </div>`;
 }
 
-async function viewOfficer(email) {
+async function viewOfficer(email, params) {
   setBusy("Loading contracting officer…");
-  const d = await api(`/v1/officers/${encodeURIComponent(email)}`);
+  const awardsFrom = pageParam(params, "awards");
+  const d = await api(`/v1/officers/${encodeURIComponent(email)}?offset=${awardsFrom}`);
   const o = d.officer;
 
   view.innerHTML = `
@@ -2017,21 +2035,34 @@ async function viewOfficer(email) {
     </div>
 
     ${addToPortfolioButton(
-        [...new Set(d.contracts.map((c) => c.entity_key).filter(Boolean))],
+        (d.entity_keys || []).filter(Boolean),
         "Watch the contractors this officer holds awards with.")}
 
     <div class="card">
       <h2>Awards</h2>
-      ${truncationNote(d.contracts_shown, d.contract_count)}
       ${contractsTable(d.contracts)}
+      ${listPager(d.contracts_offset, d.contracts.length, d.contracts_more,
+                  d.contract_count, "awards",
+                  (off) => `#/officer/${encodeURIComponent(email)}${off ? `?awards=${off}` : ""}`)}
     </div>`;
 
   wireAddToPortfolio();
 }
 
-async function viewAgency(name) {
+async function viewAgency(name, params) {
   setBusy("Loading agency…");
-  const d = await api(`/v1/agencies/${encodeURIComponent(name)}`);
+  const from = { contractors: pageParam(params, "contractors"),
+                 officers: pageParam(params, "officers") };
+  const d = await api(`/v1/agencies/${encodeURIComponent(name)}` +
+                      `?entities_offset=${from.contractors}&officers_offset=${from.officers}`);
+  // Each list pages on its own, keeping the other where it was.
+  const agencyHref = (which) => (off) => {
+    const q = new URLSearchParams();
+    const next = { ...from, [which]: off };
+    if (next.contractors) q.set("contractors", next.contractors);
+    if (next.officers) q.set("officers", next.officers);
+    return `#/agency/${encodeURIComponent(name)}${q.toString() ? `?${q}` : ""}`;
+  };
 
   view.innerHTML = `
     <div class="breadcrumb"><a href="#/">Overview</a> › Agency</div>
@@ -2043,7 +2074,7 @@ async function viewAgency(name) {
     <div class="grid cols-3">
       ${statCard("Obligated", money(d.obligated))}
       ${statCard("Contractors", num(d.entity_count ?? d.entities.length))}
-      ${statCard("Officers", num(d.officers.length))}
+      ${statCard("Officers", num(d.officer_count ?? d.officers.length))}
     </div>
 
     <div class="card">
@@ -2057,12 +2088,16 @@ async function viewAgency(name) {
     </div>
 
     <div class="card"><h2>Contractors</h2>
-      ${entitiesTable(d.entities, { showScreened: false })}</div>
+      ${entitiesTable(d.entities, { showScreened: false })}
+      ${listPager(d.entities_offset, d.entities.length, d.entities_more,
+                  d.entity_count, "contractors", agencyHref("contractors"))}</div>
 
-    <div class="card"><h2>Contracting officers</h2>${officersTable(d.officers)}</div>
+    <div class="card"><h2>Contracting officers</h2>${officersTable(d.officers)}
+      ${listPager(d.officers_offset, d.officers.length, d.officers_more,
+                  d.officer_count, "officers", agencyHref("officers"))}</div>
 
     ${addToPortfolioButton(
-        d.entities.map((e) => e.entity_key).filter(Boolean),
+        (d.entity_keys || d.entities.map((e) => e.entity_key)).filter(Boolean),
         "Watch this agency's contractors on your dashboard.")}`;
 
   wireAddToPortfolio();
@@ -3234,9 +3269,9 @@ const ROUTES = [
   [/^\/?$/, () => viewOverview()],
   [/^\/search\/([^/]*)(?:\/([^/]*))?(?:\/(\d+))?$/,
    (q, k, off) => viewSearch(decodeURIComponent(q), k, off)],
-  [/^\/entity\/(.+)$/, (k) => viewEntity(decodeURIComponent(k))],
-  [/^\/officer\/(.+)$/, (e) => viewOfficer(decodeURIComponent(e))],
-  [/^\/agency\/(.+)$/, (n) => viewAgency(decodeURIComponent(n))],
+  [/^\/entity\/(.+)$/, (k, params) => viewEntity(decodeURIComponent(k), params)],
+  [/^\/officer\/(.+)$/, (e, params) => viewOfficer(decodeURIComponent(e), params)],
+  [/^\/agency\/(.+)$/, (n, params) => viewAgency(decodeURIComponent(n), params)],
   [/^\/contract\/(.+)$/, (c) => viewContract(decodeURIComponent(c))],
   [/^\/diff\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/,
    (s, k, from, params) => viewDiff(decodeURIComponent(s), decodeURIComponent(k),
