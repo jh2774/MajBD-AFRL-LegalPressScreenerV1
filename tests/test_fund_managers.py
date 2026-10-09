@@ -375,6 +375,180 @@ def test_a_firm_that_could_not_be_read_is_not_downloaded_again_for_a_week():
     assert fm.worth_reading({"funds_read": False, "checked_at": "nonsense"}, now) is True
 
 
+# ------------------------------- managers followed once fund alerts are on
+
+class FakeCfg:
+    alerts_send = None
+    smtp_host = ""
+    smtp_port = 587
+    smtp_user = ""
+    smtp_password = ""
+    smtp_security = "starttls"
+    alerts_from = ""
+    email_redirect_to = ""
+
+
+def mw_filing(date, shield, estate, extra=()):
+    return AdviserSnapshot(
+        crd="283630", name=MW, filing_date=date, funds_read=True,
+        funds=[PrivateFund("805-1", "MW LSVC SHIELD AI, LLC", owned_by_non_us_pct=shield,
+                           gross_asset_value=4_000_000),
+               PrivateFund("805-2", "MW REAL ESTATE FUND, LP", owned_by_non_us_pct=estate,
+                           gross_asset_value=4_000_000),
+               *extra])
+
+
+def watching_since(store, key, days_ago):
+    day = (datetime.now(timezone.utc) - timedelta(days=days_ago)).date().isoformat()
+    with store._tx() as c:
+        c.execute("UPDATE vehicle_watches SET watching=1, watching_since=? WHERE entity_key=?",
+                  (day, key))
+
+
+def list_made(store, subscription_id, days_ago):
+    when = (datetime.now(timezone.utc) - timedelta(days=days_ago)).date().isoformat()
+    with store._tx() as c:
+        c.execute("UPDATE alert_subscriptions SET created_at=? WHERE subscription_id=?",
+                  (f"{when}T00:00:00Z", subscription_id))
+
+
+def a_watched_contractor_with_a_known_manager(store):
+    from foci_screen import alerts
+
+    key = on_file(store, fund(1, "MW LSVC Shield AI, LLC"))
+    store.save_adv_snapshot("283630", mw_filing("03/31/2026", 21, 5).to_dict(), "03/31/2026")
+    watching_since(store, key, 30)
+    sid = store.save_alert_subscription(name="Watch", emails=["ko@agency.gov"],
+                                        companies=[key])
+    alerts.baseline(store, sid, [key])
+    list_made(store, sid, 20)
+    adv = FakeAdv()
+    adv.forms["283630"] = mw_filing(
+        "07/14/2026", 30, 9,
+        [PrivateFund("805-3", "MW LSVC SHIELD AI-III, LLC", owned_by_non_us_pct=40,
+                     gross_asset_value=1_000_000)])
+    return key, sid, adv
+
+
+def test_a_managers_new_filing_reaches_the_list_without_the_firm_being_added(store):
+    """The manager's yearly Form ADV is where a fund's foreign share first
+    appears. Asking to hear about a contractor's funds covers it."""
+    from foci_screen import alerts
+    from foci_screen.notify.mailer import Mailer
+
+    key, sid, adv = a_watched_contractor_with_a_known_manager(store)
+    result = alerts.run_alerts(store, adv, Mailer(FakeCfg()), "https://site.example")
+    assert adv.read == ["283630"] and result["managers_checked"] == 1
+    assert result["firms_checked"] == 0, "it is not in anybody's portfolio"
+
+    [delivery] = store.alert_deliveries(sid)
+    body = delivery["body_text"]
+    assert "The share of MW LSVC SHIELD AI, LLC owned by investors outside the United " \
+           "States rose from 21% to 30%." in body
+    assert f"{MW} reported a new private fund: MW LSVC SHIELD AI-III, LLC." in body
+    assert "is 40% owned by investors outside the United States" in body
+    assert body.count("This fund is named after Shield AI, which is in this portfolio.") == 2
+    assert "MW REAL ESTATE FUND" not in body and "filed an updated Form ADV" not in body, \
+        "the rest of what the firm does is its own business until someone watches it"
+
+    again = alerts.run_alerts(store, adv, Mailer(FakeCfg()))
+    assert again["emails"][0]["status"] == "nothing new"
+
+
+def test_what_a_manager_changed_before_anyone_was_watching_is_not_news(store):
+    from foci_screen import alerts
+
+    key, sid, adv = a_watched_contractor_with_a_known_manager(store)
+    alerts.refresh_advisers(store, adv, ["283630"])          # noticed today...
+    watch = store.vehicle_watch(key)
+    assert len(alerts.manager_items(store, watch)) == 2
+    with store._tx() as c:                                   # ...or forty days ago
+        c.execute("UPDATE adv_changes SET detected_at='2026-08-01T00:00:00Z'")
+    assert alerts.manager_items(store, watch) == []
+
+    store.save_vehicle_watch(key, watching=False)
+    assert alerts.manager_items(store, store.vehicle_watch(key)) == []
+
+
+def test_a_firm_that_is_also_in_the_portfolio_is_read_once_and_said_once(store):
+    from foci_screen import alerts
+    from foci_screen.notify.mailer import Mailer
+
+    key, sid, adv = a_watched_contractor_with_a_known_manager(store)
+    with store._tx() as c:
+        c.execute("UPDATE alert_subscriptions SET companies=? WHERE subscription_id=?",
+                  (f'["{key}", "CRD:283630"]', sid))
+    result = alerts.run_alerts(store, adv, Mailer(FakeCfg()))
+    assert adv.read == ["283630"]
+    assert (result["firms_checked"], result["managers_checked"]) == (1, 0)
+    body = store.alert_deliveries(sid)[0]["body_text"]
+    assert body.count("rose from 21% to 30%") == 1
+    assert "MW REAL ESTATE FUND, LP" in body, "watched in its own right: all of it is said"
+
+
+def test_a_contractor_added_to_an_older_list_does_not_bring_its_managers_backlog(store):
+    from foci_screen import alerts
+
+    key, _, adv = a_watched_contractor_with_a_known_manager(store)
+    alerts.refresh_advisers(store, adv, ["283630"])
+    older = store.save_alert_subscription(name="Older", emails=["a@b.gov"], companies=[])
+    list_made(store, older, 60)
+    assert alerts.baseline(store, older, [key]) == 2
+    with store._tx() as c:
+        c.execute("UPDATE alert_subscriptions SET companies=? WHERE subscription_id=?",
+                  (f'["{key}"]', older))
+    assert alerts.pending_items(store, store.alert_subscription(older), "") == []
+
+
+# ----------------------------------------- one line for a table of contractors
+
+def test_the_one_line_summary_leaves_out_figures_that_are_not_the_funds_own(store):
+    key = on_file(store, fund(1, "MW LSVC Shield AI, LLC"),
+                  fund(2, "MW LSVC Shield AI-II, LLC"),
+                  fund(3, "Fuel Shield AI, a Series of Fuel Co-Invest Series, LLC"))
+    firm(store, "283630", MW, [("MW LSVC SHIELD AI, LLC", 21),
+                               ("MW LSVC SHIELD AI-II, LLC", 0)])
+    firm(store, "304225", "FUEL PARTNERS LLC", [("FUEL CO-INVEST SERIES, LLC", 60)])
+
+    line = vehicles.summary(store, key)
+    assert (line["funds"], line["raised"], line["watching"]) == (3, 3_000_000, False)
+    assert (line["with_figure"], line["highest_non_us"], line["managers"]) == (2, 21, 2), \
+        "60% is for a whole series company, most of it nothing to do with this contractor"
+    assert vehicles.summary(store, "NEVER-LOOKED-UP") is None
+
+
+# ------------------------- looked up as a typed name, then screened under a UEI
+
+def award(store, entity_key, name, piid):
+    with store._tx() as c:
+        c.execute(
+            "INSERT INTO contracts (tenant_id, contract_key, run_id, piid, entity_key,"
+            " entity_name, amount, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (store.tenant_id, piid, "r1", piid, entity_key, name, 1000.0,
+             "2026-01-01T00:00:00Z"))
+
+
+def test_a_look_made_under_a_typed_name_is_still_there_once_it_is_screened(store):
+    """Its page moves to its UEI. The words chosen, the funds ruled out and
+    the alert stay under the name, and are found there."""
+    from foci_screen import alerts
+
+    name = "SHIELD AI INC"
+    on_file(store, fund(1, "MW LSVC Shield AI, LLC"), key=name)
+    assert vehicles.watch_key(store, "UEI777") == "UEI777", "nothing ties them yet"
+
+    award(store, "UEI777", name, "P1")                       # ...and then it is screened
+    assert vehicles.watch_key(store, "UEI777") == name
+    assert vehicles.watch_key(store, name) == name
+    watching_since(store, name, 30)
+    for held in (["UEI777"], [name], ["UEI777", name]):      # however the portfolio holds it
+        watches = alerts.watched_vehicles(store, alerts.watched_keys(store, held))
+        assert [w["entity_key"] for w in watches] == [name], held
+
+    award(store, "UEI888", name, "P2")                       # two contractors, one name
+    assert vehicles.watch_key(store, "UEI777") == "UEI777", "whose it is cannot be told"
+
+
 # ------------------------------------------------- a person's firm, on the wire
 
 class People:
@@ -493,6 +667,35 @@ def test_the_firms_own_page_marks_its_funds_named_after_a_contractor(client):
     assert page["named_after"] == {
         "805-2836300": [{"entity_key": "UEI777", "phrase": "Shield AI"}]}
     assert adv.read == [], "already on file: opening the page reads nothing"
+
+
+def test_the_portfolio_table_carries_one_line_about_each_contractors_funds(client):
+    from foci_screen import portfolio as pf
+
+    c, store, _ = client
+    on_file(store, fund(1, "MW LSVC Shield AI, LLC"))
+    firm(store, "283630", MW, [("MW LSVC SHIELD AI, LLC", 21)])
+    key = pf.encode(pf.from_entity_keys("Watch", ["UEI777", "UEI999"]))
+    rows = {r["entity_key"]: r for r in
+            c.post("/v1/portfolio", headers=AUTH, json={"key": key}).json()["companies"]}
+    assert rows["UEI999"]["funds"] is None, "not looked up is not the same as none"
+    line = rows["UEI777"]["funds"]
+    assert (line["funds"], line["highest_non_us"], line["watching"]) == (1, 21, False)
+
+
+def test_the_screened_page_shows_and_changes_the_look_made_under_the_name(client):
+    c, store, _ = client
+    name = "SHIELD AI INC"
+    on_file(store, fund(1, "MW LSVC Shield AI, LLC"), key=name)
+    award(store, "UEI777", name, "P1")
+
+    page = c.get("/v1/entities/UEI777/vehicles", headers=AUTH).json()
+    assert page["watch"]["phrase"] == "Shield AI" and len(page["vehicles"]) == 1
+    page = c.post("/v1/entities/UEI777/vehicles", headers=AUTH, json={"watching": True}).json()
+    assert page["watch"]["watching"] is True
+    assert [w["entity_key"] for w in store.vehicle_watches()] == [name], \
+        "the one watch, switched on where it is kept — not a second one under the UEI"
+    assert c.post(URL, headers=AUTH, json={"find": True}).status_code == 200
 
 
 def test_the_adviser_database_not_answering_is_said_plainly(client):

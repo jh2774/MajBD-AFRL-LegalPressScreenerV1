@@ -1399,7 +1399,8 @@ function drawVehicles(card, key, d, busy = "", busyAt = "#vh-status") {
         <span class="muted" style="font-size:12.5px;align-self:center">${
           w.watching
             ? `The portfolio's email list is told about any fund named after “${esc(w.phrase)}”
-               that files ${sinceWords(w.watching_since)}.`
+               that files ${sinceWords(w.watching_since)}, and about what the firms managing
+               these funds change about them on a new Form ADV.`
             : "Sends to the email list of any portfolio this contractor is in. Past filings are never sent."}</span>
       </div>
       <p class="muted" style="font-size:12px">New filings are picked up from EDGAR's daily list
@@ -2391,6 +2392,22 @@ function portfolioTable(companies) {
       <span class="muted" style="font-size:12px">· ${esc(x.filed)}</span>`;
   };
 
+  // Investment funds named after the contractor, as last looked up on its
+  // page. The second line is what decides whether anyone hears about the next
+  // one, so it is always shown; the foreign share is the largest any manager
+  // reports for one of the funds itself.
+  const pooled = (r) => {
+    const f = r.funds;
+    if (!f) return '<span class="muted" title="Look them up on the contractor page">not looked up</span>';
+    if (!f.funds) return `none found <div class="muted" style="font-size:12px">${f.watching ? "alerts on" : "alerts off"}</div>`;
+    return `${f.at_least ? "at least " : ""}${num(f.funds)}${f.read ? ` · ${money(f.raised)}` : ""}
+      <div class="muted" style="font-size:12px">${f.watching ? "alerts on" : "alerts off"}${
+        f.highest_non_us === null || f.highest_non_us === undefined ? ""
+          : ` · <span title="The largest share owned outside the U.S. that a managing firm reports for any one of these funds, out of the ${num(f.with_figure)} with a figure">highest
+              for one fund: <strong>${num(f.highest_non_us)}%</strong> owned outside the U.S.</span>`}${
+        f.abroad ? ` · ${num(f.abroad)} based or run abroad` : ""}</div>`;
+  };
+
   const contractorRows = contractors.map((r) => `
     <tr>
       <td>${linkEntity(r.page_key || r.entity_key, r.entity_name)}</td>
@@ -2398,6 +2415,7 @@ function portfolioTable(companies) {
       <td class="num">${r.contract_count ? num(r.contract_count) : "—"}</td>
       <td class="num">${r.obligated ? money(r.obligated) : "—"}</td>
       <td>${raise(r)}</td>
+      <td>${pooled(r)}</td>
       <td>${r.last_screened ? day(r.last_screened) : "—"}</td>
     </tr>`).join("");
 
@@ -2415,6 +2433,7 @@ function portfolioTable(companies) {
     ${contractors.length ? `<table>
       <thead><tr><th>Contractor</th><th>Latest severity</th><th class="num">Awards</th>
         <th class="num">Obligated</th><th title="From the company's latest SEC Form D">Latest private raise</th>
+        <th title="Investment funds named after the company, and the money their latest notices report. Looked up on the contractor's page.">Funds named after it</th>
         <th>Screened</th></tr></thead>
       <tbody>${contractorRows}</tbody></table>` : ""}
     ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
@@ -2620,6 +2639,7 @@ function describeCheck(r, portfolioName) {
   const checked = `Checked ${r.firms_checked} investment firm(s) and `
     + `${r.companies_checked || 0} contractor(s) with an SEC record`
     + (funds.watched ? `, and looked for new funds named after ${funds.watched} contractor(s)` : "")
+    + (r.managers_checked ? ` and at the ${r.managers_checked} firm(s) managing those funds` : "")
     + (funds.error ? ". The list of new fund filings could not be read this time" : "") + ".";
   if (mine.status === "nothing new" || !mine.status) {
     return `${checked} Nothing new since the last alert.`;

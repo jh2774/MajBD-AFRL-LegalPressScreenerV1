@@ -813,9 +813,21 @@ firm whose name merely resembles the fund's is never shown.
   every series together, not the one named after the contractor.
 * **A fund on a Form ADV with no Form D** under the same name — sold abroad, say — is listed
   separately.
-* **"Watch this firm"** adds the firm to the portfolio, so its Form ADV is checked with the
-  others. An alert about a fund named after a contractor in the same portfolio then says
-  so, and is listed first. The firm's own page marks those funds too.
+* **Switching on fund alerts for a contractor also follows its funds' managers.** Each check
+  asks whether those firms have filed a new Form ADV, and passes on what changed about a
+  fund carrying the contractor's name — a new one, or its share owned outside the U.S.
+  moving — and nothing else the firm did. A manager's yearly filing is where a new fund's
+  foreign share first appears, so this is the alert that matters most here, and it does not
+  depend on anyone remembering to add the firm.
+* **"Watch this firm"** adds the firm to the portfolio in its own right, so everything on its
+  Form ADV is watched. An alert about a fund named after a contractor in the same portfolio
+  says so, and is listed first. The firm's own page marks those funds too.
+* **The portfolio table has a column for it**: how many funds are named after each
+  contractor, what their latest notices add up to, whether alerts are on, and the largest
+  share owned outside the U.S. that a manager reports for any one of them. A figure for a
+  whole series company is left out of that last number.
+* A company looked up while it was only a name typed into a portfolio keeps its funds, the
+  funds ruled out and its alert once it is screened and its page moves to its UEI.
 * If the lookup finds nothing, a firm can be searched by name and checked the same way.
 
 Limits: Form ADV is refiled once a year, so a fund set up since a firm's last filing is not

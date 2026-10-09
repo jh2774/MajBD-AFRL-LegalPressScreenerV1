@@ -9,7 +9,9 @@ Four kinds of item go into an alert:
     record a person has picked (see `Store.confirmed_ciks`).
   * **Investment funds named after a contractor** filing a Form D of their
     own — money being pooled to buy its shares. Only where a person has
-    switched that on for the contractor, and only filings made since.
+    switched that on for the contractor, and only filings made since. With
+    it comes what the firms managing those funds change about them on their
+    own Form ADV, whether or not the firm is in the portfolio.
   * **Flagged contractors** — a notice the screening policy raised for a
     contractor in the portfolio.
 
@@ -199,7 +201,7 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     entities = watched_keys(store, entities)
     ciks = store.confirmed_ciks(entities)
     sent = store.alert_already_sent(subscription["subscription_id"])
-    looked_up = [w for w in (store.vehicle_watch(k) for k in dict.fromkeys(entities)) if w]
+    looked_up = fund_watches(store, entities)
     items = [adv_item(c, looked_up) for c in store.adv_changes(crds, limit=200)]
     items += [formd_item(c, base_url, ciks.get(str(c.get("cik")), ""))
               for c in store.formd_changes(list(ciks), limit=200)]
@@ -209,14 +211,53 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     started = str(subscription.get("created_at") or "")[:10]
     for watch in watched_vehicles(store, entities):
         items += vehicles_engine.alert_items(store, watch, base_url, since=started)
-    fresh = [i for i in items if i["item_id"] not in sent]
+        items += manager_items(store, watch, since=started)
+    # A firm that is in the portfolio and also manages a watched contractor's
+    # fund reaches here twice with the same change: say it once.
+    fresh, seen = [], set(sent)
+    for item in items:
+        if item["item_id"] not in seen:
+            seen.add(item["item_id"])
+            fresh.append(item)
     return sorted(fresh, key=lambda i: -i["importance"])
+
+
+def fund_watches(store, entities: list[str]) -> list[dict]:
+    """The fund watches of a portfolio's contractors, switched on or not —
+    each once, wherever it is kept (`vehicles.watch_key`)."""
+    found = {}
+    for key in dict.fromkeys(entities):
+        watch = store.vehicle_watch(vehicles_engine.watch_key(store, key))
+        if watch:
+            found.setdefault(watch["entity_key"], watch)
+    return list(found.values())
 
 
 def watched_vehicles(store, entities: list[str]) -> list[dict]:
     """The switched-on fund watches among a portfolio's contractors."""
-    watches = (store.vehicle_watch(key) for key in dict.fromkeys(entities))
-    return [w for w in watches if w and w["watching"]]
+    return [w for w in fund_watches(store, entities) if w["watching"]]
+
+
+def manager_items(store, watch: dict, since: str = "") -> list[dict]:
+    """What the firms managing a contractor's funds changed, on their own Form
+    ADV, about a fund named after it.
+
+    Asking to be told about a contractor's funds covers this without the firm
+    being added to the portfolio: the manager's yearly filing is where a new
+    fund's share owned outside the United States first appears. Only changes
+    to funds carrying the contractor's name are passed on — the rest of what
+    the firm does is its own business until someone chooses to watch it — and,
+    as with the funds themselves, only what was noticed after the watch and
+    the list began.
+    """
+    if not watch.get("watching"):
+        return []
+    start = max(watch.get("watching_since") or "9999", since or "")
+    crds = vehicles_engine.manager_crds(store, watch)
+    return [adv_item(change, [watch])
+            for change in store.adv_changes(crds, limit=200)
+            if str(change.get("detected_at") or "")[:10] >= start
+            and fund_managers.tie_to_contractor(change, [watch])]
 
 
 def baseline(store, subscription_id: str, companies: list[str]) -> int:
@@ -231,6 +272,7 @@ def baseline(store, subscription_id: str, companies: list[str]) -> int:
     # since its watch began were news before it joined, not now.
     for watch in watched_vehicles(store, entities):
         ids += [i["item_id"] for i in vehicles_engine.alert_items(store, watch)]
+        ids += [i["item_id"] for i in manager_items(store, watch)]
     store.mark_alert_sent(subscription_id, ids)
     return len(ids)
 
@@ -336,6 +378,10 @@ def is_due(store, hours: float = DUE_AFTER_HOURS) -> bool:
     return False
 
 
+# Firms followed only because they manage a watched contractor's fund, per run.
+MANAGERS_PER_RUN = 40
+
+
 def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
                formd: FormDConnector | None = None,
                vehicles: VehicleConnector | None = None) -> dict:
@@ -361,9 +407,18 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
             log.warning("could not update the index of fund filings: %s", exc)
             funds = {"error": f"{type(exc).__name__}: {exc}"}
 
+    # The firms that manage those funds, whether or not anyone added them to a
+    # portfolio. One small request each on a night they filed nothing.
+    seen = set(all_crds)
+    managers = [crd for crd in dict.fromkeys(
+        crd for watch in watching for crd in vehicles_engine.manager_crds(store, watch))
+        if crd not in seen][:MANAGERS_PER_RUN]
+    managed = refresh_advisers(store, adv, managers)
+
     summary = {"subscriptions": len(subscriptions), "firms_checked": len(firms),
                "firms": firms, "companies_checked": len(companies),
-               "companies": companies, "funds": funds, "emails": []}
+               "companies": companies, "funds": funds,
+               "managers_checked": len(managed), "managers": managed, "emails": []}
     for s in subscriptions:
         items = pending_items(store, s, base_url)
         store.touch_alert_subscription(s["subscription_id"])

@@ -544,6 +544,11 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
         screened = bool(totals["contract_count"]) or bool(latest)
         rows.append({
             **_latest_raise(store, [company.key, page_key]),
+            # Funds named after it, as last looked up on its page. The page is
+            # at `page_key`, so that is where a look was recorded — unless it
+            # was looked up by name before it was ever screened.
+            "funds": vehicles_engine.summary(
+                store, vehicles_engine.watch_key(store, page_key)),
             "entity_key": company.key,
             "page_key": page_key,
             # The database's name wins when it has one: it is the name the
@@ -745,9 +750,9 @@ def entity_vehicles(entity_key: str, store: Store = Depends(tenant_store)) -> di
     Reads the database only. `suggested_phrase` is the contractor's name
     without its legal ending — the words a first look would match on.
     """
-    key = entity_key.upper()
+    key = vehicles_engine.watch_key(store, entity_key)
     name = vehicles_engine.contractor_name(store, key)
-    return {"entity_key": key, "suggested_phrase": default_phrase(name),
+    return {"entity_key": entity_key.upper(), "suggested_phrase": default_phrase(name),
             **vehicles_engine.view(store, key)}
 
 
@@ -765,7 +770,7 @@ def change_entity_vehicles(entity_key: str, body: VehicleRequest,
     show what has arrived and ask again while `pending_names` or `unread`
     say there is more.
     """
-    key = entity_key.upper()
+    key = vehicles_engine.watch_key(store, entity_key)
     watch = store.vehicle_watch(key)
 
     try:
@@ -808,7 +813,7 @@ def find_fund_managers(entity_key: str, body: ManagerRequest,
     which any fund that firm lists now carries what the firm reports about
     it; `checked.lists` says how many it did.
     """
-    key = entity_key.upper()
+    key = vehicles_engine.watch_key(store, entity_key)
     watch = store.vehicle_watch(key)
     if watch is None:
         raise HTTPException(409, "Look this company's funds up first.")

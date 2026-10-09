@@ -116,6 +116,26 @@ def contractor_name(store, entity_key: str) -> str:
     return (rows[0].get("entity_name") if rows else "") or key
 
 
+def watch_key(store, entity_key: str) -> str:
+    """The key a contractor's fund watch is kept under: nearly always its own.
+
+    The exception is a company whose funds were looked up while it was only a
+    name typed into a portfolio. Once it is screened its page moves to its
+    UEI, and the watch — the words chosen, the funds ruled out, the alert —
+    is still under the name. It is found there rather than moved: alert items
+    carry the key, and re-keying them would send everything out again as new.
+    Only when the name belongs to exactly one screened contractor, the same
+    test the portfolio uses to follow a name to its UEI.
+    """
+    key = entity_key.upper()
+    if store.vehicle_watch(key):
+        return key
+    name = contractor_name(store, key).upper()
+    if name != key and store.vehicle_watch(name) and store.resolve_entity_key(name) == key:
+        return name
+    return key
+
+
 def _itself(store, watch: dict) -> set[tuple[str, ...]]:
     """The bare names that are the contractor, not a fund named after it.
 
@@ -277,6 +297,38 @@ def view(store, entity_key: str) -> dict:
             "reported": sum(1 for f in funds if f["reported"] or f["reported_parent"]),
         },
         "index_through": max(store.edgar_days(), default=""),
+    }
+
+
+def manager_crds(store, watch: dict) -> list[str]:
+    """The firms whose Form ADV lists a fund named after this contractor."""
+    funds = _grouped(matching(store, watch, own_ciks(store, watch["entity_key"])))
+    return [m["crd"] for m in fund_managers.reported(store, watch, funds)["managers"]]
+
+
+def summary(store, entity_key: str) -> dict | None:
+    """One line about a contractor's funds, for a table of many contractors;
+    None when nobody has looked them up.
+
+    `highest_non_us` is the largest share owned outside the U.S. that a
+    manager reports for one of these funds *itself*. A figure for a whole
+    series company is left out: it covers funds that have nothing to do with
+    this contractor.
+    """
+    page = view(store, entity_key)
+    watch, totals = page["watch"], page["totals"]
+    if not watch or not watch.get("looked_at"):
+        return None
+    own = [f["reported"][0]["non_us_pct"] for f in page["vehicles"]
+           if f["reported"] and f["reported"][0].get("non_us_pct") is not None]
+    return {
+        "key": watch["entity_key"], "phrase": watch["phrase"],
+        "watching": watch["watching"],
+        "funds": totals["funds"] + len(page["pending_names"]),
+        "at_least": bool(watch["more_exist"]),
+        "read": totals["read"], "raised": totals["raised"], "abroad": totals["abroad"],
+        "with_figure": len(own), "highest_non_us": max(own, default=None),
+        "managers": len(page["managers"]),
     }
 
 
