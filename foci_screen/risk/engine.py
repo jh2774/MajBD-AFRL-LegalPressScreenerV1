@@ -141,7 +141,7 @@ def rule_foci_jurisdiction(doc: Document, ctx: RuleContext) -> list[Signal]:
     # Registry records are fields, not prose, and have their own rules. An IAPD
     # record's office line reads "... Cayman Islands"; read here as well, the
     # one fact would be flagged twice, once as a bare mention.
-    if doc.source == "iapd" or (doc.meta or {}).get("ownership"):
+    if doc.source in ("iapd", "sam_exclusions") or (doc.meta or {}).get("ownership"):
         return []
     text = doc.text
     if not text.strip():
@@ -388,6 +388,48 @@ def rule_sanctions_hit(doc: Document, ctx: RuleContext) -> list[Signal]:
         evidence=doc.text[:600], source="ofac", source_url=doc.url, is_new=ctx.is_new)]
 
 
+def rule_sam_exclusion(doc: Document, ctx: RuleContext) -> list[Signal]:
+    """The contractor, or its parent, is on SAM.gov's list of excluded parties.
+
+    By UEI or CAGE the record is this contractor. By name it may not be, and
+    says so — the same footing as an OFAC name match.
+    """
+    if doc.source != "sam_exclusions":
+        return []
+    meta = doc.meta or {}
+    basis, whose = meta.get("match_basis", ""), meta.get("whose", "contractor")
+    what = (f"{meta.get('exclusion_type') or 'an exclusion'} entered by "
+            f"{meta.get('excluding_agency') or 'a federal agency'}, active since "
+            f"{meta.get('active_date') or 'an unrecorded date'}"
+            + (f" until {meta['termination_date']}" if meta.get("termination_date") else ""))
+    rules = ("FAR subpart 9.4 bars new awards to an excluded party; contracts already "
+             "in place may continue unless the agency decides otherwise (FAR 9.405-1). "
+             "SAM.gov asks that the whole record be read to see how the exclusion "
+             "applies, and it is quoted in full below.")
+    if whose == "parent":
+        rule_id, mult = "EXCL-SAM-PARENT-01", 1.2
+        title = "Contractor's parent is excluded from federal awards (SAM.gov)"
+        rationale = (f"The contractor's parent, matched by UEI, carries {what}. An "
+                     f"exclusion does not automatically extend to affiliates, but the "
+                     f"excluding agency may have named them. {rules}")
+    elif basis in ("uei", "cage"):
+        rule_id, mult = "EXCL-SAM-01", 2.0
+        title = "Contractor is excluded from federal awards (SAM.gov)"
+        rationale = (f"SAM.gov's exclusion list matches this contractor by "
+                     f"{basis.upper()}: {what}. {rules}")
+    else:
+        rule_id, mult = "EXCL-SAM-NAME-01", 0.6
+        title = "Possible SAM.gov exclusion — name match only"
+        rationale = (f"An excluded {meta.get('classification', 'party').lower()} has "
+                     f"the contractor's name, but no UEI or CAGE ties the record to it: "
+                     f"{what}. Confirm the identifiers before relying on it. {rules}")
+    score = _score("SANCTIONS", ctx, mult)
+    return [Signal(
+        rule_id=rule_id, category="SANCTIONS", severity=_sev(score), score=score,
+        title=title, rationale=rationale, evidence=doc.text[:1500],
+        source="sam_exclusions", source_url=doc.url, is_new=ctx.is_new)]
+
+
 def rule_adviser_foreign_domicile(doc: Document, ctx: RuleContext) -> list[Signal]:
     """A holder of the contractor is an SEC-registered adviser domiciled abroad."""
     if doc.source != "iapd":
@@ -568,6 +610,7 @@ DOCUMENT_RULES = [
     rule_uspto_security_interest,
     rule_sanctions_hit,
     rule_adviser_foreign_domicile,
+    rule_sam_exclusion,
     rule_ownership_foreign_holder,
     rule_release_disclosure,
 ]

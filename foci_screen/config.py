@@ -225,6 +225,7 @@ class Config:
             "sec_edgar": True,
             "iapd": True,
             "ofac": True,
+            "sam_exclusions": True,
             "webwatch": True,
             "ir_email_alerts": bool(self.alerts_dir
                                     and Path(self.alerts_dir).is_dir()),

@@ -322,6 +322,7 @@ class TestGather(unittest.TestCase):
         screener.edgar = EdgarConnector(http)
         screener.iapd = IAPDConnector(http)
         screener.ofac = SimpleNamespace(screen=lambda name: [])
+        screener.exclusions = SimpleNamespace(screen=lambda *a, **k: [])
         screener.uspto = SimpleNamespace(available=False)
         screener.patent_dataset = SimpleNamespace(available=False)
         screener.sam = SimpleNamespace(available=False)

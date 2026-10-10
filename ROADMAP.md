@@ -219,6 +219,10 @@ Ordered by how much they limit the tool today.
 2. **Get a SAM.gov API key.** Adds the registered ownership chain (immediate and highest-level
    owner) - the most direct FOCI structural signal there is - and an authoritative KO contact
    to corroborate FPDS.
+
+   **Exclusions do not need it.** SAM.gov publishes every active exclusion as a daily public
+   file, keyless, and the screen now reads it — matched by UEI and CAGE, then by name. See the
+   README's Exclusions section.
 3. **Headless browser for investor-relations pages — built, then partly withdrawn.** Playwright
    in the worker, applied only to hosts that fail the plain fetch. The v0.3 numbers
    (`investors.lockheedmartin.com` 0 → 905 characters, `investors.leidos.com` 0 → 1,952) came

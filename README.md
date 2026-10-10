@@ -71,6 +71,7 @@ actually return, not what their docs claim.
 | **SEC EDGAR** submissions + full-text search | no | 8-K item codes, the exhibits where IP security agreements actually live, and Schedule 13D/13G holders |
 | **IAPD** `api.adviserinfo.sec.gov` | no | Adviser registration, office country and disclosures for the contractor's 5%+ holders — see [Who holds the contractor](#who-holds-the-contractor) |
 | **OFAC SDN** CSV | no | Sanctions name screening |
+| **SAM.gov exclusions** public extract | no | Parties debarred or suspended from federal awards, by UEI and CAGE — see [Exclusions](#exclusions) |
 | **SAM.gov** entity + opportunities | yes | Registered address, business types, solicitation point of contact |
 | **USPTO** assignments | yes | Recorded `SECURITY INTEREST` conveyances against the patent estate |
 | **USPTO Patent Assignment Dataset** (downloaded by hand) | no | The same liens, from the yearly research release — see [Patent liens without a key](#patent-liens-without-a-key) |
@@ -226,6 +227,43 @@ Capital Research all carry disclosures, so as a rule it would fire on nearly eve
 EDGAR gives places of organisation as codes (`DE`, `X1`, `E9`); `connectors/edgar_codes.py` is
 the SEC's published table, and the documents keep the code rather than the name so the prose
 jurisdiction rule never reads the tool's own words as a mention.
+
+### Exclusions
+
+SAM.gov's entity API needs a key, but its list of **excluded parties** — debarred, suspended,
+or otherwise barred from federal awards — is published every day as a public file, listed and
+served by SAM.gov's own file service with no key and no login, under a `robots.txt` that
+permits it:
+
+    https://sam.gov/data-services/Exclusions/Public%20V2?privacy=Public
+
+What the October 2026 extract held: 169,044 active records — 8,368 firms, 25,565 special
+entity designations, 133,789 individuals and 1,322 vessels — of which 47,727 carry a UEI, and
+many a CAGE code. The listing's own link points at the underlying S3 bucket, which refuses a
+direct request (403); the download goes through SAM.gov's service, as its download button does.
+
+- **Matched on identifiers first.** A UEI or CAGE match identifies the excluded party as the
+  contractor (`EXCL-SAM-01`). Only failing both is the exact name tried, for firms and special
+  entities, and a name match says it is one and asks for the identifiers to be confirmed
+  (`EXCL-SAM-NAME-01`), the same footing as an OFAC name match. The parent is checked by UEI
+  (`EXCL-SAM-PARENT-01`); an exclusion does not automatically reach affiliates, and the
+  rationale says so.
+- **Individuals are never matched by name.** A contractor sharing a name with an excluded
+  person says nothing about either. Individuals with no UEI or CAGE can therefore never match,
+  and are left out of the index — most of the file.
+- **A lapsed exclusion is not reported.** The file lists active records but is a day old when
+  read; one whose termination date has passed is dropped.
+- **The whole record is the evidence.** SAM.gov asks that users read an exclusion record
+  completely to understand how it applies, so the finding quotes every field — including the
+  agency's comment, which is often the part that matters ("DEBARMENT ON THIS ENTITY AND ALL
+  ASSOCIATED PARTIES").
+- **Downloaded once a day.** The newest file is indexed into `sam_exclusions.db` in the cache
+  directory: about 40 MB and six seconds to build, 37 MB of memory at peak. If a refresh
+  fails, the previous day's index is used; with none at all, the step reports nothing rather
+  than failing the screen.
+
+The rationale cites FAR subpart 9.4: no new award to an excluded party, while existing
+contracts may continue unless the agency decides otherwise (FAR 9.405-1).
 
 ### Patent liens without a key
 
@@ -1147,7 +1185,7 @@ foci_screen/
   store.py         SQLite snapshots, diffing, findings, notification log
   pipeline.py      orchestration (injected deps — same code serves an API)
   cli.py           argparse entry point
-  connectors/      usaspending, fpds, sec_edgar, registries, webwatch, edgar_codes, uspto_dataset
+  connectors/      usaspending, fpds, sec_edgar, registries, webwatch, edgar_codes, uspto_dataset, sam_exclusions
   risk/            lexicon (jurisdictions, terms, clauses), engine (rules, scoring)
   notify/          render (.eml, text, html), gmail (guarded delivery)
 tests/             45 offline tests
