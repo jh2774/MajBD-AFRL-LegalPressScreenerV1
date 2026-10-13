@@ -2633,7 +2633,7 @@ async function alertsCard(key, portfolioName) {
 
 /* What a check did, for the line under the buttons. */
 function describeCheck(r, portfolioName) {
-  if (r.status === "already running") return r.detail;
+  if (r.status === "already running" || r.status === "paused") return r.detail;
   const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
   const funds = r.funds || {};
   const checked = `Checked ${r.firms_checked} investment firm(s) and `
@@ -2701,7 +2701,10 @@ function wireAlerts(key, portfolioName) {
       try {
         const r = await apiPost("/v1/alerts/run", {});
         status.textContent = describeCheck(r, portfolioName);
-        if (r.status === "already running") { run.disabled = false; return; }
+        if (r.status === "already running" || r.status === "paused") {
+          run.disabled = false;
+          return;
+        }
         setTimeout(viewPortfolio, 2500);
       } catch (e) {
         run.disabled = false;
@@ -3248,6 +3251,79 @@ async function viewScreening(notes) {
   };
 }
 
+/* ------------------------------------------------------------ system check */
+
+/* Whether this site can do its job, and what it holds. Made for moving between
+ * hosts: a new site that draws its pages can still be unable to write to its
+ * database, reach the SEC, or reach itself — and the row counts, read on the
+ * old site and the new, are how to tell that everything was copied. */
+async function viewSystem() {
+  setBusy("Trying each thing this site depends on — a few seconds…");
+  const d = await api("/v1/system/check");
+  const mark = (ok) => ok === true ? '<span class="pill">✓ working</span>'
+    : ok === false ? '<span class="pill warn">✗ not working</span>'
+      : '<span class="muted">note</span>';
+  const failing = d.checks.filter((c) => c.ok === false).length;
+  const tables = Object.entries(d.tables);
+  // One line that can be pasted next to the other site's, to compare by eye
+  // or in a text editor.
+  const fingerprint = tables.map(([t, n]) => `${t}=${n}`).join(" ");
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>System check</h1>
+      <div class="sub">${esc(d.host)}${d.revision ? " · " + esc(d.revision) : ""}
+        · version ${esc(d.version)} · ${esc(d.database)} · checked ${esc(day(d.checked_at))}</div>
+    </div>
+
+    <div class="card">
+      <h2>${failing ? `${num(failing)} thing${failing === 1 ? "" : "s"} not working`
+        : "Everything this site depends on is working"}</h2>
+      <p class="muted">Each line was tried just now, for real: a row written to the database
+      and read back, a request sent to each source. A “note” is worth knowing and is not a
+      fault.</p>
+      <table>
+        <tbody>${d.checks.map((c) => `<tr>
+          <td style="white-space:nowrap"><strong>${esc(c.name)}</strong></td>
+          <td style="white-space:nowrap">${mark(c.ok)}</td>
+          <td>${esc(c.detail)}${c.fix ? `<div style="margin-top:4px"><strong>To fix:</strong>
+            ${esc(c.fix)}</div>` : ""}</td></tr>`).join("")}</tbody>
+      </table>
+      <div class="actions"><button id="sys-again">Check again</button></div>
+    </div>
+
+    <div class="card">
+      <h2>What is stored here</h2>
+      <p class="muted"><strong>${num(d.rows)}</strong> rows in ${num(tables.length)} tables.
+      When moving the site, open this page on the old site and on the new one: the same
+      numbers on both mean everything was copied, and a different number names the table
+      to look at.</p>
+      <table>
+        <thead><tr><th>Table</th><th class="num">Rows</th></tr></thead>
+        <tbody>${tables.map(([t, n]) => `<tr><td class="mono">${esc(t)}</td>
+          <td class="num">${n < 0 ? '<span class="pill warn">could not be counted</span>'
+            : num(n)}</td></tr>`).join("")}</tbody>
+      </table>
+      <p class="muted" style="font-size:12.5px;margin-top:10px">The same, as one line to
+      paste beside the other site's:</p>
+      <textarea readonly rows="3" style="width:100%;font-size:12px"
+        onclick="this.select()">${esc(fingerprint)}</textarea>
+    </div>
+
+    <div class="card">
+      <h2>Settings in use</h2>
+      <p class="muted">By name only; values are never shown. A new site needs each of the
+      first group set to the same value as the old one.</p>
+      <p><strong>To carry to a new site:</strong>
+        ${d.settings.carry.length ? d.settings.carry.map((s) =>
+          `<span class="mono">${esc(s)}</span>`).join(", ") : "none"}</p>
+      <p class="muted"><strong>About this host only</strong> (expected to differ):
+        ${d.settings.this_host.length ? d.settings.this_host.map((s) =>
+          `<span class="mono">${esc(s)}</span>`).join(", ") : "none"}</p>
+    </div>`;
+  document.getElementById("sys-again").onclick = () => viewSystem();
+}
+
 /* ------------------------------------------------------------------ router */
 
 const ROUTES = [
@@ -3268,6 +3344,7 @@ const ROUTES = [
   [/^\/screening$/, () => viewScreening()],
   [/^\/adviser\/(\d+)$/, (crd) => viewAdviser(crd)],
   [/^\/screens\/(.+)$/, (id) => viewScreen(decodeURIComponent(id))],
+  [/^\/system$/, () => viewSystem()],
 ];
 
 async function route() {

@@ -338,11 +338,12 @@ def client(tmp_path, monkeypatch):
 
 def test_health_says_whether_alerts_leave_without_naming_anyone(client):
     c, _ = client()
-    assert c.get("/health").json()["alerts"] == {"mode": "draft", "provider": ""}
+    assert c.get("/health").json()["alerts"] == {"mode": "draft", "provider": "",
+                                                 "paused": False}
 
     c, _ = client(BREVO_API_KEY=KEY, ALERTS_FROM="alerts@concord.example")
     body = c.get("/health")
-    assert body.json()["alerts"] == {"mode": "send", "provider": "Brevo"}
+    assert body.json()["alerts"] == {"mode": "send", "provider": "Brevo", "paused": False}
     assert KEY not in body.text and "concord.example" not in body.text
 
 

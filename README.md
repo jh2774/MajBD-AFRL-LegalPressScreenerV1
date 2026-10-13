@@ -409,6 +409,7 @@ every night on a deploy that was screening nothing.
 | `POST /v1/entities/{key}/vehicles/managers` | Find the firms worth reading (`find`), or read one firm's Form ADV and join it to the funds (`check`) |
 | `POST /v1/alerts/subscriptions` | Save who is emailed about a portfolio |
 | `POST /v1/alerts/run` | Check every watched firm and company now and email what is new |
+| `GET /v1/system/check` | Try each thing the deployment depends on, and count what is stored — for moving hosts |
 | `POST /v1/policy/preview` | What a proposed policy would do over past findings — saves nothing |
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
 | `POST /v1/portfolio/edit` | Add or drop companies, returning a new key |
@@ -1086,7 +1087,10 @@ each:
   runs the service holds a request open against itself (`jobs._hold_open`). That keeps the
   thread running and the instance alive, and it is billed for the minutes the screen takes. On
   by default wherever a managed host is detected; `FOCI_KEEP_AWAKE=false` turns it off. It also
-  stops Render's free plan cutting a long screen short.
+  stops Render's free plan cutting a long screen short. An alert check is held the same way:
+  it runs inside the request that asked for it, and whoever asked — the portfolio page, the
+  daily schedule with its ten-minute limit — has usually stopped waiting before a long one
+  ends.
 * **A database connection can be closed while the instance is frozen.** The store checks a
   connection that has sat idle before using it and reconnects; a read that hits a dead
   connection is repeated once on a new one. A write is never silently replayed.
@@ -1102,6 +1106,20 @@ only reads the source, creates the current schema at the destination, refuses a 
 that already holds rows, and on Postgres moves the id counters past the copied rows.
 
 `GET /health` reports `host` (`Cloud Run`, `Render`, …) and, on Cloud Run, the `revision`.
+
+Two things exist for the move itself:
+
+* **`ALERTS_PAUSED=true`** stops a site checking for changes altogether. It is set on the old
+  site before the copy and on the new one until the switch, so nothing is emailed twice and
+  nothing is used up unsent. Holding alerts as drafts (`ALERTS_SEND=false`) would not do: a
+  draft counts as said, so a new site tried out on drafts would consume alerts nobody received.
+  A paused site says so in a banner.
+* **System check** — the link in the footer, or `GET /v1/system/check`. It tries each thing the
+  site depends on for real: writes a row to the database and reads it back, calls its own
+  address (which is how long work stays alive on Cloud Run), asks each SEC service, IAPD and
+  USAspending. It also counts every table. The same counts on the old site and the new are the
+  evidence that everything was copied. Settings in use are listed by name, never by value, so
+  the ones to carry across are not forgotten.
 
 ### Deploying to Render
 

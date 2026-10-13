@@ -38,7 +38,8 @@ DB_VARS = ("DATABASE_URL", "INSTANCE_CONNECTION_NAME", "CLOUD_SQL_CONNECTION_NAM
 @pytest.fixture()
 def clean_env(monkeypatch):
     for var in HOSTS + DB_VARS + ("K_REVISION", "FOCI_KEEP_AWAKE", "FOCI_CACHE_MAX_MB",
-                                  "REDIS_URL", "FOCI_INPROCESS_SCREENS", "FOCI_PUBLIC_URL"):
+                                  "REDIS_URL", "FOCI_INPROCESS_SCREENS", "FOCI_PUBLIC_URL",
+                                  "ALERTS_PAUSED"):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
 
@@ -384,6 +385,82 @@ def test_holding_stops_with_the_screen_and_gives_up_if_it_cannot_reach_itself(mo
     monkeypatch.setattr("requests.get", unreachable)
     jobs._hold_open("https://site.example/internal/hold/r1", "t", lambda: True)
     assert calls == ["failed"] * 5, "five tries, then the screen carries on without it"
+
+
+# -------------------------------------- staying awake during an alert check
+
+def a_check_that_records(app_module, monkeypatch):
+    """Stand in for the hold and the check; return what each was given."""
+    held, seen = [], {}
+    monkeypatch.setattr(app_module, "_hold_open",
+                        lambda url, token, alive: held.append((url, token, alive())))
+
+    def run_alerts(store, adv, mailer, base_url="", **kw):
+        seen["locked"] = app_module._alerts_running.locked()
+        for _ in range(50):                     # the hold thread starts alongside
+            if held:
+                break
+            time.sleep(0.02)
+        return {"subscriptions": 0, "emails": []}
+
+    monkeypatch.setattr(app_module.alerts_engine, "run_alerts", run_alerts)
+    return held, seen
+
+
+def test_an_alert_check_on_a_managed_host_holds_a_request_open_too(tmp_path, clean_env):
+    """Whoever asked for the check stops waiting long before a big one ends:
+    the page moves on, the daily schedule gives up after ten minutes."""
+    c, app_module = boot(tmp_path, clean_env, K_SERVICE="foci",
+                         FOCI_INPROCESS_SCREENS="true")
+    held, seen = a_check_that_records(app_module, clean_env)
+    assert c.post("/v1/alerts/run", headers=AUTH).json()["status"] == "checked"
+    assert held == [("http://testserver/internal/hold/alerts", app_module._hold_token, True)]
+    assert seen["locked"] is True
+
+    clean_env.delenv("K_SERVICE")
+    c, app_module = boot(tmp_path, clean_env)               # a developer's machine
+    held, _ = a_check_that_records(app_module, clean_env)
+    c.post("/v1/alerts/run", headers=AUTH)
+    assert held == []
+
+
+def test_the_hold_for_an_alert_check_lasts_as_long_as_the_check(tmp_path, clean_env):
+    c, app_module = boot(tmp_path, clean_env)
+    token = {"X-Hold-Token": app_module._hold_token}
+    assert c.get("/internal/hold/alerts", headers=token).json() == {"running": False}
+
+    assert app_module._alerts_running.acquire(blocking=False)
+    threading.Timer(0.3, app_module._alerts_running.release).start()
+    began = time.monotonic()
+    assert c.get("/internal/hold/alerts", headers=token).json() == {"running": False}
+    assert 0.25 < time.monotonic() - began < 5
+
+
+# ------------------------------------------ pausing alert checks for a move
+
+def test_a_paused_site_checks_nothing_and_says_so(tmp_path, clean_env):
+    """A draft counts as said. A new site tried out on drafts would use up
+    alerts nobody received; an old one left checking would send them twice."""
+    c, app_module = boot(tmp_path, clean_env, ALERTS_PAUSED="true")
+
+    def must_not_run(*a, **kw):
+        raise AssertionError("a paused site ran a check")
+
+    clean_env.setattr(app_module.alerts_engine, "run_alerts", must_not_run)
+    clean_env.setattr(app_module.alerts_engine, "is_due", must_not_run)
+    for url in ("/v1/alerts/run", "/v1/alerts/run?only_if_due=true"):
+        answer = c.post(url, headers=AUTH).json()
+        assert answer["status"] == "paused" and "ALERTS_PAUSED" in answer["detail"]
+    health = c.get("/health").json()
+    assert health["alerts"]["paused"] is True
+    assert any("Alert checks are paused" in w for w in health["warnings"]), \
+        "the banner is how nobody forgets to switch it back on"
+
+    clean_env.delenv("ALERTS_PAUSED")
+    c, _ = boot(tmp_path, clean_env)
+    health = c.get("/health").json()
+    assert health["alerts"]["paused"] is False
+    assert not any("paused" in w for w in health["warnings"])
 
 
 # ------------------------------------------------ one check across instances

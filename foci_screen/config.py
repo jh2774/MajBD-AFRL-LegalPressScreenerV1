@@ -127,6 +127,12 @@ class Config:
     # missing service as a fault. Left unset, connecting a service is the
     # decision to send.
     alerts_send: bool | None = field(default_factory=lambda: _switch("ALERTS_SEND"))
+    # Stop checking altogether — nothing read, nothing composed, nothing
+    # recorded as said. For a site that is being moved from, or a new one
+    # being tried before people are sent to it. ALERTS_SEND=false is not the
+    # same thing: a draft still counts as said, so a new site left on drafts
+    # while it was being tested would use up alerts nobody ever received.
+    alerts_paused: bool = field(default_factory=lambda: _flag("ALERTS_PAUSED", False))
     # A mail service reached over HTTPS. This is the route that works on a
     # free Render instance, which blocks the SMTP ports (25, 465, 587).
     brevo_api_key: str = field(default_factory=lambda: _env("BREVO_API_KEY"))

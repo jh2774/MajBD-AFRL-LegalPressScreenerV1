@@ -27,7 +27,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import alerts as alerts_engine
-from .. import fund_managers
+from .. import fund_managers, syscheck
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from .. import vehicles as vehicles_engine
@@ -40,7 +40,7 @@ from ..connectors.formd import READABLE_URL as FORMD_READABLE_URL
 from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
 from ..connectors.vehicles import VehicleConnector, default_phrase, phrase_problem
-from ..jobs import HOLD_SECONDS, JobQueue
+from ..jobs import HOLD_SECONDS, JobQueue, _hold_open
 from ..notify import render as render_notice
 from ..notify.mailer import LABEL as LABEL_OF_MAIL
 from ..notify.mailer import Mailer
@@ -184,7 +184,16 @@ def deployment_warnings() -> list[str]:
     mail = Mailer(cfg).status()
     if mail["mode"] == "misconfigured":
         warnings.append("Email alerts: " + mail["explanation"])
+    if cfg.alerts_paused:
+        warnings.append(ALERTS_PAUSED_NOTE)
     return warnings
+
+
+ALERTS_PAUSED_NOTE = (
+    "Alert checks are paused on this site (ALERTS_PAUSED is set). Nothing is checked "
+    "and nothing is emailed until that setting is removed. This is the right state "
+    "for a site being moved away from, or a new one still being tried out; it is the "
+    "wrong one for the site people rely on.")
 
 
 INTERRUPTED_NOTE = (
@@ -250,8 +259,29 @@ def health() -> dict:
             # Whether alert emails actually leave: send, redirect, draft or
             # misconfigured — and through which service. No addresses, no keys.
             "alerts": {"mode": mail.status()["mode"],
-                       "provider": LABEL_OF_MAIL.get(mail.transport, "")},
+                       "provider": LABEL_OF_MAIL.get(mail.transport, ""),
+                       "paused": cfg.alerts_paused},
             "warnings": deployment_warnings()}
+
+
+def _probe_client():
+    from ..httpclient import HttpClient
+    return HttpClient(cfg)
+
+
+@app.get("/v1/system/check", tags=["meta"])
+def system_check(request: Request, store: Store = Depends(tenant_store)) -> dict:
+    """Try, for real, each thing this deployment has to be able to do, and
+    count what is stored.
+
+    For moving between hosts: the checks say whether a new site can do the
+    work, not merely answer; the counts, read on the old site and the new,
+    say whether everything was copied. Takes a few seconds. Settings are
+    named, never shown.
+    """
+    return syscheck.run(cfg, store, _probe_client(), _base_url(request),
+                        Mailer(cfg).status(), environ=os.environ,
+                        queue_backend=queue.backend, version=VERSION)
 
 
 @app.get("/v1/config", tags=["meta"])
@@ -297,16 +327,24 @@ def _hold_for(run_id: str, request: Request) -> dict:
             "hold_token": _hold_token}
 
 
+ALERTS_HOLD = "alerts"      # the hold address used while an alert check runs
+
+
 @app.get("/internal/hold/{run_id}", include_in_schema=False)
 def hold_for_screen(run_id: str, request: Request) -> dict:
-    """Wait while this process is running the screen, then say whether it still is."""
+    """Wait while this process is running the screen — or the alert check —
+    then say whether it still is."""
     given = request.headers.get("x-hold-token", "")
     if not secrets.compare_digest(given, _hold_token):
         raise HTTPException(404, "Not Found")
+
+    def running() -> bool:
+        return _alerts_running.locked() if run_id == ALERTS_HOLD else queue.is_running(run_id)
+
     deadline = time.monotonic() + HOLD_SECONDS
-    while queue.is_running(run_id) and time.monotonic() < deadline:
+    while running() and time.monotonic() < deadline:
         time.sleep(1)
-    return {"running": queue.is_running(run_id)}
+    return {"running": running()}
 
 
 @app.get("/v1/screens", tags=["screens"])
@@ -900,6 +938,27 @@ def delete_subscription(subscription_id: str,
 _alerts_running = threading.Lock()
 
 
+def _keep_awake_for_alerts(request: Request) -> None:
+    """Hold a request open against this service for as long as the check runs.
+
+    The check runs inside the request that asked for it, which is enough only
+    while whoever asked is still waiting. The portfolio page asks and moves
+    on; the daily schedule gives up after ten minutes; Cloud Run ends any
+    request at its timeout. After that a managed host sees no work in
+    progress — Cloud Run withdraws the processor, and it or Render's free
+    plan may shut the instance down — with a check half done. In the weeks
+    investment firms refile, reading dozens of new forms takes longer than
+    any of those limits. So, as for a screen (`jobs._hold_open`), the service
+    keeps a request open to itself until the check has finished.
+    """
+    wanted = cfg.keep_awake if cfg.keep_awake is not None else bool(cfg.managed_host)
+    if wanted:
+        threading.Thread(
+            target=_hold_open, name="hold-alerts", daemon=True,
+            args=(f"{_base_url(request)}/internal/hold/{ALERTS_HOLD}", _hold_token,
+                  _alerts_running.locked)).start()
+
+
 @app.post("/v1/alerts/run", tags=["alerts"])
 def run_alerts(request: Request, only_if_due: bool = Query(False),
                store: Store = Depends(tenant_store)) -> dict:
@@ -915,6 +974,8 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
     busy = {"status": "already running", "emails": [],
             "detail": "A check is already under way. Its results will appear "
                       "under Recent alerts when it finishes."}
+    if cfg.alerts_paused:
+        return {"status": "paused", "emails": [], "detail": ALERTS_PAUSED_NOTE}
     if only_if_due and not alerts_engine.is_due(store):
         return {"status": "not due", "emails": []}
     if not _alerts_running.acquire(blocking=False):
@@ -926,6 +987,7 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
         if not store.try_lock("alerts"):
             return busy
         try:
+            _keep_awake_for_alerts(request)
             result = alerts_engine.run_alerts(store, _adv(), Mailer(cfg),
                                               _base_url(request), formd=_formd(),
                                               vehicles=_vehicles())
