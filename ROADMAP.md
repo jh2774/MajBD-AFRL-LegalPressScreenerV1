@@ -282,9 +282,14 @@ Ordered by how much they limit the tool today.
    and ownership-change signals — it needs the disposition data from item 7 to be worth
    anything.
 
-   Also open: **distinguishing sole proprietors properly.** The individual test is a name
-   heuristic. SAM.gov's entity registration states whether a registrant is a sole proprietor,
-   which is authoritative; that needs `SAM_API_KEY` (item 2).
+   ~~Also open: distinguishing sole proprietors properly.~~ **Done without a SAM key, for
+   most cases.** FPDS copies the vendor's SAM registration onto every award, including whether
+   it is a sole proprietor (spelled `isSolePropreitorship` in FPDS). A prime registered as one
+   is no longer screened; it was never checked before. A subcontractor is looked up by its own
+   UEI (`VENDOR_UEI:"…"` in the FPDS feed), and if it has ever held a prime award, its
+   registration decides in both directions — a person trading as "Apex Precision Machining"
+   is skipped, and "Shield AI" is screened. Only a subcontractor with no prime award of its
+   own still falls back to the name heuristic, and the run notes say which test decided.
 6. ~~**Entity resolution.**~~ **Done for UEI → CIK**, which is the mapping that bites: EDGAR
    full-text search is constrained by CIK, so a wrong answer returns another registrant's
    exhibits rather than nothing. `entity_links` stores the resolution with its confidence, and
@@ -295,7 +300,8 @@ Ordered by how much they limit the tool today.
    rather than its own name, and only an exact match (legal suffixes aside) is accepted, with
    its CRD kept on the record. What is missing is the link from a holding company to its
    registered advisers — FMR LLC and BlackRock, Inc. have no IAPD record of their own. There
-   is still no CAGE crosswalk. Both want an authoritative seed rather than another
+   is a CAGE code now — FPDS carries it on every award, and it is on the contractor record
+   and page — but nothing yet keys on it. Both want an authoritative seed rather than another
    similarity score.
 7. ~~**Feedback loop.**~~ **Done.** Verdicts are recorded per signal (`POST /v1/dispositions`),
    keyed on a hash of rule plus evidence so rewording a rule does not orphan them, and

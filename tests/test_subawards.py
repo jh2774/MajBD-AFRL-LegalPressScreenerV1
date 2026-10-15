@@ -258,6 +258,7 @@ def test_individual_subawardees_are_skipped_and_reported():
     ]
     screener = Screener.__new__(Screener)
     screener.usaspending = SubOnlyScreener(subs).usaspending
+    screener.fpds = SubOnlyScreener(subs).fpds
 
     opts = ScreenOptions(agency="DoD", max_subaward_entities=5)
     result = ScreenResult(run_id="r1", options=opts)
@@ -273,10 +274,17 @@ def test_individual_subawardees_are_skipped_and_reported():
 # ----------------------------------------------------------- the pipeline
 
 class SubOnlyScreener:
-    """Just enough of a screener to exercise the selection logic."""
+    """Just enough of a screener to exercise the selection logic.
 
-    def __init__(self, subs):
+    `registrations` maps a UEI to what FPDS says about that vendor; a UEI not
+    in it has never held a prime award, so FPDS knows nothing about it.
+    """
+
+    def __init__(self, subs, registrations=None):
+        regs = registrations or {}
         self.usaspending = type("C", (), {"search_subawards": lambda *a, **k: subs})()
+        self.fpds = type("F", (), {"vendor_registration":
+                                   lambda self, uei: regs.get(uei)})()
 
 
 @pytest.mark.parametrize("requested,expected", [(0, 0), (1, 1), (5, 2)])
@@ -291,6 +299,7 @@ def test_subaward_entity_quota_is_respected(requested, expected):
     ]
     screener = Screener.__new__(Screener)
     screener.usaspending = SubOnlyScreener(subs).usaspending
+    screener.fpds = SubOnlyScreener(subs).fpds
 
     from foci_screen.pipeline import ScreenResult
     opts = ScreenOptions(agency="DoD", max_subaward_entities=requested)
@@ -307,6 +316,7 @@ def test_subcontractor_already_screened_as_a_prime_is_not_repeated():
                      recipient_name="ALREADY SCREENED INC")]
     screener = Screener.__new__(Screener)
     screener.usaspending = SubOnlyScreener(subs).usaspending
+    screener.fpds = SubOnlyScreener(subs).fpds
 
     opts = ScreenOptions(agency="DoD", max_subaward_entities=5)
     result = ScreenResult(run_id="r1", options=opts)
@@ -322,6 +332,7 @@ def test_run_notes_warn_about_self_reported_values():
                      recipient_name="SUPPLIER ONE LLC")]
     screener = Screener.__new__(Screener)
     screener.usaspending = SubOnlyScreener(subs).usaspending
+    screener.fpds = SubOnlyScreener(subs).fpds
 
     opts = ScreenOptions(agency="DoD", max_subaward_entities=1)
     result = ScreenResult(run_id="r1", options=opts)
@@ -330,3 +341,58 @@ def test_run_notes_warn_about_self_reported_values():
     note = " ".join(result.notes)
     assert "self-reported" in note
     assert "prime contract" in note
+
+
+# ------------------------------------- a subcontractor's own SAM registration
+
+def _registration(sole_proprietor):
+    return {"cage": "1ABC2", "sole_proprietor": sole_proprietor,
+            "foreign_government": False, "organizational_type": "", "name": ""}
+
+
+def _pick(subs, registrations):
+    from foci_screen.pipeline import Screener, ScreenOptions, ScreenResult
+
+    stand_in = SubOnlyScreener(subs, registrations)
+    screener = Screener.__new__(Screener)
+    screener.usaspending, screener.fpds = stand_in.usaspending, stand_in.fpds
+    opts = ScreenOptions(agency="DoD", max_subaward_entities=5)
+    result = ScreenResult(run_id="r1", options=opts)
+    picked = screener._subaward_entities(opts, {}, result, lambda *_: None)
+    return [c[1][0].recipient_name for c in picked], " ".join(result.notes)
+
+
+def test_a_registered_sole_proprietor_is_skipped_whatever_its_name():
+    """A company-sounding name does not make a business: the registration
+    says this is a person trading under it."""
+    subs = [Contract(award_id="S1", piid="S1", is_subaward=True, recipient_uei="U1",
+                     recipient_name="APEX PRECISION MACHINING")]
+    picked, note = _pick(subs, {"U1": _registration(True)})
+    assert picked == []
+    assert "registered as sole proprietors" in note
+    assert "APEX PRECISION MACHINING" in note
+
+
+def test_a_person_like_name_registered_as_a_company_is_screened():
+    """The heuristic's known false positive — "Shield AI" reads as a person —
+    is overruled where the registration says otherwise."""
+    subs = [Contract(award_id="S1", piid="S1", is_subaward=True, recipient_uei="U1",
+                     recipient_name="SHIELD AI")]
+    picked, note = _pick(subs, {"U1": _registration(False)})
+    assert picked == ["SHIELD AI"]
+    assert "looks like a person" not in note
+
+
+def test_without_a_registration_the_name_heuristic_still_decides():
+    subs = [Contract(award_id="S1", piid="S1", is_subaward=True, recipient_uei="U1",
+                     recipient_name="JOSHUA D GOODWIN")]
+    picked, note = _pick(subs, {})
+    assert picked == []
+    assert "no FPDS record of their own" in note
+
+
+def test_a_registration_that_does_not_say_falls_back_to_the_name():
+    subs = [Contract(award_id="S1", piid="S1", is_subaward=True, recipient_uei="U1",
+                     recipient_name="JOSHUA D GOODWIN")]
+    picked, _ = _pick(subs, {"U1": _registration(None)})
+    assert picked == []

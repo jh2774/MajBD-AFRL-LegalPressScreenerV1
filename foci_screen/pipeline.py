@@ -135,6 +135,20 @@ class Screener:
                 progress(f"  enriching {c.piid} (USAspending detail + FPDS)...")
                 self.usaspending.enrich(c)
                 self.fpds.enrich(c)
+            if any(c.is_sole_proprietor for c in ent_contracts if not c.is_subaward):
+                # The prime's own SAM registration, as FPDS records it, says
+                # this awardee is a person trading under their own name. The
+                # same reason subcontractors who are people are not screened
+                # applies, and here it is a recorded fact, not a guess from
+                # the name.
+                progress("  skipped: registered as a sole proprietor (FPDS).")
+                result.notes.append(
+                    f"Did not screen {name}: its SAM registration, as FPDS records it "
+                    f"on award {ent_contracts[0].piid or ent_contracts[0].award_id}, is "
+                    f"a sole proprietorship. Screening a named individual, then "
+                    f"writing to their contracting officer about them, is not "
+                    f"something this tool does by default.")
+                continue
             entity = self._build_entity(name, ent_contracts, opts)
             # Indexed for search regardless of whether a finding results — an
             # award with no risk signal is still the record that answers "what
@@ -196,22 +210,48 @@ class Screener:
             return []
 
         grouped: dict[str, list[Contract]] = {}
-        individuals: set[str] = set()
+        individuals: set[str] = set()       # by the name heuristic
+        registered: set[str] = set()        # by their own SAM registration
+        decided: dict[str, bool] = {}
         for c in subs:
             key = (c.recipient_uei or c.recipient_name).upper()
             if not key or key in already:      # already screened as a prime
                 continue
-            if looks_like_an_individual(c.recipient_name):
-                # Sole proprietors appear in subaward reporting. Screening a
-                # named person, and writing to their customer's contracting
-                # officer about them, is not what this tool is for.
-                individuals.add(c.recipient_name)
+            if key in grouped:
+                grouped[key].append(c)
                 continue
+            if len(grouped) >= opts.max_subaward_entities or key in decided:
+                continue
+            # Sole proprietors appear in subaward reporting. Screening a named
+            # person, and writing to their customer's contracting officer about
+            # them, is not what this tool is for. A subcontractor that has held
+            # a prime award has its own SAM registration on FPDS, which says so
+            # outright; only without one does the name decide.
+            reg = self.fpds.vendor_registration(c.recipient_uei)
+            if reg and reg["sole_proprietor"] is not None:
+                person = decided[key] = reg["sole_proprietor"]
+                if person:
+                    registered.add(c.recipient_name)
+                    continue
+            else:
+                person = decided[key] = looks_like_an_individual(c.recipient_name)
+                if person:
+                    individuals.add(c.recipient_name)
+                    continue
             grouped.setdefault(key, []).append(c)
 
         picked = list(grouped.items())[:opts.max_subaward_entities]
         progress(f"  {len(subs)} subaward(s); screening {len(picked)} "
                  f"subcontractor(s) not already covered.")
+        if registered:
+            progress(f"  {len(registered)} subawardee(s) skipped: registered as sole "
+                     f"proprietors.")
+            result.notes.append(
+                f"Skipped {len(registered)} subawardee(s) registered as sole "
+                f"proprietors, according to their own SAM registration as FPDS records "
+                f"it: {', '.join(sorted(registered))}. Screening a named individual — "
+                f"then writing to their customer's contracting officer about them — is "
+                f"not something this tool does by default.")
         if individuals:
             progress(f"  {len(individuals)} subawardee(s) skipped as individuals.")
             result.notes.append(
@@ -219,9 +259,11 @@ class Screener:
                 f"person rather than a company: {', '.join(sorted(individuals))}. "
                 f"Subaward reporting includes sole proprietors, and screening a named "
                 f"individual — then writing to their customer's contracting officer "
-                f"about them — is not something this tool does by default. The test is "
-                f"a heuristic, so a company with a two-word name and no 'Inc' can land "
-                f"here; they are listed above so that is visible rather than silent.")
+                f"about them — is not something this tool does by default. These have "
+                f"no FPDS record of their own to say either way, so the test is a "
+                f"heuristic: a company with a two-word name and no 'Inc' can land "
+                f"here, and they are listed above so that is visible rather than "
+                f"silent.")
         if picked:
             result.notes.append(
                 f"{len(picked)} subcontractor(s) screened. Subaward values are "
@@ -309,6 +351,7 @@ class Screener:
                               if c.country_of_incorporation})
         return Entity(
             name=name, uei=first.recipient_uei,
+            cage=next((c.cage_code for c in contracts if c.cage_code), ""),
             parent_name=first.parent_recipient_name,
             parent_uei=first.parent_recipient_uei,
             cik=cik, aliases=[matched] if matched else [],
