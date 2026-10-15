@@ -12,6 +12,12 @@ Google to create things.
 > end). The commands have still not been run against a live Google Cloud project, because that
 > needs your account. Each step says what you should see; if a step shows something else, stop
 > there rather than pressing on. The old site keeps working while you find out why.
+>
+> **Up to date with** pull requests #6 (a contractor's SAM registration read from FPDS) and #7
+> (a screening policy for each watchlist), merged 15 October 2026. Neither needs a new setting
+> or a step of its own; what they change for the move is in "Watchlists" and step 8. If more
+> pull requests are merged before you start, push them and let Render deploy them first —
+> "Before you start", step 1.
 
 ## The order, and why
 
@@ -36,6 +42,7 @@ stays behind.
 | Environment settings | Cloud Run settings, with passwords and keys in **Secret Manager** | |
 | Deploy when you push | **Cloud Build** trigger on the GitHub repository | Step 10 |
 | Daily alert check | The same GitHub workflow, pointed at the new address | Or Cloud Scheduler; step 11 |
+| Watchlists, and each one's screening policy | Copied with the rest of the database | Not screened nightly on either host; see "Watchlists" |
 
 **What does not move, because it is not on Render either:** the patent-lien index
 (`patent_assignments.db`) is a file on whichever computer built it. A website on Render's free
@@ -53,10 +60,16 @@ for one team's screening tool it is ample, and step 2 says how to choose the nex
 
 ## Before you start
 
-**1. Get the current code onto the old site.** Push from GitHub Desktop, wait for the checks on
-the repository's **Actions** tab to go green, and wait for Render to finish deploying. The old
-site needs this version too: it has the pause switch and the System check page the steps below
-use. You can tell it has arrived when the old site's footer shows a **System check** link.
+**1. Get the current code onto the old site.** Push from GitHub Desktop (and merge any pull
+requests you mean to include), wait for the checks on the repository's **Actions** tab to go
+green, and wait for Render to finish deploying. The old site needs the same version as the new
+one: it has the pause switch and the System check page the steps below use, and starting up
+brings its database to the same shape — pull request #7, for one, added a column for each
+watchlist's policy. Both databases must have the same shape for the copy to be exact.
+
+To confirm it has arrived: the old site's footer shows a **System check** link, and the top
+line of that page shows the commit Render built, as seven characters (for example `250a418`).
+It should match the newest commit on the repository's GitHub page.
 
 **2. Open the old site's System check** (the link in the footer, or add `#/system` to its
 address). Keep that tab open for the whole move. You need two things from it:
@@ -309,8 +322,10 @@ Open the address from step 5 in your browser.
    * *Database* — a row was written, read back and removed.
    * *The site can reach its own address* — this is how a long screen or alert check keeps
      running on Cloud Run.
-   * The four *SEC* lines and *USAspending* — Google's network can reach them, and the SEC
-     accepts your `FOCI_USER_AGENT`.
+   * The four *SEC* lines, *USAspending* and *FPDS* — Google's network can reach them, and the
+     SEC accepts your `FOCI_USER_AGENT`. FPDS matters more since pull request #6: a screen now
+     reads each contractor's SAM registration from it, with no SAM key.
+   * *Watchlists* — a note, not a fault. It says how many are saved; see "Watchlists".
 3. **Compare "What is stored here" with the old site's tab.** The row counts should be the same,
    table for table. The quickest way: copy the one-line version from each page and paste them
    under one another. A table that differs was not fully copied — go back to step 7.
@@ -379,6 +394,24 @@ does no harm, because two checks never run at once.
   unset KEY
   ```
   The key is stored in the scheduler job, where people with access to the project can read it.
+
+## Watchlists
+
+A watchlist is a saved screen — an agency or a contractor, with its options — and since pull
+request #7 each one can carry its own screening policy: what to screen for and what raises a
+notice, laid over the site's own policy. Watchlists and their policies live in the database, so
+step 7 copies them with everything else. Nothing needs setting for them.
+
+**What does not change: nothing runs them on a schedule, on Render today or on Google Cloud as
+set up here.** The nightly sweep (`foci-scheduler`) hands each watchlist to a job queue
+(`REDIS_URL`) and a separate worker, and refuses to run without them. The site on Render is a
+single web service with neither, and so is this Cloud Run setup. A watchlist is screened when
+someone runs it (`POST /v1/watchlists/{id}/run`), and that screen runs inside the site and keeps
+it awake like any other. The System check's *Watchlists* line says how many are saved.
+
+If watchlists should be screened every night on Google Cloud, that is a change to make after
+the move, not part of it: the sweep can be given a way to run its screens itself, as a Cloud Run
+job started by Cloud Scheduler, which needs no queue or worker. Ask for it when it is wanted.
 
 ## 12. Retire Render
 
@@ -453,10 +486,13 @@ shows up as nothing at all rather than as a failed page.
   would use up alerts nobody received.
 * **System check.** A page (and `GET /v1/system/check`) that tries each dependency for real and
   counts every table, so a new site can be shown to work and to hold what the old one holds.
+  It includes FPDS, which screens rely on for SAM registrations since pull request #6, and says
+  how many watchlists are saved and whether anything screens them on a schedule.
 * **Cache size.** Expired cached responses are deleted and the cache is capped.
 * **`foci-screen copy-db`.** The command step 7 runs.
-* **`/health`** names the host that answered and the deploy, to tell the two sites apart during
-  the move, and says whether alert checks are paused.
+* **`/health`** names the host that answered and the deploy — Cloud Run's revision, or the
+  commit Render built — to tell the two sites apart during the move and to show the old one is
+  current, and says whether alert checks are paused.
 * **The alert list follows the portfolio** to a new website address, so re-saving does not
   create a second list.
 

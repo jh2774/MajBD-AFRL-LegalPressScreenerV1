@@ -250,9 +250,9 @@ def health() -> dict:
     return {"status": "ok", "version": VERSION, "queue": queue.backend,
             # Which platform answered, and which deploy of it. During a move
             # between hosts this is how to tell the old site from the new one
-            # at a glance; K_REVISION is Cloud Run's name for a deploy.
+            # at a glance: Cloud Run's revision name, or on Render the commit.
             "host": cfg.managed_host or "self-hosted",
-            "revision": os.environ.get("K_REVISION", ""),
+            "revision": syscheck.revision(os.environ),
             "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
             "authenticated": bool(keymap),
             "ephemeral_storage": storage_is_ephemeral(),

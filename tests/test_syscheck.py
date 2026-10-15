@@ -162,6 +162,26 @@ def test_every_table_the_copy_moves_is_counted(store):
     assert syscheck.table_counts(store)["formd_index"] == 1
 
 
+def test_which_deploy_is_answering_on_either_host():
+    assert syscheck.revision({"K_REVISION": "foci-00007-abc"}) == "foci-00007-abc"
+    assert syscheck.revision({"RENDER_GIT_COMMIT": "250a418d0c4f9e2b"}) == "250a418"
+    assert syscheck.revision({}) == ""
+
+
+def test_saved_watchlists_that_nothing_screens_on_a_schedule_are_said(store):
+    """Each can now carry its own screening policy, which makes it easy to
+    assume it is screened every night. Without a queue, it is not."""
+    assert syscheck.watchlist_check(store, "thread") == {
+        "name": "Watchlists", "ok": None, "detail": "None saved.", "fix": ""}
+    store.create_watchlist("Navy shipbuilders", {"agency": "Department of the Navy"},
+                           policy={"notice_threshold": "high"})
+    idle = syscheck.watchlist_check(store, "thread")
+    assert idle["ok"] is None and idle["detail"].startswith("1 active, and nothing screens")
+    assert "REDIS_URL" in idle["detail"]
+    swept = syscheck.watchlist_check(store, "rq")
+    assert swept["ok"] is True and "each night" in swept["detail"]
+
+
 # --------------------------------------------------------------- all together
 
 def run(store, http=None, env=None, **cfg):
@@ -229,6 +249,8 @@ def test_the_check_is_for_people_with_a_key_and_asks_the_site_for_itself(client)
     asked = [url for url, _ in http.calls]
     assert asked[0] == "http://testserver/health", "its own address first"
     assert sum("sec.gov" in url for url in asked) == 4
+    assert any("fpds.gov" in url for url in asked), "the SAM registration comes from FPDS"
+    assert [c["name"] for c in body["checks"]][-1] == "Watchlists"
 
 
 def test_the_counts_follow_what_is_stored(client):

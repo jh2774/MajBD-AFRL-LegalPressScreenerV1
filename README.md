@@ -1120,10 +1120,12 @@ Two things exist for the move itself:
   A paused site says so in a banner.
 * **System check** — the link in the footer, or `GET /v1/system/check`. It tries each thing the
   site depends on for real: writes a row to the database and reads it back, calls its own
-  address (which is how long work stays alive on Cloud Run), asks each SEC service, IAPD and
-  USAspending. It also counts every table. The same counts on the old site and the new are the
-  evidence that everything was copied. Settings in use are listed by name, never by value, so
-  the ones to carry across are not forgotten.
+  address (which is how long work stays alive on Cloud Run), asks each SEC service, IAPD,
+  USAspending and FPDS. It says how many watchlists are saved and whether anything screens them
+  on a schedule — without a job queue, nothing does. It also counts every table. The same counts
+  on the old site and the new are the evidence that everything was copied. Settings in use are
+  listed by name, never by value, so the ones to carry across are not forgotten. Its top line,
+  like `/health`, names the deploy: Cloud Run's revision, or the commit Render built.
 
 ### Deploying to Render
 

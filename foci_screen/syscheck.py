@@ -23,6 +23,7 @@ from pathlib import Path
 
 from .connectors.adv import SEARCH_API as IAPD_SEARCH
 from .connectors.formd import TYPEAHEAD_API
+from .connectors.fpds import FEED as FPDS_FEED
 from .connectors.vehicles import DAILY_DIR
 from .dbcopy import TABLES, describe
 
@@ -59,6 +60,14 @@ MEMORY_COMFORTABLE_MB = 900
 MEMORY_TOO_SMALL_MB = 400
 
 PROBE_TIMEOUT = 10
+
+
+def revision(environ) -> str:
+    """Which deploy is answering: Cloud Run's revision name, or on Render the
+    commit it was built from — so the old site can be shown to run the same
+    code as GitHub before its data is copied."""
+    return (environ.get("K_REVISION") or (environ.get("RENDER_GIT_COMMIT") or "")[:7]
+            or "")
 
 
 def settings_in_use(environ) -> dict:
@@ -193,6 +202,32 @@ def memory_check(limit_mb: int | None) -> dict:
     return _check(name, True, f"{limit_mb:,} MB.")
 
 
+def watchlist_check(store, queue_backend: str) -> dict:
+    """Whether anything screens the saved watchlists on a schedule.
+
+    The nightly sweep (`scheduler.py`) hands each watchlist to a job queue and
+    refuses to run without one, because a screen started in a process that
+    exits a second later would never finish. A site with no queue — a single
+    Render web service, or Cloud Run as set up in docs/GOOGLE_CLOUD.md — has
+    nothing that runs them on its own. Said here, so a watchlist with its own
+    screening policy is not assumed to be screened every night.
+    """
+    name = "Watchlists"
+    try:
+        active = len(store.all_active_watchlists())
+    except Exception as exc:            # noqa: BLE001
+        return _check(name, None, f"Could not be counted: {type(exc).__name__}.")
+    if queue_backend == "rq":
+        return _check(name, True, f"{active:,} active. Screened each night by the "
+                                  f"scheduler's own cron job, through the job queue.")
+    if not active:
+        return _check(name, None, "None saved.")
+    return _check(name, None,
+                  f"{active:,} active, and nothing screens them on a schedule here: the "
+                  f"nightly sweep needs a job queue (REDIS_URL) and a worker, which this "
+                  f"site does not have. Each is screened only when someone runs it.")
+
+
 def mail_check(status: dict, paused: bool) -> list[dict]:
     mode = status.get("mode")
     sending = _check("Email alerts", {"send": True, "redirect": True,
@@ -231,17 +266,22 @@ def run(cfg, store, http, base_url: str, mail_status: dict, *, environ,
         probe(http, "USAspending", "https://api.usaspending.gov/api/v2/references/"
                                    "toptier_agencies/",
               why="The awards a screen starts from."),
+        probe(http, "FPDS", FPDS_FEED,
+              params={"FEEDNAME": "PUBLIC", "q": 'PIID:"FOCI-SYSTEM-CHECK"'},
+              why="Each award's contracting officer, and the contractor's SAM "
+                  "registration as FPDS records it."),
         *mail_check(mail_status, cfg.alerts_paused),
         _check("Screens", True if queue_backend == "rq" else None,
                "Run by a separate worker." if queue_backend == "rq" else
                "Run inside the site itself, which holds a request open to stay awake "
                "while one is running. A screen still running when the site is redeployed "
                "is cut off and marked interrupted."),
+        watchlist_check(store, queue_backend),
     ]
     counts = table_counts(store)
     return {
         "host": cfg.managed_host or "self-hosted", "version": version,
-        "revision": environ.get("K_REVISION", ""),
+        "revision": revision(environ),
         "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
         "ok": not any(c["ok"] is False for c in checks),
         "checks": checks,

@@ -39,7 +39,7 @@ DB_VARS = ("DATABASE_URL", "INSTANCE_CONNECTION_NAME", "CLOUD_SQL_CONNECTION_NAM
 def clean_env(monkeypatch):
     for var in HOSTS + DB_VARS + ("K_REVISION", "FOCI_KEEP_AWAKE", "FOCI_CACHE_MAX_MB",
                                   "REDIS_URL", "FOCI_INPROCESS_SCREENS", "FOCI_PUBLIC_URL",
-                                  "ALERTS_PAUSED"):
+                                  "ALERTS_PAUSED", "RENDER_GIT_COMMIT"):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
 
@@ -285,6 +285,15 @@ def test_health_says_which_host_answered(tmp_path, clean_env):
                 FOCI_INPROCESS_SCREENS="true")
     body = c.get("/health").json()
     assert (body["host"], body["revision"]) == ("Cloud Run", "foci-00007-abc")
+
+    # Render names no revision, but says which commit it built: enough to see
+    # that the old site runs the same code as GitHub before its data is copied.
+    clean_env.delenv("K_SERVICE")
+    clean_env.delenv("K_REVISION")
+    c, _ = boot(tmp_path, clean_env, RENDER="true", RENDER_GIT_COMMIT="250a418d0c4f9e2b",
+                FOCI_INPROCESS_SCREENS="true")
+    body = c.get("/health").json()
+    assert (body["host"], body["revision"]) == ("Render", "250a418")
 
 
 def test_a_screen_started_on_a_managed_host_is_given_a_request_to_hold(tmp_path, clean_env):
