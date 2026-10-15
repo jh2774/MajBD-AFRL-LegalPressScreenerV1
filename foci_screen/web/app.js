@@ -117,6 +117,16 @@ async function apiSend(method, path, body) {
   return res.status === 204 ? null : res.json();
 }
 
+/* Where the site runs a screen inside the request that asks for it — Vercel,
+ * which stops a function once its answer is sent — the page that started the
+ * screen sends that request and leaves it open. Moving to another page of this
+ * site keeps it open; closing or reloading the tab ends the screen, which then
+ * keeps what it had finished. The screen's own page shows how it went. */
+function runScreenInRequest(started) {
+  if (!started || !started.execute) return null;
+  return apiPost(started.execute, {}).catch(() => null);
+}
+
 async function apiPost(path, body) {
   const res = await fetch(path, {
     method: "POST",
@@ -699,8 +709,11 @@ function wireScreenFirm(q) {
       const d = await apiPost("/v1/screens", {
         recipient: q, months_back: 12, max_awards: 25, max_entities: 3,
       });
+      runScreenInRequest(d);
       status.innerHTML = `Screening started (run <span class="mono">${esc(d.run_id)}</span>).
         This takes minutes — the contractor appears in search once it finishes.
+        ${d.execute ? `Keep this page open until it ends; it stops after
+          ${num(Math.round(d.time_limit_seconds / 60))} minutes at most.` : ""}
         <a href="#/screens/${encodeURIComponent(d.run_id)}">Watch it</a>.`;
     } catch (e) {
       button.disabled = false;

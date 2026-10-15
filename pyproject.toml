@@ -16,6 +16,12 @@ dependencies = [
     # adviserinfo.sec.gov's robots.txt — and Schedule D 7.B is read from it.
     # Pure Python, so it needs nothing from the image.
     "pypdf>=4.0",
+    # The website and its database driver. Here rather than only in the
+    # `api` and `postgres` extras because Vercel installs a project's own
+    # dependencies and no extras, and finds FastAPI by looking for it here.
+    "fastapi>=0.110",
+    "pydantic>=2.6",
+    "psycopg[binary]>=3.1",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +58,11 @@ dev = ["pytest>=8.0", "ruff>=0.4", "httpx>=0.27"]
 foci-screen = "foci_screen.cli:main"
 foci-worker = "foci_screen.worker:main"
 foci-scheduler = "foci_screen.scheduler:main"
+
+# Vercel: the web application, run as one Vercel Function. See docs/VERCEL.md
+# and vercel.json.
+[tool.vercel]
+entrypoint = "foci_screen.api.app:app"
 
 [tool.setuptools.packages.find]
 include = ["foci_screen*"]

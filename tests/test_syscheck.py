@@ -62,7 +62,7 @@ def test_every_setting_the_application_reads_is_one_the_check_knows():
     source = Path(config.__file__).read_text(encoding="utf-8")
     read = set(re.findall(r'(?:_env|_flag|_switch|os\.environ\.get)\(\s*"([A-Z][A-Z0-9_]+)"',
                           source))
-    hosts = {"RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID"}
+    hosts = {"RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID", "VERCEL"}
     assert read - hosts - set(syscheck.SETTINGS) == set()
     assert syscheck.HOST_SPECIFIC <= set(syscheck.SETTINGS)
 
@@ -247,7 +247,8 @@ def test_the_check_is_for_people_with_a_key_and_asks_the_site_for_itself(client)
     assert body["database"] == "sqlite" and "secret-key" not in json.dumps(body)
     assert "FOCI_API_KEYS" in body["settings"]["carry"]
     asked = [url for url, _ in http.calls]
-    assert asked[0] == "http://testserver/health", "its own address first"
+    assert "http://testserver/health" not in asked,         "nothing keeps itself awake on a developer's machine, so nothing depends on it"
+    assert named(body, "The site can reach")["ok"] is None
     assert sum("sec.gov" in url for url in asked) == 4
     assert any("fpds.gov" in url for url in asked), "the SAM registration comes from FPDS"
     assert [c["name"] for c in body["checks"]][-1] == "Watchlists"

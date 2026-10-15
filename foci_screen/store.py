@@ -769,17 +769,41 @@ class Store:
         caller decides that; see the startup sweep in the API, which runs it
         only when screening happens in-process.
         """
-        stuck = self._query(
-            "SELECT run_id FROM runs WHERE tenant_id=? AND status='running'",
-            (self.tenant_id,))
+        return self.close_stale_runs(note, statuses=("running",))
+
+    def close_stale_runs(self, note: str, *, statuses: tuple[str, ...] = ("running",),
+                         started_before: str = "") -> int:
+        """Mark runs in `statuses` as interrupted, with `note` as the reason —
+        only those started before `started_before` (an ISO time), if given.
+
+        The age limit is what makes this safe where several copies of the
+        site run at once, as on Vercel: a run younger than the longest a
+        screen may take could belong to another copy that is still on it.
+        """
+        marks = ",".join("?" for _ in statuses)
+        where = f" WHERE tenant_id=? AND status IN ({marks})"
+        params: list = [self.tenant_id, *statuses]
+        if started_before:
+            where += " AND started_at < ?"
+            params.append(started_before)
+        stuck = self._query("SELECT run_id FROM runs" + where, tuple(params))
         if not stuck:
             return 0
         with self._tx() as c:
-            c.execute(
-                "UPDATE runs SET status='interrupted', finished_at=?, error=?"
-                " WHERE tenant_id=? AND status='running'",
-                (_now(), note, self.tenant_id))
+            c.execute("UPDATE runs SET status='interrupted', finished_at=?, error=?" + where,
+                      (_now(), note, *params))
         return len(stuck)
+
+    def claim_run(self, run_id: str) -> bool:
+        """Move a queued run to running, unless something else already has.
+
+        Two tabs, or a page reloaded at the wrong moment, can ask for the same
+        screen to be run twice; only the first is allowed to.
+        """
+        with self._tx() as c:
+            c.execute("UPDATE runs SET status='running' WHERE run_id=? AND tenant_id=?"
+                      " AND status='queued'", (run_id, self.tenant_id))
+            return c.rowcount() == 1
 
     def finish_run(self, run_id: str, status: str = "complete",
                    stats: dict | None = None, error: str = "") -> None:

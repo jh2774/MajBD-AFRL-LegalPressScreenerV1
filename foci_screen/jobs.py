@@ -6,7 +6,7 @@ connection open for that is the single thing that stops the CLI design from
 being a service, so the API creates a run row, hands the work to a queue, and
 returns a `run_id` immediately.
 
-Two backends, chosen by whether `REDIS_URL` is set:
+Three backends, chosen by configuration:
 
   * **RQ.** The real one. Work survives a web-process restart, and the worker
     scales independently of the API — which matters because the worker is the
@@ -14,6 +14,10 @@ Two backends, chosen by whether `REDIS_URL` is set:
   * **Thread.** Local development and the CLI. No Redis, no worker to run, and
     a job dies with the process. Fine when the process is a terminal someone
     is watching; not fine in production, which is why a deployment sets Redis.
+  * **Request.** For a host that stops a function once its response is sent
+    (Vercel). Nothing is started here: the page that asked for the screen
+    then calls `POST /v1/screens/{id}/execute`, and the screen runs inside
+    that request, up to the time limit (`FOCI_SCREEN_SECONDS`).
 
 The job function is module-level and takes only JSON-serialisable arguments so
 RQ can address it by import path.
@@ -58,16 +62,40 @@ def build_screener(cfg: Config, store: Store) -> tuple[Screener, BrowserRenderer
 
 # --------------------------------------------------------------------- the job
 
-def run_screen_job(tenant_id: str, run_id: str, options: dict) -> dict:
-    """Execute one screen. Called by an RQ worker or a local thread."""
+class OutOfTime(BaseException):
+    """The screen reached its time limit.
+
+    A BaseException, so that nothing between the progress callback and the
+    job — a connector's own `except Exception` — swallows it and carries on.
+    """
+
+
+def time_limit_note(seconds: int) -> str:
+    return (f"Stopped at this site's time limit for one screen ({seconds // 60} min "
+            f"{seconds % 60:02d} s). The contractors screened before then are saved, with "
+            f"their findings on their pages; no notices were drafted for this run. Screen "
+            f"fewer contractors at a time to finish within the limit.")
+
+
+def run_screen_job(tenant_id: str, run_id: str, options: dict,
+                   limit_seconds: int = 0) -> dict:
+    """Execute one screen. Called by an RQ worker, a local thread, or the
+    request that runs it (`limit_seconds` then says how long it may take)."""
+    import time
+
     cfg = get_config()
     store = Store(cfg.dsn, tenant_id=tenant_id)
     screener, browser = build_screener(cfg, store)
+    deadline = time.monotonic() + limit_seconds if limit_seconds else None
 
     def progress(msg: str) -> None:
         text = msg.strip()
         if text:
             store.set_run_progress(run_id, text)
+        # Checked at each step a screen reports, so it stops between steps
+        # rather than being cut off by the host part-way through a write.
+        if deadline is not None and time.monotonic() >= deadline:
+            raise OutOfTime
 
     try:
         store.mark_running(run_id)
@@ -88,6 +116,10 @@ def run_screen_job(tenant_id: str, run_id: str, options: dict) -> dict:
         store.finish_run(run_id, status="complete", stats=stats)
         return {"run_id": run_id, "findings": len(result.findings),
                 "notices": len(notices)}
+    except OutOfTime:
+        log.warning("screen %s stopped at its %ss limit", run_id, limit_seconds)
+        store.finish_run(run_id, status="interrupted", error=time_limit_note(limit_seconds))
+        return {"run_id": run_id, "status": "interrupted"}
     except Exception as exc:
         log.exception("screen %s failed", run_id)
         store.finish_run(run_id, status="failed", error=f"{type(exc).__name__}: {exc}",
@@ -154,6 +186,9 @@ class JobQueue:
     def __init__(self, cfg: Config) -> None:
         self.cfg = cfg
         self._queue = None
+        # No queue, and a host that would starve a background thread: the
+        # screen runs in the request that executes it.
+        self._in_request = bool(cfg.screens_in_request and not cfg.redis_url)
         # Screens running as threads in this process, by run id.
         self._threads: dict[str, threading.Thread] = {}
         self._threads_lock = threading.Lock()
@@ -175,7 +210,9 @@ class JobQueue:
 
     @property
     def backend(self) -> str:
-        return "rq" if self._queue is not None else "thread"
+        if self._queue is not None:
+            return "rq"
+        return "request" if self._in_request else "thread"
 
     def worker_count(self) -> int | None:
         """Workers listening on this queue, or None when it cannot be asked.
@@ -207,6 +244,8 @@ class JobQueue:
             self._queue.enqueue(run_screen_job, tenant_id, run_id, options,
                                 job_id=run_id, job_timeout=self.cfg.job_timeout)
             return
+        if self._in_request:
+            return              # left queued for POST /v1/screens/{id}/execute
         worker = threading.Thread(
             target=_thread_target, args=(tenant_id, run_id, options),
             name=f"screen-{run_id}", daemon=True)

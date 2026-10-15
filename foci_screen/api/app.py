@@ -18,6 +18,7 @@ import os
 import secrets
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from pathlib import Path
 
@@ -202,17 +203,51 @@ INTERRUPTED_NOTE = (
     "beyond the point it reached. Start another screen.")
 
 
+STALE_NOTE = (
+    "This screen did not finish. It runs inside the request the page sends to start it, "
+    "and that request ended — the page was closed or reloaded, or the host's time limit "
+    "cut it off — so nothing is running it now. What it had finished is kept. Start "
+    "another, and keep the page open until it ends.")
+
+
+def _stale_cutoff() -> str:
+    """Runs started before this, and not finished, can no longer be running:
+    the longest a screen may take, and two minutes over."""
+    limit = (cfg.screen_seconds or 300) + 120
+    when = datetime.now(timezone.utc) - timedelta(seconds=limit)
+    return when.replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+
+
+def close_stale_runs(store: Store) -> int:
+    """Where screens run inside requests, close the ones whose request is gone.
+
+    Several copies of the site may be running, so a run is only closed once
+    it is older than any request could last; until then it may belong to a
+    request still under way somewhere else. A run still queued that long was
+    never started — its page was closed before it could ask.
+    """
+    if queue.backend != "request":
+        return 0
+    return store.close_stale_runs(STALE_NOTE, statuses=("queued", "running"),
+                                  started_before=_stale_cutoff())
+
+
 def reap_interrupted_runs() -> int:
     """Close out runs left `running` by a process that no longer exists.
 
     Only when screening happens in this process. With a queue, a run marked
     running may be owned by a worker that is alive and working, and closing it
     from here would report a screen as interrupted while it is still going.
+    Where screens run inside requests, only runs too old to be running are
+    closed (`close_stale_runs`).
     """
+    tenants = sorted(set(keymap.values()) | {auth.DEFAULT_TENANT})
+    if queue.backend == "request":
+        return sum(close_stale_runs(store_for(t)) for t in tenants)
     if queue.backend != "thread":
         return 0
     reaped = 0
-    for tenant in sorted(set(keymap.values()) | {auth.DEFAULT_TENANT}):
+    for tenant in tenants:
         reaped += store_for(tenant).reap_interrupted_runs(INTERRUPTED_NOTE)
     return reaped
 
@@ -306,7 +341,41 @@ def create_screen(body: ScreenRequest, request: Request,
     subject = body.recipient or body.agency
     run_id = store.start_run(subject, options, status="queued")
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
-    return {"run_id": run_id, "status": "queued", "backend": queue.backend}
+    return {"run_id": run_id, "status": "queued", "backend": queue.backend,
+            **_execute_link(run_id)}
+
+
+def _execute_link(run_id: str) -> dict:
+    """Where screens run inside requests, the request that runs this one."""
+    if queue.backend != "request":
+        return {}
+    return {"execute": f"/v1/screens/{run_id}/execute",
+            "time_limit_seconds": cfg.screen_seconds}
+
+
+@app.post("/v1/screens/{run_id}/execute", tags=["screens"])
+def execute_screen(run_id: str, tenant: str = Depends(require_tenant)) -> dict:
+    """Run a queued screen inside this request, and answer when it ends.
+
+    For a host that gives a function no time once its response has gone
+    (Vercel), where a screen cannot carry on in the background. The page
+    that started the screen sends this and leaves it open; the screen's own
+    page shows its progress meanwhile. It stops at `FOCI_SCREEN_SECONDS` and
+    keeps what it finished. A screen already started — by another tab, or a
+    second click — is not started again.
+    """
+    store = store_for(tenant)
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "No such run.")
+    if not store.claim_run(run_id):
+        return {"run_id": run_id, "status": run["status"], "started_here": False}
+    from .. import jobs as jobs_mod
+    result = jobs_mod.run_screen_job(tenant, run_id, _json(run["params"]),
+                                     limit_seconds=cfg.screen_seconds)
+    finished = store.get_run(run_id) or {}
+    return {"run_id": run_id, "status": finished.get("status", result.get("status")),
+            "started_here": True}
 
 
 # ------------------------------------------------- staying awake for a screen
@@ -320,7 +389,7 @@ _hold_token = secrets.token_urlsafe(24)
 
 def _hold_for(run_id: str, request: Request) -> dict:
     """The hold address for a run, or nothing where holding is not wanted."""
-    wanted = cfg.keep_awake if cfg.keep_awake is not None else bool(cfg.managed_host)
+    wanted = cfg.keep_awake_wanted
     if not wanted or queue.backend != "thread":
         return {}
     return {"hold_url": f"{_base_url(request)}/internal/hold/{run_id}",
@@ -350,6 +419,7 @@ def hold_for_screen(run_id: str, request: Request) -> dict:
 @app.get("/v1/screens", tags=["screens"])
 def list_screens(limit: int = Query(25, ge=1, le=200),
                  store: Store = Depends(tenant_store)) -> dict:
+    close_stale_runs(store)
     return {"runs": store.recent_runs(limit=limit)}
 
 
@@ -382,6 +452,7 @@ def delete_screen(run_id: str, confirm: bool = Query(False),
 
 @app.get("/v1/screens/{run_id}", tags=["screens"])
 def get_screen(run_id: str, store: Store = Depends(tenant_store)) -> dict:
+    close_stale_runs(store)
     run = store.get_run(run_id)
     if run is None:
         raise HTTPException(404, "No such run.")
@@ -951,7 +1022,7 @@ def _keep_awake_for_alerts(request: Request) -> None:
     any of those limits. So, as for a screen (`jobs._hold_open`), the service
     keeps a request open to itself until the check has finished.
     """
-    wanted = cfg.keep_awake if cfg.keep_awake is not None else bool(cfg.managed_host)
+    wanted = cfg.keep_awake_wanted
     if wanted:
         threading.Thread(
             target=_hold_open, name="hold-alerts", daemon=True,
@@ -1572,7 +1643,7 @@ def run_watchlist(watchlist_id: str, request: Request,
     run_id = store.start_run(options.get("agency", ""), options, status="queued")
     store.mark_watchlist_run(watchlist_id, run_id)
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
-    return {"run_id": run_id, "status": "queued"}
+    return {"run_id": run_id, "status": "queued", **_execute_link(run_id)}
 
 
 @app.delete("/v1/watchlists/{watchlist_id}", tags=["watchlists"])

@@ -35,8 +35,10 @@ SETTINGS = (
     "FOCI_API_KEYS", "FOCI_USER_AGENT", "FOCI_PUBLIC_URL", "FOCI_CORS_ORIGINS",
     "DATABASE_URL", "INSTANCE_CONNECTION_NAME", "CLOUD_SQL_CONNECTION_NAME",
     "INSTANCE_UNIX_SOCKET", "DB_USER", "DB_NAME", "DB_PASS", "DB_PASSWORD",
+    "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING",
     "FOCI_DB", "FOCI_CACHE", "FOCI_OUT", "FOCI_CACHE_MAX_MB", "FOCI_CACHE_TTL",
     "REDIS_URL", "FOCI_JOB_TIMEOUT", "FOCI_INPROCESS_SCREENS", "FOCI_KEEP_AWAKE",
+    "FOCI_SCREENS_IN_REQUEST", "FOCI_SCREEN_SECONDS",
     "ALERTS_SEND", "ALERTS_PAUSED", "ALERTS_FROM", "BREVO_API_KEY", "RESEND_API_KEY",
     "MAIL_PROVIDER", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD",
     "SMTP_SECURITY", "FOCI_EMAIL_REDIRECT_TO",
@@ -52,6 +54,8 @@ HOST_SPECIFIC = {
     "INSTANCE_UNIX_SOCKET", "DB_USER", "DB_NAME", "DB_PASS", "DB_PASSWORD", "FOCI_DB",
     "FOCI_CACHE", "FOCI_OUT", "FOCI_CACHE_MAX_MB", "FOCI_PUBLIC_URL", "REDIS_URL",
     "ALERTS_PAUSED", "FOCI_INPROCESS_SCREENS", "FOCI_KEEP_AWAKE",
+    "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING", "FOCI_SCREENS_IN_REQUEST",
+    "FOCI_SCREEN_SECONDS",
 }
 
 # Reading the largest Form ADV filings peaks at about 230 MB on top of the
@@ -63,11 +67,11 @@ PROBE_TIMEOUT = 10
 
 
 def revision(environ) -> str:
-    """Which deploy is answering: Cloud Run's revision name, or on Render the
-    commit it was built from — so the old site can be shown to run the same
-    code as GitHub before its data is copied."""
-    return (environ.get("K_REVISION") or (environ.get("RENDER_GIT_COMMIT") or "")[:7]
-            or "")
+    """Which deploy is answering: Cloud Run's revision name, or on Render and
+    Vercel the commit it was built from — so the old site can be shown to run
+    the same code as GitHub before its data is copied."""
+    commit = environ.get("RENDER_GIT_COMMIT") or environ.get("VERCEL_GIT_COMMIT_SHA") or ""
+    return environ.get("K_REVISION") or commit[:7]
 
 
 def settings_in_use(environ) -> dict:
@@ -161,14 +165,18 @@ def probe(http, name: str, url: str, *, params: dict | None = None, why: str = "
                   "and email address. Anything else is usually temporary: try again.")
 
 
-def self_check(http, base_url: str) -> dict:
+def self_check(http, base_url: str, needed: bool = True) -> dict:
     """Whether the site can call its own public address.
 
     A screen, and an alert check, runs for minutes after the request that
     started it has been answered. On Cloud Run the site keeps its processor
-    for that work only by holding a request open to itself.
+    for that work only by holding a request open to itself. On Vercel it does
+    not do that, and nothing depends on the answer.
     """
     name = "The site can reach its own address"
+    if not needed:
+        return _check(name, None, "Not needed here: long work does not keep this site "
+                                  "awake by calling itself on this host.")
     url = f"{base_url.rstrip('/')}/health"
     try:
         resp = http.request("GET", url, use_cache=False, timeout=PROBE_TIMEOUT,
@@ -200,6 +208,22 @@ def memory_check(limit_mb: int | None) -> dict:
         return _check(name, None, f"{limit_mb:,} MB. Enough, with little to spare when a "
                                   f"large Form ADV is being read. 1 GB is comfortable.")
     return _check(name, True, f"{limit_mb:,} MB.")
+
+
+def screens_check(queue_backend: str, limit_seconds: int) -> dict:
+    if queue_backend == "rq":
+        return _check("Screens", True, "Run by a separate worker.")
+    if queue_backend == "request":
+        limit = (f"stops after {limit_seconds // 60} min {limit_seconds % 60:02d} s and keeps "
+                 f"what it finished" if limit_seconds else "has no time limit set here")
+        return _check("Screens", None,
+                      f"Each runs inside the request the page sends to start it, so the page "
+                      f"has to stay open until it ends. A screen {limit}. Up to about 15 "
+                      f"contractors fit comfortably; screen more in several goes.")
+    return _check("Screens", None,
+                  "Run inside the site itself, which holds a request open to stay awake while "
+                  "one is running. A screen still running when the site is redeployed is cut "
+                  "off and marked interrupted.")
 
 
 def watchlist_check(store, queue_backend: str) -> dict:
@@ -249,7 +273,7 @@ def run(cfg, store, http, base_url: str, mail_status: dict, *, environ,
     daily = DAILY_DIR.format(year=day.year, quarter=(day.month - 1) // 3 + 1) + "index.json"
     checks = [
         database_check(store, cfg.dsn, cfg.managed_host),
-        self_check(http, base_url),
+        self_check(http, base_url, needed=getattr(cfg, "keep_awake_wanted", True)),
         memory_check(memory_limit_mb()),
         probe(http, "SEC EDGAR: daily list of filings", daily,
               why="New funds named after a contractor are found here."),
@@ -271,11 +295,7 @@ def run(cfg, store, http, base_url: str, mail_status: dict, *, environ,
               why="Each award's contracting officer, and the contractor's SAM "
                   "registration as FPDS records it."),
         *mail_check(mail_status, cfg.alerts_paused),
-        _check("Screens", True if queue_backend == "rq" else None,
-               "Run by a separate worker." if queue_backend == "rq" else
-               "Run inside the site itself, which holds a request open to stay awake "
-               "while one is running. A screen still running when the site is redeployed "
-               "is cut off and marked interrupted."),
+        screens_check(queue_backend, getattr(cfg, "screen_seconds", 0)),
         watchlist_check(store, queue_backend),
     ]
     counts = table_counts(store)

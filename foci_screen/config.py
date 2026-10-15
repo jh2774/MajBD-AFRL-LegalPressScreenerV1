@@ -30,8 +30,20 @@ def _switch(name: str) -> bool | None:
     return raw.lower() in _TRUE if raw else None
 
 
+def _on_vercel() -> bool:
+    """Vercel sets VERCEL=1 while building and while running."""
+    return bool(os.environ.get("VERCEL"))
+
+
 def _database_url() -> str:
     """Where Postgres is, from DATABASE_URL or from Cloud SQL's separate values.
+
+    Neon, as Vercel connects it, sets two: DATABASE_URL goes through a
+    connection pooler, DATABASE_URL_UNPOOLED does not. The direct one is used
+    when it is there. A pooler in transaction mode hands each transaction to
+    whichever server connection is free, which breaks the three things here
+    that belong to one connection: the lock that stops two alert checks
+    running at once, the copy's streaming cursor, and prepared statements.
 
     Render hands over one URL. Google Cloud's own convention for Cloud Run is
     four values — the instance's connection name and a user, password and
@@ -43,7 +55,8 @@ def _database_url() -> str:
     /cloudsql/<connection name>; `host=` with a path is how libpq is told to
     use one.
     """
-    url = _env("DATABASE_URL")
+    url = (_env("DATABASE_URL_UNPOOLED") or _env("POSTGRES_URL_NON_POOLING")
+           or _env("DATABASE_URL"))
     if url:
         return url
     instance = _env("INSTANCE_CONNECTION_NAME") or _env("CLOUD_SQL_CONNECTION_NAME")
@@ -58,8 +71,16 @@ def _database_url() -> str:
 
 def _default_cache_mb() -> str:
     # Cloud Run has no disk: files written inside the container are held in
-    # the instance's memory and count against its limit.
-    return "64" if os.environ.get("K_SERVICE") else "256"
+    # the instance's memory and count against its limit. Vercel gives a
+    # function 500 MB of /tmp, shared with everything else written there.
+    return "64" if os.environ.get("K_SERVICE") or _on_vercel() else "256"
+
+
+def _writable(name: str, default: str, on_vercel: str) -> str:
+    """A path the site may write to. On Vercel everything but /tmp is
+    read-only, and writing the default relative path would stop the site
+    starting at all."""
+    return _env(name) or (on_vercel if _on_vercel() else default)
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -87,9 +108,11 @@ class Config:
     trade_gov_key: str = field(default_factory=lambda: _env("TRADE_GOV_API_KEY"))
 
     # --- storage ---
-    db_path: str = field(default_factory=lambda: _env("FOCI_DB", "foci_screen.db"))
-    cache_dir: str = field(default_factory=lambda: _env("FOCI_CACHE", ".cache"))
-    out_dir: str = field(default_factory=lambda: _env("FOCI_OUT", "out"))
+    db_path: str = field(default_factory=lambda: _writable(
+        "FOCI_DB", "foci_screen.db", "/tmp/foci_screen.db"))
+    cache_dir: str = field(default_factory=lambda: _writable(
+        "FOCI_CACHE", ".cache", "/tmp/foci-cache"))
+    out_dir: str = field(default_factory=lambda: _writable("FOCI_OUT", "out", "/tmp/foci-out"))
     # The HTTP cache is a convenience, not storage, and is kept under this
     # size: expired responses are deleted, then the oldest, as it fills.
     cache_max_mb: int = field(
@@ -117,6 +140,16 @@ class Config:
     # processor time (Cloud Run) nor shuts the instance down as idle (Cloud
     # Run, Render's free plan). Unset: on wherever a managed host is detected.
     keep_awake: bool | None = field(default_factory=lambda: _switch("FOCI_KEEP_AWAKE"))
+    # Run each screen inside a request that the page starting it keeps open,
+    # rather than in a background thread. For a host that gives a function no
+    # time once its response is sent — Vercel. On there by default.
+    screens_in_request: bool = field(
+        default_factory=lambda: _flag("FOCI_SCREENS_IN_REQUEST", _on_vercel()))
+    # How long one screen may run before it stops and keeps what it finished.
+    # 0 is no limit. On Vercel a request is cut off at 300 seconds on the free
+    # plan; stopping a minute earlier leaves time to record the stop.
+    screen_seconds: int = field(default_factory=lambda: int(
+        _env("FOCI_SCREEN_SECONDS", "240" if _on_vercel() else "0") or 0))
 
     # --- portfolio email alerts ---
     # Alerts go to the addresses typed into a portfolio as soon as a mail
@@ -205,10 +238,23 @@ class Config:
         """
         for var, name in (("RENDER", "Render"), ("DYNO", "Heroku"),
                           ("FLY_APP_NAME", "Fly.io"), ("K_SERVICE", "Cloud Run"),
-                          ("WEBSITE_INSTANCE_ID", "Azure App Service")):
+                          ("WEBSITE_INSTANCE_ID", "Azure App Service"),
+                          ("VERCEL", "Vercel")):
             if os.environ.get(var):
                 return name
         return ""
+
+    @property
+    def keep_awake_wanted(self) -> bool:
+        """Whether long work holds a request open against the site itself.
+
+        On wherever a managed host is detected, unless switched off — except
+        Vercel, where a request to the site's own address starts another
+        function rather than keeping this one going, so it would only cost.
+        """
+        if self.keep_awake is not None:
+            return self.keep_awake
+        return bool(self.managed_host) and self.managed_host != "Vercel"
 
     @property
     def dsn(self) -> str:
