@@ -111,5 +111,6 @@ def test_unreadable_watchlist_is_skipped_not_fatal(env, monkeypatch):
         store.close()
 
     assert scheduler.sweep() == 1
-    assert FakeQueue.enqueued[0][2] == {"agency": "DoD"}
+    # The run is told which watchlist started it, so its policy applies.
+    assert FakeQueue.enqueued[0][2] == {"agency": "DoD", "watchlist_id": good}
     assert good

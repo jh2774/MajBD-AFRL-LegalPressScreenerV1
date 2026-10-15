@@ -29,7 +29,7 @@ from .connectors.browser import BrowserRenderer
 from .httpclient import HttpClient
 from .notify import render as render_notice
 from .pipeline import Screener, ScreenOptions
-from .policy import ScreeningPolicy, decide_notice
+from .policy import decide_notice, policy_for
 from .store import Store
 
 log = logging.getLogger("foci.jobs")
@@ -74,7 +74,8 @@ def run_screen_job(tenant_id: str, run_id: str, options: dict) -> dict:
         opts = ScreenOptions(**options)
         result = screener.run(opts, progress=progress, run_id=run_id)
 
-        notices, held = raise_notices(store, result.findings, run_id)
+        notices, held = raise_notices(store, result.findings, run_id,
+                                      watchlist_id=opts.watchlist_id)
 
         stats = dict(result.stats)
         stats["findings"] = len(result.findings)
@@ -97,12 +98,14 @@ def run_screen_job(tenant_id: str, run_id: str, options: dict) -> dict:
         store.close()
 
 
-def raise_notices(store: Store, findings, run_id: str) -> tuple[list[str], dict]:
-    """Decide which findings become draft notices, under the tenant's policy.
+def raise_notices(store: Store, findings, run_id: str,
+                  watchlist_id: str = "") -> tuple[list[str], dict]:
+    """Decide which findings become draft notices, under the run's policy —
+    its watchlist's, laid over the tenant's.
 
     Returns the new notice ids and a count of why the others were held back.
     """
-    policy, _ = ScreeningPolicy.from_dict(store.screening_policy())
+    policy = policy_for(store, watchlist_id)
     raised: list[str] = []
     held: dict[str, int] = {}
 
