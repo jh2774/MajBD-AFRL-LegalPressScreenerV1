@@ -1079,7 +1079,31 @@ Every tool in `tools/` is Python, so the repository runs the same way on Windows
 Linux. The only non-Python code is the web interface's HTML, CSS and JavaScript, which a
 browser requires.
 
+### Deploying on Vercel, with Supabase
+
+**This is how the site is deployed.** [docs/VERCEL.md](docs/VERCEL.md) is the step-by-step
+guide: the repository imported into Vercel, Supabase connected as its database, and the daily
+alert check pointed at it. What the code does for that host:
+
+* `pyproject.toml` names the application for Vercel (`[tool.vercel] entrypoint`) and carries
+  FastAPI and the Postgres driver as ordinary dependencies, because Vercel installs no extras.
+  `vercel.json` gives the function Vercel's free-plan limit of 300 seconds.
+* **The database address** (`foci_screen/dburl.py`): of the addresses Supabase's integration
+  sets, the pooler's session mode on port 5432 is used — the direct address is IPv6 only,
+  which Vercel cannot reach, and transaction mode would break the alert lock and prepared
+  statements. Query parameters meant for other drivers are dropped.
+* **Its own schema.** On Supabase the tables live in `foci`, not `public`, so Supabase's Data
+  API does not publish them (`FOCI_DB_SCHEMA` to change).
+* **Screens inside requests.** A Vercel function gets no processor time after it has answered,
+  so `POST /v1/screens` leaves the run queued and returns an `execute` address; the page calls
+  it and keeps it open, and the screen runs there. It stops between steps at
+  `FOCI_SCREEN_SECONDS` (240 on Vercel) and keeps what it finished; a run whose request ended
+  is closed once it is too old to be running anywhere.
+* **Files** go to `/tmp`, and nothing calls its own address to stay awake.
+
 ### Deploying to Google Cloud
+
+Not the current plan; kept for reference.
 
 [docs/GOOGLE_CLOUD.md](docs/GOOGLE_CLOUD.md) is the step-by-step guide: Cloud Run for the site,
 Cloud SQL for the database, and how to move an existing deployment's data across. The same

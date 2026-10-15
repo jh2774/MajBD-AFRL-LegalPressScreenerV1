@@ -1,5 +1,9 @@
 # Moving FOCI-Screener to Google Cloud
 
+> **Not the current plan.** The site is deployed on Vercel with Supabase —
+> [docs/VERCEL.md](VERCEL.md) — and the Render site is retired, so there is nothing to move.
+> This guide is kept for reference.
+
 This moves the website from Render to **Cloud Run** and its database from Render's Postgres to
 **Cloud SQL**. Nothing is deleted from Render until the last step, so at any point before then
 the old site is still there, untouched, and you can go back to it ("Going back", near the end).

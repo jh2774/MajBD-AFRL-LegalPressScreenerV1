@@ -247,7 +247,8 @@ def test_the_check_is_for_people_with_a_key_and_asks_the_site_for_itself(client)
     assert body["database"] == "sqlite" and "secret-key" not in json.dumps(body)
     assert "FOCI_API_KEYS" in body["settings"]["carry"]
     asked = [url for url, _ in http.calls]
-    assert "http://testserver/health" not in asked,         "nothing keeps itself awake on a developer's machine, so nothing depends on it"
+    assert "http://testserver/health" not in asked, \
+        "nothing keeps itself awake on a developer's machine, so nothing depends on it"
     assert named(body, "The site can reach")["ok"] is None
     assert sum("sec.gov" in url for url in asked) == 4
     assert any("fpds.gov" in url for url in asked), "the SAM registration comes from FPDS"

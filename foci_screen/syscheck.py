@@ -35,7 +35,7 @@ SETTINGS = (
     "FOCI_API_KEYS", "FOCI_USER_AGENT", "FOCI_PUBLIC_URL", "FOCI_CORS_ORIGINS",
     "DATABASE_URL", "INSTANCE_CONNECTION_NAME", "CLOUD_SQL_CONNECTION_NAME",
     "INSTANCE_UNIX_SOCKET", "DB_USER", "DB_NAME", "DB_PASS", "DB_PASSWORD",
-    "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING",
+    "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING", "POSTGRES_URL", "FOCI_DB_SCHEMA",
     "FOCI_DB", "FOCI_CACHE", "FOCI_OUT", "FOCI_CACHE_MAX_MB", "FOCI_CACHE_TTL",
     "REDIS_URL", "FOCI_JOB_TIMEOUT", "FOCI_INPROCESS_SCREENS", "FOCI_KEEP_AWAKE",
     "FOCI_SCREENS_IN_REQUEST", "FOCI_SCREEN_SECONDS",
@@ -54,8 +54,8 @@ HOST_SPECIFIC = {
     "INSTANCE_UNIX_SOCKET", "DB_USER", "DB_NAME", "DB_PASS", "DB_PASSWORD", "FOCI_DB",
     "FOCI_CACHE", "FOCI_OUT", "FOCI_CACHE_MAX_MB", "FOCI_PUBLIC_URL", "REDIS_URL",
     "ALERTS_PAUSED", "FOCI_INPROCESS_SCREENS", "FOCI_KEEP_AWAKE",
-    "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING", "FOCI_SCREENS_IN_REQUEST",
-    "FOCI_SCREEN_SECONDS",
+    "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING", "POSTGRES_URL",
+    "FOCI_DB_SCHEMA", "FOCI_SCREENS_IN_REQUEST", "FOCI_SCREEN_SECONDS",
 }
 
 # Reading the largest Form ADV filings peaks at about 230 MB on top of the
@@ -119,7 +119,11 @@ def _check(name: str, ok: bool | None, detail: str, fix: str = "") -> dict:
 
 def database_check(store, dsn: str, managed_host: str) -> dict:
     """The database really is written to and read back, not merely reachable."""
+    from .dburl import schema_for
+
     where = describe(dsn)
+    if store.is_postgres and schema_for(dsn):
+        where += f", tables in schema {schema_for(dsn)}"
     marker = ("system-check", f"written {datetime.now(timezone.utc).isoformat()}")
     try:
         with store._tx() as c:

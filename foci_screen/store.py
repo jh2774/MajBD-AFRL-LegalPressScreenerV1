@@ -522,9 +522,23 @@ def open_connection(dsn: str):
         except ImportError as exc:      # say which extra, not "no module named"
             raise RuntimeError(DRIVER_MISSING) from exc
 
+        from psycopg import sql
+
+        from .dburl import schema_for
+
         # Render hands out postgres:// ; psycopg wants postgresql://
-        return psycopg.connect(dsn.replace("postgres://", "postgresql://", 1),
+        conn = psycopg.connect(dsn.replace("postgres://", "postgresql://", 1),
                                row_factory=dict_row, autocommit=False)
+        schema = schema_for(dsn)
+        if schema:
+            # Every table, index and query here is unqualified, so naming the
+            # schema once per connection puts all of it there (see dburl).
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                    sql.Identifier(schema)))
+                cur.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+            conn.commit()
+        return conn
 
     import sqlite3
 
@@ -612,8 +626,12 @@ class Store:
     def _table_columns(self, cur, table: str) -> set[str]:
         """Existing column names, or empty if the table is absent."""
         if self.is_postgres:
+            # In this connection's own schema: Supabase's other schemas hold
+            # tables of their own, and a name shared with one of them would
+            # otherwise answer for a table that is not there.
             cur.execute("SELECT column_name FROM information_schema.columns"
-                        " WHERE table_name = %s", (table,))
+                        " WHERE table_name = %s AND table_schema = current_schema()",
+                        (table,))
             return {r["column_name"] for r in cur.fetchall()}
         cur.execute(f"PRAGMA table_info({table})")
         return {r[1] for r in cur.fetchall()}

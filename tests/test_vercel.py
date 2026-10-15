@@ -23,7 +23,8 @@ ROOT = Path(__file__).resolve().parent.parent
 AUTH = {"X-API-Key": "secret-key"}
 ENV = ("VERCEL", "VERCEL_GIT_COMMIT_SHA", "RENDER", "RENDER_GIT_COMMIT", "DYNO",
        "FLY_APP_NAME", "K_SERVICE", "K_REVISION", "WEBSITE_INSTANCE_ID",
-       "DATABASE_URL", "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING",
+       "DATABASE_URL", "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING", "POSTGRES_URL",
+       "FOCI_DB_SCHEMA",
        "INSTANCE_CONNECTION_NAME", "DB_USER", "DB_NAME", "DB_PASS", "REDIS_URL",
        "FOCI_DB", "FOCI_CACHE", "FOCI_OUT", "FOCI_CACHE_MAX_MB", "FOCI_KEEP_AWAKE",
        "FOCI_SCREENS_IN_REQUEST", "FOCI_SCREEN_SECONDS", "FOCI_INPROCESS_SCREENS",
@@ -72,16 +73,15 @@ def test_screens_run_in_a_request_with_a_time_limit_and_nothing_calls_itself(env
     assert Config().keep_awake_wanted is False
 
 
-def test_neons_direct_address_is_used_over_its_pooled_one(env):
+def test_an_address_set_by_hand_wins_and_neons_direct_one_beats_its_pooled_one(env):
     """A pooler in transaction mode would break the alert lock, the copy's
     streaming cursor and prepared statements."""
+    env.setenv("POSTGRES_URL_NON_POOLING", "postgresql://u:p@other.example/db")
+    assert Config().database_url == "postgresql://u:p@other.example/db"
     env.setenv("DATABASE_URL", "postgresql://u:p@ep-x-pooler.neon.tech/neondb")
     assert Config().database_url.endswith("ep-x-pooler.neon.tech/neondb")
     env.setenv("DATABASE_URL_UNPOOLED", "postgresql://u:p@ep-x.neon.tech/neondb")
     assert Config().database_url == "postgresql://u:p@ep-x.neon.tech/neondb"
-    env.delenv("DATABASE_URL_UNPOOLED")
-    env.setenv("POSTGRES_URL_NON_POOLING", "postgresql://u:p@ep-y.neon.tech/neondb")
-    assert Config().database_url == "postgresql://u:p@ep-y.neon.tech/neondb"
 
 
 def test_vercel_is_pointed_at_the_application_and_can_install_what_it_needs():

@@ -191,6 +191,35 @@ def test_the_index_of_fund_filings_and_a_watch_behave_the_same_here(pg):
     store.close()
 
 
+def test_a_schema_of_its_own_holds_every_table(pg, monkeypatch):
+    """What happens on Supabase, where the tables are kept out of `public`
+    so its Data API does not publish them. Here the schema is asked for by
+    name, since this server is not Supabase."""
+    monkeypatch.setenv("FOCI_DB_SCHEMA", "foci_schema_test")
+    with _admin() as conn:
+        conn.execute("DROP SCHEMA IF EXISTS foci_schema_test CASCADE")
+    try:
+        store = Store(pg, tenant_id="acme")
+        seed(store)
+        assert store.contract_totals("entity_key", "UEI777")["contract_count"] == 3
+        assert store.try_lock("alerts") is True
+        store.unlock("alerts")
+        store.close()
+        with _admin() as conn:
+            def tables(schema):
+                return {r[0] for r in conn.execute(
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema=%s",
+                    (schema,))}
+            assert set(dbcopy.TABLES) <= tables("foci_schema_test")
+            assert not set(dbcopy.TABLES) & tables("public"), "nothing left in public"
+        again = Store(pg, tenant_id="acme")     # finds what is there, adds nothing twice
+        assert again.contract_totals("entity_key", "UEI777")["contract_count"] == 3
+        again.close()
+    finally:
+        with _admin() as conn:
+            conn.execute("DROP SCHEMA IF EXISTS foci_schema_test CASCADE")
+
+
 def test_a_connection_the_server_closes_is_replaced(pg):
     """What Cloud SQL maintenance, or a long freeze on Cloud Run, does."""
     store = Store(pg, tenant_id="acme")

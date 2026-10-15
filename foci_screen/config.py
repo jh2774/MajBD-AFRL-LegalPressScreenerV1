@@ -36,14 +36,9 @@ def _on_vercel() -> bool:
 
 
 def _database_url() -> str:
-    """Where Postgres is, from DATABASE_URL or from Cloud SQL's separate values.
-
-    Neon, as Vercel connects it, sets two: DATABASE_URL goes through a
-    connection pooler, DATABASE_URL_UNPOOLED does not. The direct one is used
-    when it is there. A pooler in transaction mode hands each transaction to
-    whichever server connection is free, which breaks the three things here
-    that belong to one connection: the lock that stops two alert checks
-    running at once, the copy's streaming cursor, and prepared statements.
+    """Where Postgres is: one address (see `dburl.choose` for which, when a
+    host sets several, and how a Supabase one is corrected), or Cloud SQL's
+    separate values.
 
     Render hands over one URL. Google Cloud's own convention for Cloud Run is
     four values — the instance's connection name and a user, password and
@@ -55,8 +50,9 @@ def _database_url() -> str:
     /cloudsql/<connection name>; `host=` with a path is how libpq is told to
     use one.
     """
-    url = (_env("DATABASE_URL_UNPOOLED") or _env("POSTGRES_URL_NON_POOLING")
-           or _env("DATABASE_URL"))
+    from .dburl import choose
+
+    url = choose(os.environ)
     if url:
         return url
     instance = _env("INSTANCE_CONNECTION_NAME") or _env("CLOUD_SQL_CONNECTION_NAME")

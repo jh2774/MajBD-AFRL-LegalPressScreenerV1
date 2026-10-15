@@ -2,6 +2,9 @@
 
 Concrete steps. Roughly 30 minutes, most of it waiting for the worker image to build.
 
+> **The site is deployed on Vercel, with Supabase as its database:**
+> [docs/VERCEL.md](docs/VERCEL.md). The Render steps below are kept for reference.
+>
 > **Moving to, or starting on, Google Cloud?** That has its own guide:
 > [docs/GOOGLE_CLOUD.md](docs/GOOGLE_CLOUD.md) — Cloud Run for the site, Cloud SQL for the
 > database, and a command that copies the data across from Render and checks it arrived.
