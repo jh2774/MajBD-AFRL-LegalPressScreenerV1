@@ -50,13 +50,10 @@ plan or on Cloud Run has no disk to keep it on, so screens run from the site say
 liens were not checked, exactly as they do today. Screens run from your own computer against
 the database are unaffected.
 
-**Cost.** Roughly $10–15 a month, nearly all of it the database, which runs all the time. The
-website costs little or nothing at light use: Cloud Run charges for the seconds it is handling a
-request and has a monthly free allowance. These are estimates; Google's pricing calculator has
-the current figures. Unlike Render's free database, Cloud SQL is not deleted after 30 days and
-keeps daily backups. The database size used here (`db-f1-micro`) is Google's smallest. Google
-describes it as for testing and development and does not cover it with its uptime guarantee;
-for one team's screening tool it is ample, and step 2 says how to choose the next size up.
+**Cost.** About $10 a month, nearly all of it the database, which runs all the time.
+Everything else fits in Google's free allowances at this tool's level of use. "What it costs,
+and keeping it down", near the end, has the breakdown and the four things that keep it there.
+Unlike Render's free database, Cloud SQL is not deleted after 30 days and keeps daily backups.
 
 ## Before you start
 
@@ -108,7 +105,7 @@ box again first** — it forgets these between sessions.
 
 ```bash
 export PROJECT_ID="your-project-id"
-export REGION="us-east4"                 # Northern Virginia. us-central1 (Iowa) also works.
+export REGION="us-central1"              # Iowa: among Google's cheapest. us-east1 is too.
 export SERVICE="foci-screener"
 export INSTANCE="foci-db"
 export CONN="$PROJECT_ID:$REGION:$INSTANCE"
@@ -395,24 +392,6 @@ does no harm, because two checks never run at once.
   ```
   The key is stored in the scheduler job, where people with access to the project can read it.
 
-## Watchlists
-
-A watchlist is a saved screen — an agency or a contractor, with its options — and since pull
-request #7 each one can carry its own screening policy: what to screen for and what raises a
-notice, laid over the site's own policy. Watchlists and their policies live in the database, so
-step 7 copies them with everything else. Nothing needs setting for them.
-
-**What does not change: nothing runs them on a schedule, on Render today or on Google Cloud as
-set up here.** The nightly sweep (`foci-scheduler`) hands each watchlist to a job queue
-(`REDIS_URL`) and a separate worker, and refuses to run without them. The site on Render is a
-single web service with neither, and so is this Cloud Run setup. A watchlist is screened when
-someone runs it (`POST /v1/watchlists/{id}/run`), and that screen runs inside the site and keeps
-it awake like any other. The System check's *Watchlists* line says how many are saved.
-
-If watchlists should be screened every night on Google Cloud, that is a change to make after
-the move, not part of it: the sweep can be given a way to run its screens itself, as a Cloud Run
-job started by Cloud Scheduler, which needs no queue or worker. Ask for it when it is wanted.
-
 ## 12. Retire Render
 
 Give it a week of the new site working. Then on Render delete the web service and the database,
@@ -436,6 +415,64 @@ Until step 12 the old site and its database are intact.
   (`gcloud run services update "$SERVICE" --region "$REGION" --update-env-vars
   ALERTS_PAUSED=true`). What was screened or sent from the new site after the switch is not on
   the old one, so alerts sent in that time may be sent again by the old site.
+
+## What it costs, and keeping it down
+
+What this guide sets up, and roughly what each costs a month. Prices are approximate, from
+Google's published rates and free allowances in October 2026; Google's pricing calculator has
+the current figures.
+
+| Google service | What it is for | About |
+|---|---|---|
+| **Cloud SQL** for PostgreSQL, `db-f1-micro`, 10 GB SSD, daily backups | The database | **$9–10** |
+| **Cloud Run** | The website | $0 — inside the monthly free allowance (2 million requests, 50 hours of processor time) |
+| **Cloud Build** | Building the site from the code | $0 — 2,500 free build-minutes a month; a deploy takes about five |
+| **Artifact Registry** | Keeping the built site | $0 — 0.5 GB free, if old copies are cleared (below) |
+| **Secret Manager** | Passwords and keys | $0 — 6 free; this guide uses 3 to 5 |
+| **Cloud Logging** | The site's log | $0 — 50 GB free |
+| The daily check | Kept on GitHub (step 11) | $0 |
+
+The database is the only thing that runs all the time, which is why it is nearly the whole
+bill. `db-f1-micro` is Google's smallest; Google offers no free database. New Google Cloud
+accounts get $300 of credit for their first 90 days, which covers this many times over.
+
+Four things keep it there:
+
+1. **The region.** `us-central1` (Iowa), the guide's default, or `us-east1` (South Carolina) are
+   among Google's cheapest. Others, Northern Virginia included, cost a little more.
+2. **Leave Cloud Run's defaults alone.** No minimum number of instances, and the default billing
+   (processor time only while answering requests). The site then costs nothing while nobody is
+   using it. Step 5's settings are already right.
+3. **Keep the daily check on GitHub** rather than Cloud Scheduler (step 11). Both work; GitHub's
+   is free and already set up.
+4. **Clear old copies of the site.** Each deploy stores a new copy (an "image") of a few hundred
+   MB, and only 0.5 GB is free. console.cloud.google.com → **Artifact Registry** → the
+   `cloud-run-source-deploy` repository → **Edit** → **Cleanup policies** → add a policy that
+   keeps the **2 most recent versions**, and save.
+
+And one safety net, free: console.cloud.google.com → **Billing** → **Budgets & alerts** →
+**Create budget**, for $15 a month, with email alerts at 50%, 90% and 100%. A budget does not
+stop anything; it emails you if the bill heads somewhere unexpected.
+
+After the move, step 12 deletes the copy job and one secret that are no longer needed.
+
+## Watchlists
+
+A watchlist is a saved screen — an agency or a contractor, with its options — and since pull
+request #7 each one can carry its own screening policy: what to screen for and what raises a
+notice, laid over the site's own policy. Watchlists and their policies live in the database, so
+step 7 copies them with everything else. Nothing needs setting for them.
+
+**What does not change: nothing runs them on a schedule, on Render today or on Google Cloud as
+set up here.** The nightly sweep (`foci-scheduler`) hands each watchlist to a job queue
+(`REDIS_URL`) and a separate worker, and refuses to run without them. The site on Render is a
+single web service with neither, and so is this Cloud Run setup. A watchlist is screened when
+someone runs it (`POST /v1/watchlists/{id}/run`), and that screen runs inside the site and keeps
+it awake like any other. The System check's *Watchlists* line says how many are saved.
+
+If watchlists should be screened every night on Google Cloud, that is a change to make after
+the move, not part of it: the sweep can be given a way to run its screens itself, as a Cloud Run
+job started by Cloud Scheduler, which needs no queue or worker. Ask for it when it is wanted.
 
 ## What is different on Google Cloud
 
