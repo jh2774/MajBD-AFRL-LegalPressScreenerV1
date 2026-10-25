@@ -130,7 +130,10 @@ CREATE TABLE IF NOT EXISTS notices (
     decision_note TEXT,
     created_at  TEXT NOT NULL,
     signal_ids  TEXT,
-    trigger_reason TEXT
+    trigger_reason TEXT,
+    delivered_to TEXT,
+    delivered_at TEXT,
+    delivery_detail TEXT
 );
 -- The latest reading of each investment firm's Form ADV, and every change seen
 -- between readings. Global, like document snapshots: a filing is a public
@@ -403,6 +406,12 @@ COLUMN_ADDITIONS = [
     # from a threshold.
     ("notices", "signal_ids", "TEXT"),
     ("notices", "trigger_reason", "TEXT"),
+    # Where an approved notice actually went, and what became of it. Approval
+    # and delivery are separate events: a notice can be approved while delivery
+    # is switched off, and the record has to say which one happened.
+    ("notices", "delivered_to", "TEXT"),
+    ("notices", "delivered_at", "TEXT"),
+    ("notices", "delivery_detail", "TEXT"),
     ("contracts", "is_subaward", "INTEGER DEFAULT 0"),
     ("contracts", "prime_award_id", "TEXT"),
     ("contracts", "prime_recipient_name", "TEXT"),
@@ -1494,7 +1503,8 @@ class Store:
         marks = ",".join("?" for _ in entity_keys)
         return self._query(
             f"SELECT * FROM notices WHERE tenant_id=? AND entity_key IN ({marks})"
-            f" AND status IN ('pending','approved') ORDER BY created_at DESC LIMIT ?",
+            f" AND status IN ('pending','approved','drafted','sent')"
+            f" ORDER BY created_at DESC LIMIT ?",
             (self.tenant_id, *entity_keys, limit))
 
     # --------------------------------------------------------- screening policy
@@ -1574,6 +1584,42 @@ class Store:
             if c.rowcount() == 0:
                 return "already_decided"
         return "ok"
+
+    def record_notice_delivery(self, notice_id: str, status: str, *,
+                               delivered_to: str = "", detail: str = "") -> str:
+        """Record what happened when an approved notice was handed to Gmail.
+
+        `status` is the delivery outcome: "drafted" or "sent" move the notice on,
+        so it leaves the approved-but-undelivered pile; anything else ("rendered",
+        "error") leaves it approved, with the reason kept, so it can be tried
+        again once delivery is switched on or fixed.
+
+        Returns "ok", "not_found" or "not_approved". Only an approved notice can
+        be delivered — the guard is in the UPDATE as well, so a notice decided
+        a moment ago by someone else cannot be sent from a stale read.
+        """
+        existing = self.get_notice(notice_id)
+        if existing is None:
+            return "not_found"
+        if existing["status"] != "approved":
+            return "not_approved"
+        moved = status in ("drafted", "sent")
+        with self._tx() as c:
+            c.execute("UPDATE notices SET status=?, delivered_to=?, delivered_at=?,"
+                      " delivery_detail=?"
+                      " WHERE notice_id=? AND tenant_id=? AND status='approved'",
+                      (status if moved else "approved", delivered_to or None,
+                       _now() if moved else None, detail[:1000],
+                       notice_id, self.tenant_id))
+            if c.rowcount() == 0:
+                return "not_approved"
+        return "ok"
+
+    def undelivered_notices(self, limit: int = 200) -> list[dict]:
+        """Approved notices that have not yet become a Gmail draft or a send."""
+        return self._query("SELECT * FROM notices WHERE tenant_id=? AND status='approved'"
+                           " ORDER BY decided_at, created_at LIMIT ?",
+                           (self.tenant_id, limit))
 
     def notice_edits(self, notice: dict) -> dict | None:
         """What a reviewer changed, as diff lines. None if the text is as generated."""

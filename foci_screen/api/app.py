@@ -41,6 +41,7 @@ from ..connectors.usaspending import USASpendingConnector
 from ..connectors.vehicles import VehicleConnector, default_phrase, phrase_problem
 from ..jobs import HOLD_SECONDS, JobQueue
 from ..notify import render as render_notice
+from ..notify.gmail import GmailNotifier
 from ..notify.mailer import LABEL as LABEL_OF_MAIL
 from ..notify.mailer import Mailer
 from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_available
@@ -182,6 +183,13 @@ def deployment_warnings() -> list[str]:
     mail = Mailer(cfg).status()
     if mail["mode"] == "misconfigured":
         warnings.append("Email alerts: " + mail["explanation"])
+    # The same for notices: Gmail switched on but never signed in means every
+    # approval silently stops short of Gmail.
+    if cfg.gmail_enabled and not Path(cfg.gmail_token).is_file():
+        warnings.append(
+            f"Notices: GMAIL_ENABLED is true but there is no Gmail sign-in at "
+            f"{cfg.gmail_token}, so approved notices cannot reach Gmail. Run "
+            f"`foci-screen gmail-auth` once and place token.json at GMAIL_TOKEN.")
     return warnings
 
 
@@ -249,6 +257,9 @@ def health() -> dict:
             # misconfigured — and through which service. No addresses, no keys.
             "alerts": {"mode": mail.status()["mode"],
                        "provider": LABEL_OF_MAIL.get(mail.transport, "")},
+            # What an approved notice turns into: render_only, draft, send or
+            # redirected.
+            "notices": {"mode": _delivery_state()["mode"]},
             "warnings": deployment_warnings()}
 
 
@@ -1458,11 +1469,14 @@ def _decision_error(outcome: str) -> None:
 @app.post("/v1/notices/{notice_id}/approve", tags=["notices"])
 def approve_notice(notice_id: str, body: NoticeDecision,
                    tenant: str = Depends(require_tenant)) -> dict:
-    """Approve a notice for delivery, optionally with an edited body.
+    """Approve a notice, optionally with an edited body, and hand it to Gmail.
 
-    Approval records a decision; it does not itself send. Delivery still depends
-    on `GMAIL_ENABLED` and `GMAIL_SEND`, and while `FOCI_EMAIL_REDIRECT_TO` is
-    set every approved notice goes to that address instead of the officer.
+    Approval is the decision; delivery follows it under the same guards as
+    everything else: nothing leaves unless `GMAIL_ENABLED`, it becomes a draft
+    rather than a send unless `GMAIL_SEND`, and while `FOCI_EMAIL_REDIRECT_TO` is
+    set it goes to that address instead of the officer. If delivery does not
+    happen — switched off, not signed in, refused — the approval still stands
+    and `POST /v1/notices/{id}/deliver` tries again.
 
     An edit may change anything except the limitations statement. That paragraph
     is what makes the notice a screening result rather than an assertion about a
@@ -1485,10 +1499,50 @@ def approve_notice(notice_id: str, body: NoticeDecision,
     _decision_error(store.decide_notice(
         notice_id, "approved", decided_by=_decider(body, tenant),
         note=body.note, body_text=body.body_text))
-    decided = store.get_notice(notice_id)
-    return {"notice_id": notice_id, "status": "approved",
-            "edited": bool(decided and decided.get("original_body_text")),
-            "delivery": _delivery_state()}
+    edited = bool((store.get_notice(notice_id) or {}).get("original_body_text"))
+    delivery = _deliver(store, notice_id)
+    return {"notice_id": notice_id, "status": delivery.pop("notice_status"),
+            "edited": edited, "delivery": delivery}
+
+
+@app.post("/v1/notices/{notice_id}/deliver", tags=["notices"])
+def deliver_notice(notice_id: str, store: Store = Depends(tenant_store)) -> dict:
+    """Try again to deliver an approved notice that has not reached Gmail.
+
+    For a notice approved while delivery was off, or whose delivery failed.
+    Only an approved notice qualifies: a pending one has not been decided, and
+    one already drafted or sent is not sent twice.
+    """
+    notice = store.get_notice(notice_id)
+    if notice is None:
+        raise HTTPException(404, "No such notice.")
+    if notice["status"] != "approved":
+        raise HTTPException(
+            409, f"Only an approved notice that has not been delivered can be; this "
+                 f"one is {notice['status']}.")
+    delivery = _deliver(store, notice_id)
+    return {"notice_id": notice_id, "status": delivery.pop("notice_status"),
+            "delivery": delivery}
+
+
+# One notifier for the process, so a Gmail connection is made once rather than
+# on every approval.
+_gmail = GmailNotifier(cfg)
+
+
+def _deliver(store: Store, notice_id: str) -> dict:
+    """Hand an approved notice to Gmail and record the outcome on it."""
+    notice = store.get_notice(notice_id) or {}
+    result = _gmail.deliver_notice(notice)
+    if store.record_notice_delivery(notice_id, result.status,
+                                    delivered_to=result.recipient,
+                                    detail=result.detail) != "ok":
+        # Decided by someone else between the read and the write; what Gmail
+        # did is still worth saying, but the row is theirs.
+        log.warning("notice %s changed state during delivery", notice_id)
+    current = store.get_notice(notice_id) or {}
+    return {**_delivery_state(), "outcome": result.status, "to": result.recipient,
+            "detail": result.detail, "notice_status": current.get("status", "")}
 
 
 @app.post("/v1/notices/{notice_id}/reject", tags=["notices"])
@@ -1510,10 +1564,13 @@ def _delivery_state() -> dict:
         return {"mode": "render_only",
                 "detail": "GMAIL_ENABLED is false; download the .eml to route it."}
     if cfg.email_redirect_to:
-        return {"mode": "redirected", "detail": f"All mail goes to {cfg.email_redirect_to}."}
+        return {"mode": "redirected",
+                "detail": f"Approved notices go to {cfg.email_redirect_to} instead of the "
+                          f"officer, as Gmail "
+                          f"{'sends' if cfg.gmail_send else 'drafts'}."}
     return {"mode": "send" if cfg.gmail_send else "draft",
-            "detail": "Gmail drafts are created for review."
-                      if not cfg.gmail_send else "Approved notices are sent."}
+            "detail": "Approved notices become Gmail drafts for someone to send."
+                      if not cfg.gmail_send else "Approved notices are sent through Gmail."}
 
 
 # ---------------------------------------------------------------------- web

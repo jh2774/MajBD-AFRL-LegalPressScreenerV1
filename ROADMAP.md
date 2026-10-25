@@ -111,6 +111,18 @@ before acting.
    in the `UPDATE` so two reviewers cannot race); and an edit could delete the limitations
    statement (now refused).
 
+   **Approval now delivers.** Until this, approving a notice recorded the decision and
+   stopped: the response even said "Approved notices are sent" while nothing was. An approval
+   now hands the approved text to Gmail under the existing guards — a draft by default — and
+   records where it went (`drafted` / `sent`), or why it did not, in which case the approval
+   stands and `POST /v1/notices/{id}/deliver` or `foci-screen deliver-notices` tries again.
+   The service never opens a browser sign-in; `foci-screen gmail-auth` does that once.
+
+   That closed a bypass too: the CLI's `screen --notify` and `notify --run` used to hand
+   findings straight to Gmail, so with `GMAIL_ENABLED=true` they drafted — or with
+   `GMAIL_SEND`, sent — notices nobody had reviewed. They now only write `.eml` files to read.
+   There is no path from a finding to Gmail that does not pass through an approval.
+
    Remaining here: **per-person attribution.** Decisions record `api-key:<tenant>` because keys
    are shared. For an approval trail on notices to federal officials, that should become the
    signed-in reviewer — which is the SSO item under Phase 1 auth, not a UI change.
