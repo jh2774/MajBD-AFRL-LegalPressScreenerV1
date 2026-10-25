@@ -247,6 +247,18 @@ CREATE TABLE IF NOT EXISTS alert_optouts (
     restorable   INTEGER NOT NULL DEFAULT 0,
     UNIQUE (subscription_id, email)
 );
+-- Addresses the mail service reported as dead or complaining (notify/
+-- bounces.py). Not tenant-scoped, like snapshots: that an address bounces is a
+-- fact about the address, not about whose list it is on.
+CREATE TABLE IF NOT EXISTS mail_suppressions (
+    email        TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    reason       TEXT,
+    provider     TEXT,
+    first_at     TEXT NOT NULL,
+    last_at      TEXT NOT NULL,
+    events       INTEGER NOT NULL DEFAULT 1
+);
 -- Every email composed, sent or not, with exactly what it said.
 CREATE TABLE IF NOT EXISTS alert_deliveries (
     delivery_id  TEXT PRIMARY KEY,
@@ -1603,6 +1615,46 @@ class Store:
                           (json.dumps(emails), _now(), self.tenant_id,
                            row["subscription_id"]))
         return self.optout_by_token(token)
+
+    # ------------------------------------------------- bounces, complaints
+    def suppress_address(self, email: str, kind: str, reason: str = "",
+                         provider: str = "") -> None:
+        """Record a bounce or complaint. A complaint is never downgraded to a
+        bounce by a later report: it is the stronger reason not to send."""
+        email, now = email.strip().lower(), _now()
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO mail_suppressions (email, kind, reason, provider, first_at,"
+                " last_at, events) VALUES (?,?,?,?,?,?,1) ON CONFLICT (email) DO UPDATE SET"
+                " kind=CASE WHEN mail_suppressions.kind='complaint' THEN 'complaint'"
+                " ELSE excluded.kind END,"
+                " reason=excluded.reason, provider=excluded.provider,"
+                " last_at=excluded.last_at, events=mail_suppressions.events+1",
+                (email, kind, reason, provider, now, now))
+
+    def suppressed(self, emails: list[str] | None = None) -> dict[str, dict]:
+        """{address: row} for suppressed addresses, optionally among `emails`."""
+        if emails is not None:
+            wanted = sorted({e.strip().lower() for e in emails if e})
+            if not wanted:
+                return {}
+            marks = ",".join("?" for _ in wanted)
+            rows = self._query(f"SELECT * FROM mail_suppressions WHERE email IN ({marks})",
+                               tuple(wanted))
+        else:
+            rows = self._query("SELECT * FROM mail_suppressions ORDER BY last_at DESC")
+        return {r["email"]: r for r in rows}
+
+    def clear_suppression(self, email: str, *, allow_complaint: bool = False) -> str:
+        """Returns "ok", "not_found" or "complaint" (refused without allow_complaint)."""
+        row = self.suppressed([email]).get(email.strip().lower())
+        if row is None:
+            return "not_found"
+        if row["kind"] == "complaint" and not allow_complaint:
+            return "complaint"
+        with self._tx() as c:
+            c.execute("DELETE FROM mail_suppressions WHERE email=?", (row["email"],))
+        return "ok"
 
     def alert_already_sent(self, subscription_id: str) -> set[str]:
         return {r["item_id"] for r in self._query(

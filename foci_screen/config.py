@@ -175,6 +175,12 @@ class Config:
     # starttls (587, 2587), ssl (465, 2465), or none (a local relay).
     smtp_security: str = field(default_factory=lambda: _env("SMTP_SECURITY", "starttls"))
     alerts_from: str = field(default_factory=lambda: _env("ALERTS_FROM"))
+    # Bounce and complaint reports from the mail service (notify/bounces.py).
+    # Brevo cannot sign its webhooks, so it is given this secret to send back;
+    # Resend signs them, and RESEND_WEBHOOK_SECRET (whsec_...) checks that.
+    mail_webhook_secret: str = field(default_factory=lambda: _env("MAIL_WEBHOOK_SECRET"))
+    resend_webhook_secret: str = field(
+        default_factory=lambda: _env("RESEND_WEBHOOK_SECRET"))
     # Where the links in an alert point. Without it, links use whatever
     # address the request that triggered the alerts came in on.
     public_url: str = field(default_factory=lambda: _env("FOCI_PUBLIC_URL"))
