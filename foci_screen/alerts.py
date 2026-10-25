@@ -20,6 +20,11 @@ sentence on what that part of the form is, and exactly where to look. Deciding
 what it means is left to the person reading it, who is better placed to — the
 alert's job is to get them to the source, not to stand in for it.
 
+Everyone on a list can take themselves off it. Each message carries a link of
+its own, and the headers mail clients turn into an "Unsubscribe" button
+(RFC 8058). The link needs the site's address, so a check run with none known
+falls back to asking whoever added them.
+
 Every item goes to each subscription once. When a portfolio is first saved, or
 companies are added to it, everything already known about them is marked as
 sent: the subscriber hears about what happens from then on, not a backlog of
@@ -43,11 +48,55 @@ log = logging.getLogger("foci.alerts")
 
 FOOTER = (
     "You are receiving this because your address was added to the \"{name}\" alert "
-    "list in FOCI-Screener. To stop, ask whoever added you to remove it, or reply "
-    "to this message.\n\n"
+    "list in FOCI-Screener. {stop}\n\n"
     "Drawn from public records. This is not a FOCI determination or a finding of "
     "wrongdoing — it tells you where something changed so you can look for yourself."
 )
+STOP_ASK = "To stop, ask whoever added you to remove it, or reply to this message."
+STOP_LINK = "To stop receiving these, unsubscribe here: {url}"
+
+
+def footer(name: str, unsubscribe_url: str = "") -> str:
+    stop = STOP_LINK.format(url=unsubscribe_url) if unsubscribe_url else STOP_ASK
+    return FOOTER.format(name=name, stop=stop)
+
+
+def unsubscribe_url(store, subscription_id: str, address: str, base_url: str) -> str:
+    """This address's own unsubscribe link, or "" when the site's address is unknown."""
+    if not base_url:
+        return ""
+    token = store.unsubscribe_token(subscription_id, address)
+    return f"{base_url.rstrip('/')}/u/{token}"
+
+
+def personalizer(store, subscription: dict, base_url: str, build):
+    """A `Mailer.send(personalize=...)` callback for one list.
+
+    `build(url)` returns (text, html) with that unsubscribe link in the footer.
+    Only addresses on the list get a link: a redirected pilot copy goes to
+    someone who is not on it, and a link minted for them would unsubscribe
+    nobody.
+    """
+    on_list = {e.lower() for e in subscription["emails"]}
+
+    def content(address: str):
+        url = (unsubscribe_url(store, subscription["subscription_id"], address, base_url)
+               if address.lower() in on_list else "")
+        text, html = build(url)
+        headers = {"List-Unsubscribe": f"<{url}>",
+                   "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"} if url else {}
+        return text, html, headers
+    return content
+
+
+def recipients(store, subscription: dict) -> list[str]:
+    """The list's addresses, less anyone who has unsubscribed.
+
+    Unsubscribing already takes the address off the list; this is the second
+    lock, for a list saved from a page opened before they did.
+    """
+    gone = store.opted_out(subscription["subscription_id"])
+    return [e for e in subscription["emails"] if e.lower() not in gone]
 
 
 def split_keys(companies: list[str]) -> tuple[list[str], list[str]]:
@@ -299,7 +348,8 @@ def baseline_entity(store, entity_key: str) -> int:
 
 # ----------------------------------------------------------------- the email
 
-def compose(subscription: dict, items: list[dict]) -> tuple[str, str, str]:
+def compose(subscription: dict, items: list[dict],
+            unsubscribe: str = "") -> tuple[str, str, str]:
     """(subject, plain text, html) — plain text first; it is what is read."""
     name = subscription["name"]
     n = len(items)
@@ -324,7 +374,7 @@ def compose(subscription: dict, items: list[dict]) -> tuple[str, str, str]:
         for label, url in item["links"]:
             lines.append(f"   {label}: {url}")
         lines.append("")
-    lines += ["—", FOOTER.format(name=name)]
+    lines += ["—", footer(name, unsubscribe)]
     text = "\n".join(lines)
 
     e = html_lib.escape
@@ -348,8 +398,11 @@ def compose(subscription: dict, items: list[dict]) -> tuple[str, str, str]:
                f"</div>" if item["where"] else "")
             + (f'<div style="font-size:13.5px">{links}</div>' if links else "")
             + "</div>")
-    parts.append(f'<p style="color:#777;font-size:12.5px">'
-                 f'{e(FOOTER.format(name=name)).replace(chr(10), "<br>")}</p></div>')
+    note = e(footer(name)).replace(chr(10), "<br>")
+    if unsubscribe:
+        note = e(footer(name, "\0")).replace(chr(10), "<br>").replace(
+            "\0", f'<a href="{e(unsubscribe)}" style="color:#777">{e(unsubscribe)}</a>')
+    parts.append(f'<p style="color:#777;font-size:12.5px">{note}</p></div>')
     return subject, text, "".join(parts)
 
 
@@ -425,8 +478,16 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
         if not items:
             summary["emails"].append({"subscription": s["name"], "status": "nothing new"})
             continue
+        to = recipients(store, s)
+        if not to:
+            summary["emails"].append({"subscription": s["name"],
+                                      "status": "nobody to send to"})
+            continue
         subject, text, html = compose(s, items)
-        delivery = mailer.send(s["emails"], subject, text, html)
+        delivery = mailer.send(
+            to, subject, text, html,
+            personalize=personalizer(store, s, base_url,
+                                     lambda url, s=s, items=items: compose(s, items, url)[1:]))
         store.log_alert_delivery(
             subscription_id=s["subscription_id"], recipients=delivery.recipients,
             subject=subject, body_text=text, item_count=len(items),

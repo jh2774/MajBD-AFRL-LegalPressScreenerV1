@@ -22,6 +22,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -228,6 +229,23 @@ CREATE TABLE IF NOT EXISTS alert_sent (
     item_id      TEXT NOT NULL,
     sent_at      TEXT NOT NULL,
     PRIMARY KEY (subscription_id, item_id)
+);
+-- One row per address on an alert list: the secret behind the unsubscribe
+-- link in its emails, and whether the person has used it. A row outlives the
+-- address's removal from the list on purpose — someone who unsubscribed is not
+-- quietly put back by whoever next saves the list.
+CREATE TABLE IF NOT EXISTS alert_optouts (
+    token        TEXT PRIMARY KEY,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    subscription_id TEXT NOT NULL,
+    email        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    opted_out_at TEXT,
+    -- Whether unsubscribing is what took the address off the list. Only then
+    -- does "undo" put it back: someone the list's owner removed must not be
+    -- able to re-add themselves through an old email's link.
+    restorable   INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (subscription_id, email)
 );
 -- Every email composed, sent or not, with exactly what it said.
 CREATE TABLE IF NOT EXISTS alert_deliveries (
@@ -1512,7 +1530,79 @@ class Store:
             c.execute("DELETE FROM alert_subscriptions WHERE tenant_id=? AND"
                       " subscription_id=?", (self.tenant_id, subscription_id))
             c.execute("DELETE FROM alert_sent WHERE subscription_id=?", (subscription_id,))
+            c.execute("DELETE FROM alert_optouts WHERE tenant_id=? AND"
+                      " subscription_id=?", (self.tenant_id, subscription_id))
         return True
+
+    # ----------------------------------------------------- unsubscribing
+    def unsubscribe_token(self, subscription_id: str, email: str) -> str:
+        """The secret behind one address's unsubscribe link, minted on first use.
+
+        Random rather than derived from a server secret, so there is no key to
+        configure or rotate, and a link stays valid for as long as its row does.
+        """
+        email = email.strip().lower()
+        row = self._one("SELECT token FROM alert_optouts WHERE subscription_id=?"
+                        " AND email=?", (subscription_id, email))
+        if row:
+            return row["token"]
+        token = secrets.token_urlsafe(24)
+        with self._tx() as c:
+            c.execute("INSERT INTO alert_optouts (token, tenant_id, subscription_id,"
+                      " email, created_at) VALUES (?,?,?,?,?)"
+                      " ON CONFLICT (subscription_id, email) DO NOTHING",
+                      (token, self.tenant_id, subscription_id, email, _now()))
+        # Another process may have minted one first; theirs is the one kept.
+        return self._one("SELECT token FROM alert_optouts WHERE subscription_id=?"
+                         " AND email=?", (subscription_id, email))["token"]
+
+    def optout_by_token(self, token: str) -> dict | None:
+        """The row behind an unsubscribe link, whichever tenant it belongs to.
+
+        Deliberately not tenant-scoped: the person clicking has no key, and
+        the token is what identifies the tenant.
+        """
+        return self._one("SELECT * FROM alert_optouts WHERE token=?", (token,))
+
+    def opted_out(self, subscription_id: str) -> dict[str, str]:
+        """{address: when} for everyone who has unsubscribed from a list."""
+        return {r["email"]: r["opted_out_at"] for r in self._query(
+            "SELECT email, opted_out_at FROM alert_optouts WHERE tenant_id=?"
+            " AND subscription_id=? AND opted_out_at IS NOT NULL",
+            (self.tenant_id, subscription_id))}
+
+    def set_opted_out(self, token: str, out: bool) -> dict | None:
+        """Unsubscribe, or undo it. Returns the updated row, or None for an
+        unknown token.
+
+        Unsubscribing takes the address off the list. Undoing clears the
+        opt-out, and puts the address back only if unsubscribing is what took
+        it off — not if the list's owner had already removed it.
+        """
+        row = self.optout_by_token(token)
+        if row is None or row["tenant_id"] != self.tenant_id:
+            return None
+        if bool(row["opted_out_at"]) == out:
+            return row                              # already so; a second click
+        sub = self.alert_subscription(row["subscription_id"])
+        listed = sub is not None and row["email"] in {e.lower() for e in sub["emails"]}
+        with self._tx() as c:
+            if out:
+                c.execute("UPDATE alert_optouts SET opted_out_at=?, restorable=?"
+                          " WHERE token=?", (_now(), 1 if listed else 0, token))
+                emails = [e for e in sub["emails"] if e.lower() != row["email"]] \
+                    if listed else None
+            else:
+                c.execute("UPDATE alert_optouts SET opted_out_at=NULL, restorable=0"
+                          " WHERE token=?", (token,))
+                emails = sub["emails"] + [row["email"]] \
+                    if sub is not None and row["restorable"] and not listed else None
+            if emails is not None:
+                c.execute("UPDATE alert_subscriptions SET emails=?, updated_at=?"
+                          " WHERE tenant_id=? AND subscription_id=?",
+                          (json.dumps(emails), _now(), self.tenant_id,
+                           row["subscription_id"]))
+        return self.optout_by_token(token)
 
     def alert_already_sent(self, subscription_id: str) -> set[str]:
         return {r["item_id"] for r in self._query(

@@ -2627,6 +2627,12 @@ async function alertsCard(key, portfolioName) {
         <textarea id="alert-emails" rows="2" style="width:100%;margin-top:4px"
           placeholder="name@agency.gov, colleague@example.com">${esc(list ? list.emails.join(", ") : "")}</textarea>
       </label>
+      ${list && (list.opted_out || []).length ? `<p class="muted" style="font-size:12.5px">
+        Unsubscribed themselves, from the link in an alert:
+        ${list.opted_out.map((o) => `<span class="mono">${esc(o.email)}</span>
+          (${esc(day(o.at))})`).join(", ")}.
+        They are not emailed again, even if added back here; they can rejoin from that
+        same link.</p>` : ""}
       ${outOfDate ? `<p class="muted" style="font-size:12.5px">This portfolio has changed
         since the list was saved. Save again to watch the new companies.</p>` : ""}
       <div class="actions">

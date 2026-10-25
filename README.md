@@ -862,6 +862,19 @@ decides.
 * Each person on a list gets their own copy and is not shown the other addresses. One refused
   address does not hold up the rest: the alert is logged as *sent to some*, naming the address
   and the reason, and is not sent again to the people it reached.
+* **Anyone on a list can take themselves off it.** Each copy carries an unsubscribe link of its
+  own, and the `List-Unsubscribe` / `List-Unsubscribe-Post` headers (RFC 8058) that Gmail,
+  Outlook and Apple Mail turn into an Unsubscribe button. Opening the link only asks; mail
+  scanners open every link, so nothing happens until the button is pressed. The page offers
+  an undo.
+  * Unsubscribing removes the address from the list. The Portfolio page names who left and
+    when, and **refuses to add them back**: they rejoin from their own link, not on someone
+    else's say-so.
+  * Undo restores an address only if unsubscribing is what removed it. Someone the list's
+    owner took off cannot use an old email's link to put themselves back.
+  * The link needs the site's address — `FOCI_PUBLIC_URL`, or the address the check was
+    requested on. A copy redirected by `FOCI_EMAIL_REDIRECT_TO` carries no link, because its
+    reader is not on the list.
 * A check runs when the Portfolio page is opened and the last one was most of a day ago, and
   once a day from a GitHub Actions workflow if that is set up. Two checks never run at once.
 * `GET /health` reports whether alerts actually leave (`send`, `redirect`, `draft` or

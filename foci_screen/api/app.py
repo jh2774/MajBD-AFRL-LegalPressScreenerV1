@@ -960,8 +960,13 @@ def find_fund_managers(entity_key: str, body: ManagerRequest,
 @app.get("/v1/alerts", tags=["alerts"])
 def get_alerts(store: Store = Depends(tenant_store)) -> dict:
     """Subscriptions, what sending will do, and what was sent recently."""
-    return {"sending": Mailer(cfg).status(),
-            "subscriptions": store.alert_subscriptions(),
+    subscriptions = store.alert_subscriptions()
+    for s in subscriptions:
+        # Who took themselves off, so the list's owner can see why an address
+        # they added is gone — and not type it back in.
+        s["opted_out"] = [{"email": email, "at": at} for email, at
+                          in sorted(store.opted_out(s["subscription_id"]).items())]
+    return {"sending": Mailer(cfg).status(), "subscriptions": subscriptions,
             "deliveries": store.alert_deliveries(limit=30)}
 
 
@@ -984,14 +989,27 @@ def save_subscription(body: AlertSubscriptionRequest,
         if body.subscription_id else None
     before = set(existing["companies"]) if existing else set()
 
+    # Someone who unsubscribed stays unsubscribed. Typing their address back in
+    # is refused by name, so the owner knows rather than wonders; they can
+    # rejoin from the link in their last email.
+    gone = store.opted_out(existing["subscription_id"]) if existing else {}
+    declined = [e for e in body.emails if e in gone]
+    emails = [e for e in body.emails if e not in gone]
+    if not emails:
+        raise HTTPException(
+            422, "Everyone on this list has unsubscribed themselves: "
+                 f"{', '.join(declined)}. They can rejoin from the link in their last "
+                 "alert email.")
+
     sub_id = store.save_alert_subscription(
         subscription_id=body.subscription_id if existing else "",
         name=(body.name or loaded.name).strip() or loaded.name,
-        emails=body.emails, companies=companies,
+        emails=emails, companies=companies,
         portfolio_key=body.portfolio_key, active=body.active)
     baselined = alerts_engine.baseline(store, sub_id,
                                        [c for c in companies if c not in before])
-    return {"subscription": store.alert_subscription(sub_id), "baselined": baselined}
+    return {"subscription": store.alert_subscription(sub_id), "baselined": baselined,
+            "declined": declined}
 
 
 @app.delete("/v1/alerts/subscriptions/{subscription_id}", status_code=204,
@@ -1070,25 +1088,145 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
 
 
 @app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])
-def test_subscription(subscription_id: str,
+def test_subscription(subscription_id: str, request: Request,
                       store: Store = Depends(tenant_store)) -> dict:
     """Send one short test email to a list, to prove delivery works."""
     sub = store.alert_subscription(subscription_id)
     if not sub:
         raise HTTPException(404, "No such alert list.")
     subject = f"FOCI-Screener: test alert for \"{sub['name']}\""
-    text = (f"This is a test from FOCI-Screener. You are on the \"{sub['name']}\" alert "
-            f"list, which watches {len(sub['companies'])} compan"
-            f"{'y' if len(sub['companies']) == 1 else 'ies'}. When one of them changes, "
-            f"an email like this will say what changed and where to look.\n\n"
-            + alerts_engine.FOOTER.format(name=sub["name"]))
-    delivery = Mailer(cfg).send(sub["emails"], subject, text)
+    intro = (f"This is a test from FOCI-Screener. You are on the \"{sub['name']}\" alert "
+             f"list, which watches {len(sub['companies'])} compan"
+             f"{'y' if len(sub['companies']) == 1 else 'ies'}. When one of them changes, "
+             f"an email like this will say what changed and where to look.\n\n")
+    text = intro + alerts_engine.footer(sub["name"])
+    delivery = Mailer(cfg).send(
+        alerts_engine.recipients(store, sub), subject, text,
+        personalize=alerts_engine.personalizer(
+            store, sub, _base_url(request),
+            lambda url: (intro + alerts_engine.footer(sub["name"], url), None)))
     store.log_alert_delivery(subscription_id=subscription_id,
                              recipients=delivery.recipients, subject=subject,
                              body_text=text, item_count=0, status=delivery.status,
                              detail=delivery.detail)
     return {"status": delivery.status, "recipients": delivery.recipients,
             "detail": delivery.detail}
+
+
+# ------------------------------------------------------------ unsubscribing
+# The link in every alert email. No API key: the person clicking is not a user
+# of this site, and the token in the link is what proves the address is theirs.
+#
+# Opening the link does not unsubscribe. Mail scanners and link previewers
+# fetch every URL in a message, and a GET that acted would take people off
+# lists they never asked to leave. The page asks; its button POSTs. A mail
+# client's own "Unsubscribe" button POSTs directly (RFC 8058), and that is
+# honoured without a page.
+
+def _unsubscribe_page(title: str, body: str, status: int = 200) -> HTMLResponse:
+    import html as html_lib
+
+    page = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<meta name=\"robots\" content=\"noindex\">"
+        f"<title>{html_lib.escape(title)}</title><style>"
+        "body{font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;"
+        "color:#1c1c1c;background:#fafaf7;margin:0;padding:48px 16px}"
+        "main{max-width:520px;margin:0 auto;background:#fff;border:1px solid #e3e0d6;"
+        "border-radius:8px;padding:28px}h1{font-size:20px;margin:0 0 12px}"
+        "button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #8a6d1f;"
+        "background:#c8a24a;color:#1c1c1c;cursor:pointer}"
+        ".muted{color:#666;font-size:14px}.mono{font-family:Consolas,monospace}"
+        "</style></head><body><main>"
+        f"<h1>{html_lib.escape(title)}</h1>{body}</main></body></html>")
+    return HTMLResponse(page, status_code=status,
+                        headers={"Cache-Control": "no-store",
+                                 "Referrer-Policy": "no-referrer"})
+
+
+def _optout_context(token: str) -> tuple[Store, dict, dict | None] | None:
+    row = store_for(auth.DEFAULT_TENANT).optout_by_token(token) if token else None
+    if row is None:
+        return None
+    store = store_for(row["tenant_id"])
+    return store, row, store.alert_subscription(row["subscription_id"])
+
+
+_UNKNOWN_LINK = ("This link is not recognised. The alert list it belonged to may have "
+                 "been deleted, in which case no more emails will come from it.")
+
+
+@app.get("/u/{token}", include_in_schema=False)
+def unsubscribe_page(token: str) -> HTMLResponse:
+    import html as html_lib
+
+    found = _optout_context(token)
+    if found is None:
+        return _unsubscribe_page("Link not recognised",
+                                 f"<p>{_UNKNOWN_LINK}</p>", 404)
+    _, row, sub = found
+    e = html_lib.escape
+    name = e(sub["name"]) if sub else "this list"
+    who = f'<span class="mono">{e(row["email"])}</span>'
+    if row["opted_out_at"]:
+        return _unsubscribe_page(
+            "You are unsubscribed",
+            f"<p>{who} no longer receives alerts from “{name}”.</p>"
+            f'<form method="post" action="/u/{e(token)}/undo">'
+            f'<p class="muted">Changed your mind?</p>'
+            f"<button type=\"submit\">Subscribe again</button></form>")
+    return _unsubscribe_page(
+        "Stop these alerts?",
+        f"<p>Stop sending FOCI-Screener alerts for “{name}” to {who}?</p>"
+        f'<form method="post" action="/u/{e(token)}">'
+        f'<input type="hidden" name="List-Unsubscribe" value="One-Click">'
+        f'<button type="submit">Unsubscribe</button></form>'
+        f'<p class="muted" style="margin-top:16px">Only this address is taken off, and '
+        f"only this list. Whoever runs the list will see that you left.</p>")
+
+
+@app.post("/u/{token}", include_in_schema=False)
+def unsubscribe(token: str) -> HTMLResponse:
+    import html as html_lib
+
+    found = _optout_context(token)
+    if found is None:
+        return _unsubscribe_page("Link not recognised", f"<p>{_UNKNOWN_LINK}</p>", 404)
+    store, row, sub = found
+    store.set_opted_out(token, True)
+    e = html_lib.escape
+    name = e(sub["name"]) if sub else "this list"
+    return _unsubscribe_page(
+        "You are unsubscribed",
+        f'<p><span class="mono">{e(row["email"])}</span> will get no more alerts from '
+        f"“{name}”.</p>"
+        f'<form method="post" action="/u/{e(token)}/undo">'
+        f'<p class="muted">Did that by mistake?</p>'
+        f'<button type="submit">Undo</button></form>')
+
+
+@app.post("/u/{token}/undo", include_in_schema=False)
+def resubscribe(token: str) -> HTMLResponse:
+    import html as html_lib
+
+    found = _optout_context(token)
+    if found is None or found[2] is None:
+        return _unsubscribe_page("Link not recognised", f"<p>{_UNKNOWN_LINK}</p>", 404)
+    store, row, sub = found
+    e = html_lib.escape
+    who = f'<span class="mono">{e(row["email"])}</span>'
+    restored = bool(row["opted_out_at"]) and bool(row["restorable"])
+    store.set_opted_out(token, False)
+    if restored:
+        return _unsubscribe_page(
+            "Subscribed again",
+            f"<p>{who} is back on “{e(sub['name'])}”. The next alert will reach you "
+            f"as before.</p>")
+    return _unsubscribe_page(
+        "Not on the list",
+        f"<p>{who} was not on “{e(sub['name'])}” when it unsubscribed, so it has not "
+        f"been added. To be added, ask whoever runs the list.</p>")
 
 
 # -------------------------------------------------------------- type-ahead
