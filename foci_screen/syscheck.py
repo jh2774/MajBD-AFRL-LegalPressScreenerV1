@@ -32,14 +32,15 @@ log = logging.getLogger("foci.syscheck")
 # Every setting the application reads (`config.py`), so the ones in use on an
 # old site can be carried to a new one. A test holds this to the config.
 SETTINGS = (
-    "FOCI_API_KEYS", "FOCI_USER_AGENT", "FOCI_PUBLIC_URL", "FOCI_CORS_ORIGINS",
+    "FOCI_API_KEYS", "FOCI_PUBLIC", "FOCI_USER_AGENT", "FOCI_PUBLIC_URL", "FOCI_CORS_ORIGINS",
     "DATABASE_URL", "INSTANCE_CONNECTION_NAME", "CLOUD_SQL_CONNECTION_NAME",
     "INSTANCE_UNIX_SOCKET", "DB_USER", "DB_NAME", "DB_PASS", "DB_PASSWORD",
     "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING", "POSTGRES_URL", "FOCI_DB_SCHEMA",
     "FOCI_DB", "FOCI_CACHE", "FOCI_OUT", "FOCI_CACHE_MAX_MB", "FOCI_CACHE_TTL",
     "REDIS_URL", "FOCI_JOB_TIMEOUT", "FOCI_INPROCESS_SCREENS", "FOCI_KEEP_AWAKE",
     "FOCI_SCREENS_IN_REQUEST", "FOCI_SCREEN_SECONDS",
-    "ALERTS_SEND", "ALERTS_PAUSED", "ALERTS_FROM", "BREVO_API_KEY", "RESEND_API_KEY",
+    "ALERTS_SEND", "ALERTS_PAUSED", "ALERTS_FROM", "ALERTS_REPLY_TO", "RESEND_API_KEY",
+    "BREVO_API_KEY",
     "MAIL_PROVIDER", "SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD",
     "SMTP_SECURITY", "FOCI_EMAIL_REDIRECT_TO",
     "SAM_API_KEY", "USPTO_API_KEY", "TRADE_GOV_API_KEY",
@@ -261,7 +262,7 @@ def mail_check(status: dict, paused: bool) -> list[dict]:
     sending = _check("Email alerts", {"send": True, "redirect": True,
                                       "misconfigured": False}.get(mode),
                      status.get("explanation") or f"Mode: {mode}.",
-                     "Finish connecting the mail service: BREVO_API_KEY and ALERTS_FROM.")
+                     "Finish connecting the mail service: RESEND_API_KEY and ALERTS_FROM.")
     checking = _check(
         "Alert checks", None if paused else True,
         "Paused: ALERTS_PAUSED is set, so nothing is checked and nothing is emailed. "

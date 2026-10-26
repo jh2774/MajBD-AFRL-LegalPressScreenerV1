@@ -65,6 +65,18 @@ def _database_url() -> str:
     return f"postgresql://{auth}@/{quote(name, safe='')}?host={quote(socket, safe='/:')}"
 
 
+def _public_url() -> str:
+    """Where links in emails point. On Vercel, unless set, the project's
+    production address — its custom domain once one is attached — which
+    Vercel supplies without the scheme."""
+    given = _env("FOCI_PUBLIC_URL")
+    if given:
+        return given
+    # Set by Vercel itself, not a setting of this application.
+    production = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "").strip()
+    return f"https://{production}" if production else ""
+
+
 def _default_cache_mb() -> str:
     # Cloud Run has no disk: files written inside the container are held in
     # the instance's memory and count against its limit. Vercel gives a
@@ -175,9 +187,12 @@ class Config:
     # starttls (587, 2587), ssl (465, 2465), or none (a local relay).
     smtp_security: str = field(default_factory=lambda: _env("SMTP_SECURITY", "starttls"))
     alerts_from: str = field(default_factory=lambda: _env("ALERTS_FROM"))
+    # Where a reply to an alert goes, when the sending address has no mailbox
+    # behind it. Optional.
+    alerts_reply_to: str = field(default_factory=lambda: _env("ALERTS_REPLY_TO"))
     # Where the links in an alert point. Without it, links use whatever
     # address the request that triggered the alerts came in on.
-    public_url: str = field(default_factory=lambda: _env("FOCI_PUBLIC_URL"))
+    public_url: str = field(default_factory=_public_url)
 
     # --- investor-relations email alerts ---
     # A directory of saved .eml files. The IR platforms that refuse an
@@ -198,6 +213,11 @@ class Config:
 
     # --- API ---
     api_keys: str = field(default_factory=lambda: _env("FOCI_API_KEYS"))
+    # Open the site to anyone with its address: no key to read, screen or set
+    # up alerts. A key from FOCI_API_KEYS is then only for the few actions
+    # that remove work or change the site for everyone (see api.auth). Off
+    # unless set, so a deployment is never opened by accident.
+    public: bool = field(default_factory=lambda: _flag("FOCI_PUBLIC", False))
     cors_origins: str = field(default_factory=lambda: _env("FOCI_CORS_ORIGINS"))
 
     # --- HTTP behaviour ---

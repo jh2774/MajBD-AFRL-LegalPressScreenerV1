@@ -13,6 +13,13 @@ shipping a self-service credential endpoint.
 **Fails closed.** With no keys configured every authenticated route returns 503.
 A screening tool that drafts email to federal officials must not be reachable by
 accident because someone deployed it before setting a variable.
+
+**Public mode** (`FOCI_PUBLIC=true`) is the deliberate opposite: anyone with
+the site's address can read, screen and set up alerts, as tenant `default`,
+without a key. A key is then an admin key, needed only for what removes work
+or changes the site for everyone, and for the one action that emails a federal
+official — see `make_admin_dependency`. Alert emails need no key because each
+address has to confirm before it receives one (`consent`).
 """
 from __future__ import annotations
 
@@ -77,13 +84,40 @@ def resolve_tenant(keymap: dict[str, str], presented: str) -> str:
     return match
 
 
-def make_dependency(keymap: dict[str, str]):
+ADMIN_NEEDED = (
+    "This needs the site's admin key: it removes recorded work, changes how the "
+    "site screens for everyone, or emails a federal official. Enter the key with "
+    "\"Admin key\" at the top right.")
+
+ADMIN_UNSET = (
+    "This needs an admin key, and this site has none. It is open to anyone with "
+    "its address (FOCI_PUBLIC), so removing recorded work, changing how the site "
+    "screens and approving notices are switched off until FOCI_API_KEYS is set "
+    "to a key for whoever looks after it.")
+
+
+def _presented(authorization: str, x_api_key: str) -> str:
+    presented = x_api_key.strip()
+    if not presented and authorization.lower().startswith("bearer "):
+        presented = authorization[7:].strip()
+    return presented
+
+
+def make_dependency(keymap: dict[str, str], public: bool = False):
     """Build the FastAPI dependency that yields a tenant id."""
 
     async def require_tenant(
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> str:
+        presented = _presented(authorization, x_api_key)
+        if public:
+            # No key needed. A known one still selects its tenant; an unknown
+            # one — left in a browser from before the site was opened, say —
+            # is ignored rather than refused, so it cannot lock anyone out.
+            return (resolve_tenant(keymap, presented) if presented else "") \
+                or DEFAULT_TENANT
+
         if not keymap:
             # Say how to fix it. The symptom otherwise is a web page that shows
             # nothing, which looks like missing data rather than missing config.
@@ -91,9 +125,6 @@ def make_dependency(keymap: dict[str, str]):
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=CLOSED_DETAIL)
 
-        presented = x_api_key.strip()
-        if not presented and authorization.lower().startswith("bearer "):
-            presented = authorization[7:].strip()
         if not presented:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -107,3 +138,54 @@ def make_dependency(keymap: dict[str, str]):
         return tenant
 
     return require_tenant
+
+
+def make_admin_dependency(keymap: dict[str, str], public: bool = False):
+    """The dependency for routes that remove recorded work, change how the
+    site screens for everyone, or email a federal official.
+
+    Outside public mode every caller already holds a key, and any key will
+    do, as before. In public mode a key from FOCI_API_KEYS is required; with
+    none configured these routes are closed (403), not opened.
+    """
+    if not public:
+        return make_dependency(keymap)
+
+    async def require_admin(
+        authorization: str = Header(default=""),
+        x_api_key: str = Header(default=""),
+    ) -> str:
+        if not keymap:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ADMIN_UNSET)
+        presented = _presented(authorization, x_api_key)
+        tenant = resolve_tenant(keymap, presented) if presented else ""
+        if not tenant:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=ADMIN_NEEDED if not presented else "That admin key is not "
+                       "one this site knows. Check it under \"Admin key\".",
+                headers={"WWW-Authenticate": "Bearer"})
+        return tenant
+
+    return require_admin
+
+
+def make_admin_flag(keymap: dict[str, str], public: bool = False):
+    """A dependency answering whether this request carries a known key.
+
+    Always yes outside public mode, where a request without one never gets
+    this far. In public mode it decides what a visitor is shown of other
+    people's email addresses, and whether an address they add is trusted
+    without confirming.
+    """
+
+    async def is_admin(
+        authorization: str = Header(default=""),
+        x_api_key: str = Header(default=""),
+    ) -> bool:
+        if not public:
+            return True
+        presented = _presented(authorization, x_api_key)
+        return bool(presented and resolve_tenant(keymap, presented))
+
+    return is_admin

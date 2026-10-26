@@ -2559,11 +2559,47 @@ async function syncAlertList(newKey) {
     const d = await api("/v1/alerts");
     const list = d.subscriptions.find((s) => s.subscription_id === id);
     if (!list) return;
+    // Shown masked to a visitor of a public site, so not sent back: the
+    // server keeps the addresses it has.
     await apiPost("/v1/alerts/subscriptions", {
-      subscription_id: id, name: list.name, emails: list.emails,
+      subscription_id: id, name: list.name,
+      emails: list.can_edit_addresses === false ? [] : list.emails,
       portfolio_key: newKey, active: list.active,
     });
   } catch { /* shown as out of date on the portfolio page instead */ }
+}
+
+/* What saving the list did, carried across the redraw that follows it. */
+let alertSaveNote = "";
+
+function recipientRows(list) {
+  const word = {
+    confirmed: "gets alerts",
+    pending: "not confirmed yet; nothing is sent until they do",
+  };
+  if (!(list.recipients || []).length) return "";
+  return `<ul style="margin:6px 0 10px;padding-left:18px;font-size:13px">
+    ${list.recipients.map((r) => `<li>${esc(r.email)}
+      <span class="muted">· ${esc(word[r.status] || r.status)}</span></li>`).join("")}</ul>`;
+}
+
+/* The requests to confirm that saving sent, held back, or could not send. */
+function consentNote(c) {
+  if (!c) return "";
+  const parts = [];
+  if (c.asked.length) {
+    parts.push(`Emailed ${c.asked.join(", ")} asking to confirm. Alerts start for each `
+      + "address once it does; the email can take a minute, and may land in spam.");
+  }
+  if (c.waiting.length) parts.push(`${c.waiting.join(", ")} already had a request to confirm today.`);
+  if (c.held.length) {
+    parts.push(`The site has sent its day's requests to confirm, so ${c.held.join(", ")} `
+      + "will be asked when the list is next saved, from tomorrow.");
+  }
+  for (const n of c.not_sent || []) {
+    parts.push(`Could not email ${n.email} asking to confirm: ${n.detail}`);
+  }
+  return parts.join(" ");
 }
 
 function deliveryRows(deliveries) {
@@ -2605,6 +2641,12 @@ async function alertsCard(key, portfolioName) {
   const deliveries = list ? d.deliveries.filter((x) => x.subscription_id === list.subscription_id) : [];
   const outOfDate = list && list.portfolio_key !== key;
   const mode = d.sending.mode;
+  // A visitor to a public site adds people; the addresses already on the
+  // list are shown masked and are taken off by their own link, or by
+  // someone holding the admin key.
+  const editable = list ? list.can_edit_addresses !== false : d.can_edit_addresses !== false;
+  const note = alertSaveNote;
+  alertSaveNote = "";
 
   return `
     <div class="card" id="alerts-card">
@@ -2623,18 +2665,24 @@ async function alertsCard(key, portfolioName) {
       <div class="${mode === "send" ? "muted" : "error"}" style="font-size:12.5px;margin:8px 0">
         ${esc(d.sending.explanation)}</div>
 
-      <label class="field" style="display:block">Send to (one or more addresses)
+      ${list ? recipientRows(list) : ""}
+      <label class="field" style="display:block">${list && !editable
+        ? "Add people (one or more addresses)" : "Send to (one or more addresses)"}
         <textarea id="alert-emails" rows="2" style="width:100%;margin-top:4px"
-          placeholder="name@agency.gov, colleague@example.com">${esc(list ? list.emails.join(", ") : "")}</textarea>
+          placeholder="name@agency.gov, colleague@example.com">${esc(list && editable ? list.emails.join(", ") : "")}</textarea>
       </label>
+      ${!editable ? `<p class="muted" style="font-size:12.5px">Each new address is first
+        sent an email asking it to confirm. Nothing else is sent to it until it does, and
+        every alert ends with a link to stop them.</p>` : ""}
       ${outOfDate ? `<p class="muted" style="font-size:12.5px">This portfolio has changed
         since the list was saved. Save again to watch the new companies.</p>` : ""}
       <div class="actions">
-        <button class="primary" id="alert-save">${list ? "Update list" : "Start email alerts"}</button>
+        <button class="primary" id="alert-save">${list ? (editable ? "Update list" : "Add to list") : "Start email alerts"}</button>
         ${list ? `<button id="alert-run">Check now</button>
                   <button id="alert-test">Send a test email</button>
-                  <button class="ghost" id="alert-delete">Stop alerts</button>` : ""}
+                  ${editable ? '<button class="ghost" id="alert-delete">Stop alerts</button>' : ""}` : ""}
       </div>
+      ${note ? `<p style="font-size:12.5px;margin-top:8px">${esc(note)}</p>` : ""}
       <p class="muted" id="alert-status" style="font-size:12.5px;margin-top:8px">
         ${list && list.last_run_at ? `Last checked ${esc(day(list.last_run_at))}.` : ""}</p>
       ${list ? `<p class="muted" style="font-size:12px">A check runs when this page is
@@ -2646,8 +2694,10 @@ async function alertsCard(key, portfolioName) {
 }
 
 /* What a check did, for the line under the buttons. */
+const CHECK_NOT_RUN = ["already running", "paused", "recently checked"];
+
 function describeCheck(r, portfolioName) {
-  if (r.status === "already running" || r.status === "paused") return r.detail;
+  if (CHECK_NOT_RUN.includes(r.status)) return r.detail;
   const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
   const funds = r.funds || {};
   const checked = `Checked ${r.firms_checked} investment firm(s) and `
@@ -2663,6 +2713,7 @@ function describeCheck(r, portfolioName) {
     drafted: "written but not sent",
     partial: "emailed to some of this list — see Recent alerts",
     failed: "could not be sent, and will be tried again — see Recent alerts",
+    "waiting for confirmation": "kept until someone on the list confirms their address",
   }[mine.status] || mine.status;
   return `${checked} ${mine.items || 0} update(s), ${outcome}.`;
 }
@@ -2700,6 +2751,7 @@ function wireAlerts(key, portfolioName) {
         portfolio_key: key,
       });
       rememberAlertListId(r.subscription.subscription_id);
+      alertSaveNote = consentNote(r.consent);
       viewPortfolio();
     } catch (e) {
       save.disabled = false;
@@ -2715,7 +2767,7 @@ function wireAlerts(key, portfolioName) {
       try {
         const r = await apiPost("/v1/alerts/run", {});
         status.textContent = describeCheck(r, portfolioName);
-        if (r.status === "already running" || r.status === "paused") {
+        if (CHECK_NOT_RUN.includes(r.status)) {
           run.disabled = false;
           return;
         }
@@ -2734,17 +2786,26 @@ function wireAlerts(key, portfolioName) {
           drafted: `Test written but not sent: ${r.detail}`,
           partial: `Test sent to some addresses only. ${r.detail}`,
           failed: `Test not sent. ${r.detail}`,
+          waiting: `Test not sent. ${r.detail}`,
         }[r.status] || `Test ${r.status}: ${r.detail}`;
-        setTimeout(viewPortfolio, 4000);
+        if (r.status !== "waiting") setTimeout(viewPortfolio, 4000);
       } catch (e) {
         status.textContent = e.message || String(e);
       }
     };
-    document.getElementById("alert-delete").onclick = async () => {
-      await apiSend("DELETE", `/v1/alerts/subscriptions/${encodeURIComponent(savedAlertListId())}`);
-      rememberAlertListId("");
-      viewPortfolio();
-    };
+    const stop = document.getElementById("alert-delete");
+    if (stop) {
+      stop.onclick = async () => {
+        try {
+          await apiSend("DELETE", `/v1/alerts/subscriptions/${encodeURIComponent(savedAlertListId())}`);
+        } catch (e) {
+          status.textContent = e.message || String(e);
+          return;
+        }
+        rememberAlertListId("");
+        viewPortfolio();
+      };
+    }
   }
 }
 
@@ -3397,6 +3458,19 @@ async function route() {
  * look identical from here, and only one of them is the reader's fault. */
 let storageIsEphemeral = false;
 
+/* On a site open to anyone, nobody needs a key to use it; the key the
+ * button asks for is the one for the few actions kept for whoever looks
+ * after the site. */
+function showPublicKeyLabels() {
+  document.getElementById("key-button").textContent = "Admin key";
+  document.getElementById("key-title").textContent = "Admin key";
+  document.getElementById("key-explain").textContent =
+    "Nobody needs a key to use this site. The admin key is only for deleting a "
+    + "screen, a watchlist or an alert list, changing the screening rules, and "
+    + "approving or rejecting a notice. It is kept in this browser's local storage; "
+    + "treat it like a password, and leave it off a shared computer.";
+}
+
 async function refreshHealth() {
   const banner = document.getElementById("config-banner");
   if (!banner) return;
@@ -3409,6 +3483,7 @@ async function refreshHealth() {
     return;   // unreachable server; the view's own error already says so
   }
   storageIsEphemeral = health.ephemeral_storage === true;
+  if (health.public) showPublicKeyLabels();
   const warnings = health.warnings || [];
   if (!warnings.length) {
     banner.hidden = true;

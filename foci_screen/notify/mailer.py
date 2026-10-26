@@ -2,13 +2,14 @@
 
 Three ways out, chosen by which settings exist:
 
-  * **Brevo** or **Resend**, over HTTPS — one API key and a sender address.
-    This is the route for a free Render instance: since September 2025 Render's
-    free web services cannot open connections to the SMTP ports (25, 465, 587),
-    so plain SMTP to Gmail or Outlook times out there no matter how it is
-    configured. An HTTPS request is ordinary web traffic and is not blocked.
-  * **SMTP**, for a paid instance or another host. Port 2525, which most relay
-    services also listen on, is not one of the blocked ports.
+  * **Resend**, over HTTPS — one API key and a sender address on a domain
+    verified with Resend. The route this site is set up for. An HTTPS request
+    is ordinary web traffic, so it works on hosts that block the SMTP ports
+    (25, 465, 587), as Render's free plan does and as serverless functions
+    generally do.
+  * **Brevo**, the same over HTTPS, for a site already set up with it.
+  * **SMTP**, for another host. Port 2525, which most relay services also
+    listen on, is not one of the commonly blocked ports.
 
 Connecting one of them is what turns sending on. With none, every alert is
 still composed and logged exactly as it would be sent, so the wording can be
@@ -17,7 +18,9 @@ even with a service connected.
 
 Every recipient gets a message of their own. A list holds people at different
 organisations who have no reason to learn each other's addresses, and one
-address that bounces should not hold up the rest.
+address that bounces should not hold up the rest. It also lets each message
+carry its own link to stop them, in the body and in the List-Unsubscribe
+header mail programs show as an "Unsubscribe" button.
 
 Outcomes, recorded for every email:
 
@@ -35,10 +38,12 @@ before anyone else receives one.
 """
 from __future__ import annotations
 
+import html as html_lib
 import logging
 import smtplib
 import ssl
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
@@ -49,14 +54,18 @@ BREVO_URL = "https://api.brevo.com/v3/smtp/email"
 RESEND_URL = "https://api.resend.com/emails"
 
 # The settings each route needs, as they are named on the host.
-LABEL = {"brevo": "Brevo", "resend": "Resend", "smtp": "SMTP"}
+LABEL = {"resend": "Resend", "brevo": "Brevo", "smtp": "SMTP"}
 # Ports a free Render web service cannot reach.
 BLOCKED_ON_FREE_RENDER = (25, 465, 587)
 
 HOW_TO_CONNECT = (
-    "To start sending, connect a mail service: add BREVO_API_KEY and ALERTS_FROM "
-    "to this site's environment settings (DEPLOY.md, \"Turning on email alerts\", "
-    "has the steps).")
+    "To start sending, connect a mail service: add RESEND_API_KEY and ALERTS_FROM "
+    "to this site's environment settings (docs/VERCEL.md, \"Email through "
+    "Resend\", has the steps).")
+
+# How long to wait, at most, when the service asks for a pause before the
+# next message (Resend allows a few requests a second).
+RETRY_AFTER_MAX = 5
 
 
 @dataclass
@@ -64,6 +73,15 @@ class Delivery:
     status: str                 # drafted | sent | partial | failed
     recipients: list[str]       # who it was addressed to, after any redirect
     detail: str = ""
+
+
+@dataclass
+class Outgoing:
+    """One recipient's copy: the shared text, plus their own link to stop."""
+    address: str
+    text: str
+    html: str | None = None
+    headers: dict = field(default_factory=dict)
 
 
 class Mailer:
@@ -75,14 +93,14 @@ class Mailer:
 
     @property
     def transport(self) -> str:
-        """brevo, resend or smtp — whichever has been set up — or ""."""
+        """resend, brevo or smtp — whichever has been set up — or ""."""
         chosen = self._setting("mail_provider").lower()
         if chosen in LABEL:
             return chosen
-        if self._setting("brevo_api_key"):
-            return "brevo"
         if self._setting("resend_api_key"):
             return "resend"
+        if self._setting("brevo_api_key"):
+            return "brevo"
         if self._setting("smtp_host"):
             return "smtp"
         return ""
@@ -90,6 +108,10 @@ class Mailer:
     @property
     def sender(self) -> str:
         return self._setting("alerts_from") or self._setting("smtp_user")
+
+    @property
+    def reply_to(self) -> str:
+        return self._setting("alerts_reply_to")
 
     @property
     def missing(self) -> list[str]:
@@ -100,7 +122,7 @@ class Mailer:
             "smtp": [("smtp_host", "SMTP_HOST")],
         }.get(self.transport)
         if needs is None:
-            return ["BREVO_API_KEY", "ALERTS_FROM"]
+            return ["RESEND_API_KEY", "ALERTS_FROM"]
         out = [label for attr, label in needs if not self._setting(attr)]
         if not self.sender:
             out.append("ALERTS_FROM")
@@ -129,7 +151,7 @@ class Mailer:
                 and "render" in host.lower():
             return (f" Note: Render's free plan blocks port {port}. If alerts fail with "
                     f"a timeout, set SMTP_PORT=2525 where the mail service offers it, or "
-                    f"use BREVO_API_KEY instead.")
+                    f"use RESEND_API_KEY instead.")
         return ""
 
     def status(self) -> dict:
@@ -162,14 +184,19 @@ class Mailer:
 
     # ------------------------------------------------------------------ sending
     def send(self, to: list[str], subject: str, text: str,
-             html: str | None = None) -> Delivery:
+             html: str | None = None,
+             unsubscribe: dict[str, str] | None = None) -> Delivery:
+        """`unsubscribe` maps an address to its own link for stopping these
+        emails; each copy carries its recipient's, and none goes elsewhere."""
         recipients = [a for a in dict.fromkeys(x.strip() for x in to) if a]
         if not recipients:
             return Delivery("failed", [], "No recipients.")
 
+        links = dict(unsubscribe or {})
         if self.redirect:
             subject = f"[for {', '.join(recipients)}] {subject}"
             recipients = [self.redirect]
+            links = {}          # theirs, not the redirect address's to use
 
         if self.switched_off:
             return Delivery("drafted", recipients,
@@ -183,7 +210,8 @@ class Mailer:
 
         deliver = {"brevo": self._brevo, "resend": self._resend,
                    "smtp": self._smtp}[self.transport]
-        failures = deliver(recipients, subject, text, html)
+        failures = deliver([personal(a, text, html, links.get(a, "")) for a in recipients],
+                           subject)
 
         reached = [a for a in recipients if a not in failures]
         if failures:
@@ -207,13 +235,22 @@ class Mailer:
 
     @staticmethod
     def _post(url: str, headers: dict, body: dict, ok: tuple[int, ...]) -> str:
-        """"" when the service accepted the message, else why it did not."""
+        """"" when the service accepted the message, else why it did not.
+
+        Asked to slow down (429), it waits as long as the service says, up to
+        a few seconds, and tries once more. A daily allowance used up is a
+        429 too; the second try then fails with the service's own words.
+        """
         import requests
 
-        try:
-            resp = requests.post(url, headers=headers, json=body, timeout=30)
-        except requests.RequestException as exc:
-            return f"could not reach the mail service ({type(exc).__name__})"
+        for attempt in (1, 2):
+            try:
+                resp = requests.post(url, headers=headers, json=body, timeout=30)
+            except requests.RequestException as exc:
+                return f"could not reach the mail service ({type(exc).__name__})"
+            if resp.status_code != 429 or attempt == 2:
+                break
+            time.sleep(_retry_after(resp))
         if resp.status_code in ok:
             return ""
         try:
@@ -225,33 +262,41 @@ class Mailer:
         return f"the mail service refused it ({resp.status_code}): " \
                f"{message[:240] or 'no reason given'}"
 
-    def _brevo(self, recipients, subject, text, html) -> dict[str, str]:
+    def _brevo(self, messages: list[Outgoing], subject: str) -> dict[str, str]:
         headers = {"api-key": self._setting("brevo_api_key"), "accept": "application/json"}
         failures = {}
-        for address in recipients:
+        for m in messages:
             body = {"sender": {"name": SENDER_NAME, "email": self.sender},
-                    "to": [{"email": address}], "subject": subject, "textContent": text}
-            if html:
-                body["htmlContent"] = html
+                    "to": [{"email": m.address}], "subject": subject, "textContent": m.text}
+            if m.html:
+                body["htmlContent"] = m.html
+            if m.headers:
+                body["headers"] = m.headers
+            if self.reply_to:
+                body["replyTo"] = {"email": self.reply_to}
             reason = self._post(BREVO_URL, headers, body, ok=(201, 202))
             if reason:
-                failures[address] = reason
+                failures[m.address] = reason
         return failures
 
-    def _resend(self, recipients, subject, text, html) -> dict[str, str]:
+    def _resend(self, messages: list[Outgoing], subject: str) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self._setting('resend_api_key')}"}
         failures = {}
-        for address in recipients:
-            body = {"from": formataddr((SENDER_NAME, self.sender)), "to": [address],
-                    "subject": subject, "text": text}
-            if html:
-                body["html"] = html
+        for m in messages:
+            body = {"from": formataddr((SENDER_NAME, self.sender)), "to": [m.address],
+                    "subject": subject, "text": m.text}
+            if m.html:
+                body["html"] = m.html
+            if m.headers:
+                body["headers"] = m.headers
+            if self.reply_to:
+                body["reply_to"] = self.reply_to
             reason = self._post(RESEND_URL, headers, body, ok=(200, 201, 202))
             if reason:
-                failures[address] = reason
+                failures[m.address] = reason
         return failures
 
-    def _smtp(self, recipients, subject, text, html) -> dict[str, str]:
+    def _smtp(self, messages: list[Outgoing], subject: str) -> dict[str, str]:
         security = (self._setting("smtp_security") or "starttls").lower()
         host, port = self._setting("smtp_host"), int(self.cfg.smtp_port)
         failures: dict[str, str] = {}
@@ -274,29 +319,55 @@ class Mailer:
                 user, password = self._setting("smtp_user"), self._setting("smtp_password")
                 if user and password:
                     server.login(user, password)
-                for address in recipients:
+                for m in messages:
                     message = EmailMessage()
                     message["From"] = formataddr((SENDER_NAME, self.sender))
-                    message["To"] = address
+                    message["To"] = m.address
                     message["Subject"] = subject
                     message["Message-ID"] = make_msgid(
                         domain=self.sender.split("@")[-1] or None)
-                    message.set_content(text)
-                    if html:
-                        message.add_alternative(html, subtype="html")
+                    if self.reply_to:
+                        message["Reply-To"] = self.reply_to
+                    for name, value in m.headers.items():
+                        message[name] = value
+                    message.set_content(m.text)
+                    if m.html:
+                        message.add_alternative(m.html, subtype="html")
                     try:
                         server.send_message(message)
-                        handed_over.add(address)
+                        handed_over.add(m.address)
                     except smtplib.SMTPException as exc:
-                        failures[address] = reason_of(exc)
+                        failures[m.address] = reason_of(exc)
         except (smtplib.SMTPException, OSError) as exc:
             # Could not connect or sign in, or the connection dropped part-way:
             # everyone the server had not already taken a message for.
             why = reason_of(exc)
             if isinstance(exc, TimeoutError) and port in BLOCKED_ON_FREE_RENDER:
                 why += (f" — port {port} is blocked on Render's free plan; use port "
-                        f"2525 or BREVO_API_KEY")
-            for address in recipients:
-                if address not in handed_over:
-                    failures.setdefault(address, why)
+                        f"2525 or RESEND_API_KEY")
+            for m in messages:
+                if m.address not in handed_over:
+                    failures.setdefault(m.address, why)
         return failures
+
+
+def personal(address: str, text: str, html: str | None, link: str) -> Outgoing:
+    """One recipient's copy. With a link, it ends with it, and carries it as
+    the one-click unsubscribe header (RFC 8058) mail programs act on."""
+    if not link:
+        return Outgoing(address, text, html)
+    text = f"{text}\n\nTo stop these emails: {link}"
+    if html:
+        html += (f'<p style="color:#777;font-size:12.5px"><a href="{html_lib.escape(link)}">'
+                 f"Stop these emails</a></p>")
+    return Outgoing(address, text, html, {
+        "List-Unsubscribe": f"<{link}>",
+        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"})
+
+
+def _retry_after(resp) -> float:
+    try:
+        wait = float((getattr(resp, "headers", None) or {}).get("retry-after") or 1)
+    except (TypeError, ValueError):
+        wait = 1
+    return max(0.0, min(wait, RETRY_AFTER_MAX))

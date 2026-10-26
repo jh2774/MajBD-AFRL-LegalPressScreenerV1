@@ -394,6 +394,9 @@ which machine spends the minutes.
 
 ## Turning on email alerts
 
+> **On the Vercel site, email goes through Resend:** [docs/VERCEL.md](docs/VERCEL.md),
+> "Email through Resend". The Brevo steps below are for a Render setup.
+
 Alerts go to the addresses typed into a portfolio's **Email alerts** box. Until a mail service
 is connected, every alert is still written and shown on the Portfolio page exactly as it would
 be sent, and nothing leaves. **Connecting a mail service is what turns sending on.**
@@ -482,10 +485,11 @@ schedule and a button press cannot send the same alert twice.
 
 | Service | Settings | Notes |
 |---|---|---|
-| Resend | `RESEND_API_KEY`, `ALERTS_FROM` | Also HTTPS. Needs a domain you control. |
+| Resend | `RESEND_API_KEY`, `ALERTS_FROM` | Also HTTPS. Needs a domain you control. The Vercel site's service: [docs/VERCEL.md](docs/VERCEL.md). |
 | Any SMTP relay | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `ALERTS_FROM` | On Render's free plan use port `2525` where the service offers it; 25, 465 and 587 are blocked there. On a paid instance any port works, including Gmail on 587 with an app password. |
 
-If more than one is set, `MAIL_PROVIDER` (`brevo`, `resend` or `smtp`) picks.
+If more than one is set, Resend is used, then Brevo, then SMTP; `MAIL_PROVIDER` (`resend`,
+`brevo` or `smtp`) picks otherwise. `ALERTS_REPLY_TO` sets where replies go.
 
 ## Costs and gotchas
 

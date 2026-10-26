@@ -427,6 +427,15 @@ every night on a deploy that was screening nothing.
 authenticated route returns 503. A tool that drafts email to federal officials must not be
 reachable because someone deployed it before setting a variable.
 
+**Public mode is the deliberate exception.** `FOCI_PUBLIC=true` opens the site to anyone with
+its address, as tenant `default`, with no key. A key from `FOCI_API_KEYS` is then an admin key,
+needed only to delete a screen, watchlist or alert list, change the screening rules or policy,
+approve or reject a notice, and open the system check; with no key configured those are closed
+(403), not opened. Visitors see alert-list addresses masked, can add to a list but not take an
+address off, and each address they add must confirm before it receives anything
+(`foci_screen/consent.py`). [docs/VERCEL.md](docs/VERCEL.md), "Who can do what", has the
+detail.
+
 **Tenancy.** Runs, findings, notices and watchlists are tenant-scoped. Snapshots deliberately
 are not — a document's hash is a fact about the world, not about who is watching, so ten
 tenants screening the same prime fetch its 10-K once between them.
@@ -853,15 +862,19 @@ decides.
 * Each item goes to each list once. A failed send is retried next time.
 * **Connecting a mail service is what turns sending on.** With none, every alert is written and
   shown on the Portfolio page exactly as it would be sent, and nothing leaves. Setting
-  `BREVO_API_KEY` and `ALERTS_FROM` is enough to send; `ALERTS_SEND=false` holds everything as
+  `RESEND_API_KEY` and `ALERTS_FROM` is enough to send; `ALERTS_SEND=false` holds everything as
   a draft again without disconnecting anything. `FOCI_EMAIL_REDIRECT_TO` still applies, so a
   pilot can route every alert to one person first.
-* Mail goes over HTTPS (Brevo or Resend) because **Render's free plan blocks the SMTP ports**
-  (25, 465, 587), so Gmail or Outlook cannot be reached from a free instance. Plain SMTP is
-  still supported for a paid instance, or on port 2525 where a relay offers it.
+* Mail goes over HTTPS — **Resend**, or Brevo — because serverless hosts and Render's free
+  plan block the SMTP ports (25, 465, 587). Plain SMTP is still supported elsewhere, or on
+  port 2525 where a relay offers it.
 * Each person on a list gets their own copy and is not shown the other addresses. One refused
   address does not hold up the rest: the alert is logged as *sent to some*, naming the address
   and the reason, and is not sent again to the people it reached.
+* **Only to addresses that agreed.** On a public site an address a visitor adds gets one email
+  asking it to confirm, and nothing else until it does. Every alert ends with that recipient's
+  own link to stop, also sent as a one-click `List-Unsubscribe` header; an address that stops
+  is taken off its list and asked again if it is ever added back.
 * A check runs when the Portfolio page is opened and the last one was most of a day ago, and
   once a day from a GitHub Actions workflow if that is set up. Two checks never run at once.
 * `GET /health` reports whether alerts actually leave (`send`, `redirect`, `draft` or
@@ -1081,9 +1094,11 @@ browser requires.
 
 ### Deploying on Vercel, with Supabase
 
-**This is how the site is deployed.** [docs/VERCEL.md](docs/VERCEL.md) is the step-by-step
-guide: the repository imported into Vercel, Supabase connected as its database, and the daily
-alert check pointed at it. What the code does for that host:
+**This is how the site is deployed**, at contractscreener.com, open to anyone with the address
+(`FOCI_PUBLIC`) and sending through Resend. [docs/VERCEL.md](docs/VERCEL.md) is the
+step-by-step guide: the repository imported into Vercel, Supabase connected as its database,
+the domain verified with Resend, and the daily alert check pointed at it. What the code does
+for that host:
 
 * `pyproject.toml` names the application for Vercel (`[tool.vercel] entrypoint`) and carries
   FastAPI and the Postgres driver as ordinary dependencies, because Vercel installs no extras.
@@ -1100,6 +1115,8 @@ alert check pointed at it. What the code does for that host:
   `FOCI_SCREEN_SECONDS` (240 on Vercel) and keeps what it finished; a run whose request ended
   is closed once it is too old to be running anywhere.
 * **Files** go to `/tmp`, and nothing calls its own address to stay awake.
+* **Links in emails** point at the production domain Vercel reports
+  (`VERCEL_PROJECT_PRODUCTION_URL`) unless `FOCI_PUBLIC_URL` is set.
 
 ### Deploying to Google Cloud
 

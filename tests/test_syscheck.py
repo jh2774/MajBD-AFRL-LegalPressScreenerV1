@@ -62,7 +62,9 @@ def test_every_setting_the_application_reads_is_one_the_check_knows():
     source = Path(config.__file__).read_text(encoding="utf-8")
     read = set(re.findall(r'(?:_env|_flag|_switch|os\.environ\.get)\(\s*"([A-Z][A-Z0-9_]+)"',
                           source))
-    hosts = {"RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID", "VERCEL"}
+    # Set by the platform, not by whoever deploys.
+    hosts = {"RENDER", "DYNO", "FLY_APP_NAME", "K_SERVICE", "WEBSITE_INSTANCE_ID", "VERCEL",
+             "VERCEL_PROJECT_PRODUCTION_URL"}
     assert read - hosts - set(syscheck.SETTINGS) == set()
     assert syscheck.HOST_SPECIFIC <= set(syscheck.SETTINGS)
 

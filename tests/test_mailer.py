@@ -77,7 +77,7 @@ class Post:
 def test_nothing_is_sent_until_a_mail_service_is_connected():
     mailer = Mailer(Cfg())
     assert mailer.status()["mode"] == "draft"
-    assert "BREVO_API_KEY" in mailer.status()["explanation"]
+    assert "RESEND_API_KEY" in mailer.status()["explanation"]
     d = mailer.send(["ko@agency.gov"], "s", "t")
     assert d.status == "drafted" and "No mail service" in d.detail
 

@@ -1,10 +1,12 @@
 # Once a day, ask the deployed site to check every watched firm and email what
-# is new. A free Render instance has no cron of its own, and this costs nothing.
+# is new. Vercel's free plan runs a schedule only once a day and a free Render
+# instance has none, so this does it, and costs nothing.
 #
-# Does nothing until two settings exist in the repository
+# Does nothing until the site's address is set in the repository
 # (Settings → Secrets and variables → Actions):
-#   variable  FOCI_SITE_URL    e.g. https://contractwatcher-4wxb.onrender.com
-#   secret    FOCI_ALERTS_KEY  an API key the site accepts (the part after "tenant:")
+#   variable  FOCI_SITE_URL    e.g. https://contractscreener.com
+#   secret    FOCI_ALERTS_KEY  only for a site that needs a key (not FOCI_PUBLIC):
+#                              an API key it accepts, the part after "tenant:"
 #
 # Also runnable by hand from the Actions tab ("Run workflow").
 name: Daily alerts
@@ -24,13 +26,17 @@ jobs:
           SITE: ${{ vars.FOCI_SITE_URL }}
           KEY: ${{ secrets.FOCI_ALERTS_KEY }}
         run: |
-          if [ -z "$SITE" ] || [ -z "$KEY" ]; then
-            echo "FOCI_SITE_URL or FOCI_ALERTS_KEY is not set, so there is nothing to do."
+          if [ -z "$SITE" ]; then
+            echo "FOCI_SITE_URL is not set, so there is nothing to do."
             exit 0
           fi
-          # A free instance sleeps when idle; the first request wakes it, which
-          # can take the better part of a minute.
+          auth=()
+          if [ -n "$KEY" ]; then
+            auth=(-H "Authorization: Bearer $KEY")
+          fi
+          # A host that sleeps when idle wakes on the first request, which can
+          # take the better part of a minute.
           curl -sS --retry 4 --retry-delay 20 --retry-all-errors --max-time 90 \
             "$SITE/health" > /dev/null || true
           curl -fsS --max-time 600 -X POST "$SITE/v1/alerts/run" \
-            -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{}'
+            "${auth[@]}" -H "Content-Type: application/json" -d '{}'

@@ -31,7 +31,7 @@ import html as html_lib
 import logging
 from datetime import datetime, timedelta, timezone
 
-from . import fund_managers
+from . import consent, fund_managers
 from . import vehicles as vehicles_engine
 from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
@@ -43,8 +43,8 @@ log = logging.getLogger("foci.alerts")
 
 FOOTER = (
     "You are receiving this because your address was added to the \"{name}\" alert "
-    "list in FOCI-Screener. To stop, ask whoever added you to remove it, or reply "
-    "to this message.\n\n"
+    "list in FOCI-Screener. To stop, use the link at the end of this email, or ask "
+    "whoever added you to remove it.\n\n"
     "Drawn from public records. This is not a FOCI determination or a finding of "
     "wrongdoing — it tells you where something changed so you can look for yourself."
 )
@@ -425,8 +425,15 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
         if not items:
             summary["emails"].append({"subscription": s["name"], "status": "nothing new"})
             continue
+        # Only to addresses that agreed. With none yet, nothing is marked as
+        # said: whoever confirms first hears what changed since the list began.
+        to, links = consent.recipients(store, s, base_url)
+        if not to:
+            summary["emails"].append({"subscription": s["name"], "items": len(items),
+                                      "status": "waiting for confirmation"})
+            continue
         subject, text, html = compose(s, items)
-        delivery = mailer.send(s["emails"], subject, text, html)
+        delivery = mailer.send(to, subject, text, html, unsubscribe=links)
         store.log_alert_delivery(
             subscription_id=s["subscription_id"], recipients=delivery.recipients,
             subject=subject, body_text=text, item_count=len(items),

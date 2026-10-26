@@ -22,6 +22,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -242,6 +243,22 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
     status       TEXT NOT NULL,
     detail       TEXT
 );
+-- Whether each address on a list has agreed to be emailed: pending (asked,
+-- not yet answered), confirmed, or unsubscribed. The token, in the links
+-- each email carries, is all that confirming or stopping takes. An address
+-- with no row was put on its list before this existed, by someone holding a
+-- key, and is taken as confirmed (`consent.recipients`).
+CREATE TABLE IF NOT EXISTS alert_recipients (
+    subscription_id TEXT NOT NULL,
+    email        TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    token        TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    added_at     TEXT NOT NULL,
+    asked_at     TEXT,
+    answered_at  TEXT,
+    PRIMARY KEY (subscription_id, email)
+);
 -- One row per tenant: what it screens for and what raises a notice. JSON
 -- rather than columns because the shape will grow, and every read wants the
 -- whole thing at once.
@@ -369,6 +386,7 @@ CREATE TABLE IF NOT EXISTS watchlists (
 """
 
 INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_recipients_token ON alert_recipients(token);
 CREATE INDEX IF NOT EXISTS idx_findings_entity ON findings(entity_key);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_tenant ON findings(tenant_id, id);
@@ -1512,6 +1530,8 @@ class Store:
             c.execute("DELETE FROM alert_subscriptions WHERE tenant_id=? AND"
                       " subscription_id=?", (self.tenant_id, subscription_id))
             c.execute("DELETE FROM alert_sent WHERE subscription_id=?", (subscription_id,))
+            c.execute("DELETE FROM alert_recipients WHERE subscription_id=?",
+                      (subscription_id,))
         return True
 
     def alert_already_sent(self, subscription_id: str) -> set[str]:
@@ -1554,6 +1574,76 @@ class Store:
         for r in rows:
             r["recipients"] = json.loads(r.get("recipients") or "[]")
         return rows
+
+    # ------------------------------------------------ who agreed to be emailed
+    def alert_recipients(self, subscription_id: str) -> dict[str, dict]:
+        """{address: consent record} for a list's addresses that have one."""
+        rows = self._query("SELECT * FROM alert_recipients WHERE subscription_id=?",
+                           (subscription_id,))
+        return {r["email"]: r for r in rows}
+
+    def add_alert_recipient(self, subscription_id: str, email: str, status: str) -> dict:
+        """Record an address as on a list, as `status`. One already pending or
+        confirmed is left as it is; one that unsubscribed starts again at
+        `status`, keeping when it was last asked, so being added back cannot
+        bring a second request to confirm the same day."""
+        existing = self.alert_recipients(subscription_id).get(email)
+        if existing and existing["status"] != "unsubscribed":
+            return existing
+        with self._tx() as c:
+            if existing:
+                c.execute("UPDATE alert_recipients SET status=?, added_at=?, answered_at=NULL"
+                          " WHERE subscription_id=? AND email=?",
+                          (status, _now(), subscription_id, email))
+            else:
+                c.execute("INSERT INTO alert_recipients (subscription_id, email, tenant_id,"
+                          " token, status, added_at) VALUES (?,?,?,?,?,?)"
+                          " ON CONFLICT (subscription_id, email) DO NOTHING",
+                          (subscription_id, email, self.tenant_id,
+                           secrets.token_urlsafe(24), status, _now()))
+        return self.alert_recipients(subscription_id)[email]
+
+    def mark_alert_recipient_asked(self, subscription_id: str, email: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE alert_recipients SET asked_at=? WHERE subscription_id=?"
+                      " AND email=?", (_now(), subscription_id, email))
+
+    def alert_recipient_last_asked(self, email: str) -> str:
+        """When this address was last asked to confirm, for any list of any
+        tenant, or "" if never: a request a day is the most anyone gets."""
+        row = self._one("SELECT MAX(asked_at) AS asked FROM alert_recipients WHERE email=?",
+                        (email,))
+        return str((row or {}).get("asked") or "")
+
+    def alert_recipients_asked_since(self, when: str) -> int:
+        """Requests to confirm sent since `when`, by every tenant: the mail
+        service's daily allowance is the site's, not one tenant's."""
+        row = self._one("SELECT COUNT(*) AS n FROM alert_recipients WHERE asked_at >= ?",
+                        (when,))
+        return int(row["n"]) if row else 0
+
+    def alert_recipient_by_token(self, token: str) -> dict | None:
+        """Whichever tenant's it is: the token is the whole of the authority to
+        confirm or stop that one address's emails."""
+        return self._one("SELECT * FROM alert_recipients WHERE token=?", (token,))
+
+    def answer_alert_recipient(self, token: str, status: str) -> dict | None:
+        """Record a confirmation or an unsubscribe. Unsubscribing also takes
+        the address off its list, so nobody keeps seeing it there."""
+        row = self.alert_recipient_by_token(token)
+        if not row:
+            return None
+        sub = self._one("SELECT emails FROM alert_subscriptions WHERE subscription_id=?",
+                        (row["subscription_id"],))
+        with self._tx() as c:
+            c.execute("UPDATE alert_recipients SET status=?, answered_at=? WHERE token=?",
+                      (status, _now(), token))
+            if status == "unsubscribed" and sub:
+                left = [e for e in json.loads(sub.get("emails") or "[]") if e != row["email"]]
+                c.execute("UPDATE alert_subscriptions SET emails=?, updated_at=?"
+                          " WHERE subscription_id=?",
+                          (json.dumps(left), _now(), row["subscription_id"]))
+        return {**row, "status": status}
 
     def notices_for_entities(self, entity_keys: list[str], limit: int = 200) -> list[dict]:
         if not entity_keys:

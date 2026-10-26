@@ -28,7 +28,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import alerts as alerts_engine
-from .. import fund_managers, syscheck
+from .. import consent, fund_managers, syscheck
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from .. import vehicles as vehicles_engine
@@ -48,6 +48,7 @@ from ..notify.mailer import Mailer
 from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_available
 from . import auth
 from .schemas import (
+    MAX_ALERT_RECIPIENTS,
     AlertSubscriptionRequest,
     IdentityDecision,
     ManagerRequest,
@@ -66,7 +67,12 @@ log = logging.getLogger("foci.api")
 
 cfg = get_config()
 keymap = auth.parse_keys(cfg.api_keys)
-require_tenant = auth.make_dependency(keymap)
+require_tenant = auth.make_dependency(keymap, public=cfg.public)
+# Removing recorded work, changing how the site screens for everyone, and
+# approving a notice to a federal official. The same as require_tenant unless
+# the site is public, where these alone need a key.
+require_admin = auth.make_admin_dependency(keymap, public=cfg.public)
+is_admin = auth.make_admin_flag(keymap, public=cfg.public)
 queue = JobQueue(cfg)
 
 app = FastAPI(
@@ -99,6 +105,10 @@ def store_for(tenant: str) -> Store:
 
 
 def tenant_store(tenant: str = Depends(require_tenant)) -> Store:
+    return store_for(tenant)
+
+
+def admin_store(tenant: str = Depends(require_admin)) -> Store:
     return store_for(tenant)
 
 
@@ -138,10 +148,11 @@ def deployment_warnings() -> list[str]:
     host = cfg.managed_host
     on_sqlite = not cfg.dsn.startswith("postgres")
 
-    if not keymap:
+    if not keymap and not cfg.public:
         warnings.append(
             "FOCI_API_KEYS is not set: every authenticated route returns 503 and "
-            "the web interface will show nothing.")
+            "the web interface will show nothing. To open the site to anyone with "
+            "its address instead, set FOCI_PUBLIC=true.")
     if storage_is_ephemeral():
         warnings.append(
             f"This database will not survive a restart. It is SQLite on {host}'s "
@@ -267,7 +278,7 @@ for _warning in deployment_warnings():
     # logging may not be configured yet under some servers, so print as well.
     log.error(_warning)
     print(f"\n*** {_warning}\n", flush=True)
-if not keymap:
+if not keymap and not cfg.public:
     # The long form says how to set it; the health warning stays short enough
     # to read in a banner.
     print(f"*** {auth.STARTUP_WARNING}\n", flush=True)
@@ -290,6 +301,8 @@ def health() -> dict:
             "revision": syscheck.revision(os.environ),
             "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
             "authenticated": bool(keymap),
+            # Open to anyone with the address; a key is then for admin only.
+            "public": cfg.public,
             "ephemeral_storage": storage_is_ephemeral(),
             # Whether alert emails actually leave: send, redirect, draft or
             # misconfigured — and through which service. No addresses, no keys.
@@ -305,14 +318,15 @@ def _probe_client():
 
 
 @app.get("/v1/system/check", tags=["meta"])
-def system_check(request: Request, store: Store = Depends(tenant_store)) -> dict:
+def system_check(request: Request, store: Store = Depends(admin_store)) -> dict:
     """Try, for real, each thing this deployment has to be able to do, and
     count what is stored.
 
     For moving between hosts: the checks say whether a new site can do the
     work, not merely answer; the counts, read on the old site and the new,
     say whether everything was copied. Takes a few seconds. Settings are
-    named, never shown.
+    named, never shown. On a public site it needs the admin key: each check
+    writes to the database and asks six outside services.
     """
     return syscheck.run(cfg, store, _probe_client(), _base_url(request),
                         Mailer(cfg).status(), environ=os.environ,
@@ -320,12 +334,14 @@ def system_check(request: Request, store: Store = Depends(tenant_store)) -> dict
 
 
 @app.get("/v1/config", tags=["meta"])
-def configuration(tenant: str = Depends(require_tenant)) -> dict:
+def configuration(tenant: str = Depends(require_tenant),
+                  admin: bool = Depends(is_admin)) -> dict:
     """Which connectors this deployment can actually run."""
+    redirect = cfg.email_redirect_to if admin else consent.mask_text(cfg.email_redirect_to)
     return {"tenant": tenant, "connectors": cfg.availability(),
             "queue": queue.backend,
             "gmail": {"enabled": cfg.gmail_enabled, "send": cfg.gmail_send,
-                      "redirect_to": cfg.email_redirect_to or None}}
+                      "redirect_to": redirect or None}}
 
 
 # ---------------------------------------------------------------- screens
@@ -425,7 +441,7 @@ def list_screens(limit: int = Query(25, ge=1, le=200),
 
 @app.delete("/v1/screens/{run_id}", tags=["screens"])
 def delete_screen(run_id: str, confirm: bool = Query(False),
-                  store: Store = Depends(tenant_store)) -> dict:
+                  store: Store = Depends(admin_store)) -> dict:
     """Remove a screen and everything it recorded.
 
     Without `confirm=true` this reports what would go and deletes nothing,
@@ -957,22 +973,56 @@ def find_fund_managers(entity_key: str, body: ManagerRequest,
 
 # ------------------------------------------------------------ email alerts
 
+def _shown_list(store: Store, sub: dict, admin: bool) -> dict:
+    """A list as the page shows it: each address and whether it has agreed.
+
+    On a public site a visitor sees addresses masked — a list holds people at
+    other organisations, and the page is open to anyone. Holding the admin
+    key shows them in full.
+    """
+    recipients = consent.statuses(store, sub)
+    if not admin:
+        recipients = [{**r, "email": consent.mask(r["email"])} for r in recipients]
+    return {**sub, "emails": [r["email"] for r in recipients],
+            "recipients": recipients, "can_edit_addresses": admin}
+
+
+def _shown_delivery(d: dict, admin: bool) -> dict:
+    if admin:
+        return d
+    return {**d, "recipients": [consent.mask(a) for a in d["recipients"]],
+            **{k: consent.mask_text(d.get(k) or "") for k in ("subject", "detail",
+                                                              "body_text")}}
+
+
 @app.get("/v1/alerts", tags=["alerts"])
-def get_alerts(store: Store = Depends(tenant_store)) -> dict:
+def get_alerts(store: Store = Depends(tenant_store),
+               admin: bool = Depends(is_admin)) -> dict:
     """Subscriptions, what sending will do, and what was sent recently."""
-    return {"sending": Mailer(cfg).status(),
-            "subscriptions": store.alert_subscriptions(),
-            "deliveries": store.alert_deliveries(limit=30)}
+    sending = Mailer(cfg).status()
+    if not admin:
+        sending = {**sending, "explanation": consent.mask_text(sending["explanation"])}
+    return {"sending": sending, "public": cfg.public, "can_edit_addresses": admin,
+            "subscriptions": [_shown_list(store, s, admin)
+                              for s in store.alert_subscriptions()],
+            "deliveries": [_shown_delivery(d, admin)
+                           for d in store.alert_deliveries(limit=30)]}
 
 
 @app.post("/v1/alerts/subscriptions", tags=["alerts"])
-def save_subscription(body: AlertSubscriptionRequest,
-                      store: Store = Depends(tenant_store)) -> dict:
+def save_subscription(body: AlertSubscriptionRequest, request: Request,
+                      store: Store = Depends(tenant_store),
+                      admin: bool = Depends(is_admin)) -> dict:
     """Create or update who is emailed about a portfolio.
 
     Whatever is already known about the portfolio's companies is marked as
     sent, so the first email is about something that happens next — not the
     firm's history presented as news.
+
+    An address added here by a visitor to a public site is sent a request to
+    confirm and nothing else until it does (`consent`). Such a visitor adds
+    to a list; taking an address off is for the address itself, through the
+    link in every email, or for someone holding the admin key.
     """
     try:
         loaded = portfolio_keys.decode(body.portfolio_key)
@@ -983,21 +1033,114 @@ def save_subscription(body: AlertSubscriptionRequest,
     existing = store.alert_subscription(body.subscription_id) \
         if body.subscription_id else None
     before = set(existing["companies"]) if existing else set()
+    had = existing["emails"] if existing else []
 
+    emails = body.emails if admin else list(dict.fromkeys(had + body.emails))
+    if not emails:
+        raise HTTPException(400, "Add at least one email address.")
+    if len(emails) > MAX_ALERT_RECIPIENTS:
+        raise HTTPException(400, f"A list holds at most {MAX_ALERT_RECIPIENTS} addresses.")
     sub_id = store.save_alert_subscription(
         subscription_id=body.subscription_id if existing else "",
         name=(body.name or loaded.name).strip() or loaded.name,
-        emails=body.emails, companies=companies,
-        portfolio_key=body.portfolio_key, active=body.active)
+        emails=emails, companies=companies, portfolio_key=body.portfolio_key,
+        active=body.active if admin or not existing else existing["active"])
+    sub = store.alert_subscription(sub_id)
+    asked = consent.add(store, Mailer(cfg), sub, [e for e in emails if e not in had],
+                        _base_url(request), trusted=admin)
+    if not admin:
+        asked = {k: [consent.mask(a) if isinstance(a, str)
+                     else {**a, "email": consent.mask(a["email"])} for a in v]
+                 for k, v in asked.items()}
     baselined = alerts_engine.baseline(store, sub_id,
                                        [c for c in companies if c not in before])
-    return {"subscription": store.alert_subscription(sub_id), "baselined": baselined}
+    return {"subscription": _shown_list(store, sub, admin), "baselined": baselined,
+            "consent": asked}
+
+
+# ----------------------------------------- confirming, and stopping, by email
+#
+# The links in a request to confirm and at the foot of every alert. The token
+# in them is the whole of the authority, and covers one address on one list.
+# Opening a link shows a button; the button (a POST) acts. Mail programs that
+# offer "Unsubscribe" send that POST themselves (List-Unsubscribe-Post).
+
+def _recipient(token: str) -> tuple[dict | None, dict | None]:
+    row = store_for(auth.DEFAULT_TENANT).alert_recipient_by_token(token)
+    if not row:
+        return None, None
+    return row, store_for(row["tenant_id"]).alert_subscription(row["subscription_id"])
+
+
+def _page(title: str, message: str, status: int = 200, **kw) -> HTMLResponse:
+    return HTMLResponse(consent.page(title, message, **kw), status_code=status,
+                        headers={"Cache-Control": "no-store"})
+
+
+GONE = ("This link is no longer valid. The list it belonged to may have been removed. "
+        "Nothing will be sent to you from it.")
+
+
+@app.get("/alerts/confirm/{token}", include_in_schema=False)
+def confirm_page(token: str) -> HTMLResponse:
+    row, sub = _recipient(token)
+    if not row or not sub:
+        return _page("Link no longer valid", GONE, 404)
+    name = sub["name"]
+    if row["status"] == consent.CONFIRMED:
+        return _page("Already confirmed", f"This address already receives alerts for "
+                                          f"\"{name}\".")
+    if row["status"] == consent.UNSUBSCRIBED:
+        return _page("You stopped these alerts",
+                     f"This address was taken off \"{name}\". To receive its alerts "
+                     f"again, ask to be added back; a new request to confirm will follow.")
+    return _page("Confirm email alerts",
+                 f"Press the button to start receiving alerts for \"{name}\": an email "
+                 f"when something changes for the companies it watches.",
+                 button="Confirm alerts",
+                 note="Every alert has a link at the end to stop them.")
+
+
+@app.post("/alerts/confirm/{token}", include_in_schema=False)
+def confirm_recipient(token: str) -> HTMLResponse:
+    row, sub = _recipient(token)
+    if not row or not sub:
+        return _page("Link no longer valid", GONE, 404)
+    if row["status"] == consent.UNSUBSCRIBED:
+        return confirm_page(token)
+    store_for(row["tenant_id"]).answer_alert_recipient(token, consent.CONFIRMED)
+    return _page("Confirmed", f"This address will receive alerts for \"{sub['name']}\". "
+                              f"The first is sent when something next changes.",
+                 note="To stop at any time, use the link at the end of any alert.")
+
+
+@app.get("/alerts/stop/{token}", include_in_schema=False)
+def stop_page(token: str) -> HTMLResponse:
+    row, sub = _recipient(token)
+    if not row or not sub:
+        return _page("Link no longer valid", GONE, 404)
+    if row["status"] == consent.UNSUBSCRIBED:
+        return _page("Already stopped", f"This address no longer receives alerts for "
+                                        f"\"{sub['name']}\".")
+    return _page("Stop these alerts", f"Press the button and this address will be taken "
+                                      f"off \"{sub['name']}\". Nothing more will be sent "
+                                      f"to it from this list.", button="Stop alerts")
+
+
+@app.post("/alerts/stop/{token}", include_in_schema=False)
+def stop_recipient(token: str) -> HTMLResponse:
+    row, sub = _recipient(token)
+    if not row or not sub:
+        return _page("Link no longer valid", GONE, 404)
+    store_for(row["tenant_id"]).answer_alert_recipient(token, consent.UNSUBSCRIBED)
+    return _page("Stopped", f"This address has been taken off \"{sub['name']}\". Nothing "
+                            f"more will be sent to it from this list.")
 
 
 @app.delete("/v1/alerts/subscriptions/{subscription_id}", status_code=204,
             tags=["alerts"])
 def delete_subscription(subscription_id: str,
-                        store: Store = Depends(tenant_store)) -> Response:
+                        store: Store = Depends(admin_store)) -> Response:
     if not store.delete_alert_subscription(subscription_id):
         raise HTTPException(404, "No such alert list.")
     return Response(status_code=204)
@@ -1030,9 +1173,27 @@ def _keep_awake_for_alerts(request: Request) -> None:
                   _alerts_running.locked)).start()
 
 
+# On a public site, how soon "Check now" may run again, and a test email be
+# sent to the same list again. Each check reads every watched firm from the
+# SEC, and each test lands in every inbox on a list.
+CHECK_AGAIN_MINUTES = 10
+TEST_AGAIN_MINUTES = 10
+
+
+def _minutes_ago(stamp: str) -> float:
+    try:
+        when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return float("inf")
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 60
+
+
 @app.post("/v1/alerts/run", tags=["alerts"])
 def run_alerts(request: Request, only_if_due: bool = Query(False),
-               store: Store = Depends(tenant_store)) -> dict:
+               store: Store = Depends(tenant_store),
+               admin: bool = Depends(is_admin)) -> dict:
     """Check every watched firm and company now and email what is new.
 
     A free instance has no scheduler, so something has to ask. Two things do:
@@ -1049,6 +1210,10 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
         return {"status": "paused", "emails": [], "detail": ALERTS_PAUSED_NOTE}
     if only_if_due and not alerts_engine.is_due(store):
         return {"status": "not due", "emails": []}
+    if not admin and not alerts_engine.is_due(store, hours=CHECK_AGAIN_MINUTES / 60):
+        return {"status": "recently checked", "emails": [],
+                "detail": f"Every list was checked within the last {CHECK_AGAIN_MINUTES} "
+                          f"minutes. Try again in a few minutes."}
     if not _alerts_running.acquire(blocking=False):
         return busy
     try:
@@ -1070,25 +1235,43 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
 
 
 @app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])
-def test_subscription(subscription_id: str,
-                      store: Store = Depends(tenant_store)) -> dict:
-    """Send one short test email to a list, to prove delivery works."""
+def test_subscription(subscription_id: str, request: Request,
+                      store: Store = Depends(tenant_store),
+                      admin: bool = Depends(is_admin)) -> dict:
+    """Send one short test email to a list, to prove delivery works.
+
+    To the addresses that have confirmed, each with its own link to stop.
+    """
     sub = store.alert_subscription(subscription_id)
     if not sub:
         raise HTTPException(404, "No such alert list.")
     subject = f"FOCI-Screener: test alert for \"{sub['name']}\""
+    if not admin:
+        last = next((d for d in store.alert_deliveries(subscription_id, limit=10)
+                     if d["subject"] == subject), None)
+        if last and _minutes_ago(last["created_at"]) < TEST_AGAIN_MINUTES:
+            raise HTTPException(429, f"A test was sent to this list in the last "
+                                     f"{TEST_AGAIN_MINUTES} minutes. It can take a minute "
+                                     f"to arrive; check spam folders too.")
+    to, links = consent.recipients(store, sub, _base_url(request))
+    if not to:
+        return {"status": "waiting", "recipients": [],
+                "detail": "Nobody on this list has confirmed yet. Each address was sent "
+                          "a link to confirm; alerts, and tests, go to those that have."}
     text = (f"This is a test from FOCI-Screener. You are on the \"{sub['name']}\" alert "
             f"list, which watches {len(sub['companies'])} compan"
             f"{'y' if len(sub['companies']) == 1 else 'ies'}. When one of them changes, "
             f"an email like this will say what changed and where to look.\n\n"
             + alerts_engine.FOOTER.format(name=sub["name"]))
-    delivery = Mailer(cfg).send(sub["emails"], subject, text)
+    delivery = Mailer(cfg).send(to, subject, text, unsubscribe=links)
     store.log_alert_delivery(subscription_id=subscription_id,
                              recipients=delivery.recipients, subject=subject,
                              body_text=text, item_count=0, status=delivery.status,
                              detail=delivery.detail)
-    return {"status": delivery.status, "recipients": delivery.recipients,
-            "detail": delivery.detail}
+    shown = _shown_delivery({"recipients": delivery.recipients, "detail": delivery.detail},
+                            admin)
+    return {"status": delivery.status, "recipients": shown["recipients"],
+            "detail": shown["detail"]}
 
 
 # -------------------------------------------------------------- type-ahead
@@ -1394,7 +1577,7 @@ def list_rules(store: Store = Depends(tenant_store)) -> dict:
 
 @app.put("/v1/rules/{rule_id}", tags=["rules"])
 def set_rule(rule_id: str, body: RuleSetting,
-             tenant: str = Depends(require_tenant)) -> dict:
+             tenant: str = Depends(require_admin)) -> dict:
     """Override a rule for this tenant. Takes effect on the next screen."""
     store = store_for(tenant)
     store.set_rule_setting(
@@ -1404,7 +1587,7 @@ def set_rule(rule_id: str, body: RuleSetting,
 
 
 @app.delete("/v1/rules/{rule_id}", status_code=204, tags=["rules"])
-def clear_rule(rule_id: str, tenant: str = Depends(require_tenant)) -> Response:
+def clear_rule(rule_id: str, tenant: str = Depends(require_admin)) -> Response:
     """Drop the override and go back to the engine default."""
     store_for(tenant).clear_rule_setting(rule_id)
     return Response(status_code=204)
@@ -1436,7 +1619,7 @@ def get_policy(store: Store = Depends(tenant_store)) -> dict:
 
 
 @app.put("/v1/policy", tags=["policy"])
-def set_policy(body: dict, tenant: str = Depends(require_tenant)) -> dict:
+def set_policy(body: dict, tenant: str = Depends(require_admin)) -> dict:
     """Save a policy. Takes effect on the next screen.
 
     Anything inconsistent is corrected rather than refused — a notice for a
@@ -1455,7 +1638,7 @@ def set_policy(body: dict, tenant: str = Depends(require_tenant)) -> dict:
 
 
 @app.delete("/v1/policy", status_code=204, tags=["policy"])
-def reset_policy(tenant: str = Depends(require_tenant)) -> Response:
+def reset_policy(tenant: str = Depends(require_admin)) -> Response:
     """Back to the defaults, and to any later change in what they are."""
     store_for(tenant).clear_screening_policy()
     return Response(status_code=204)
@@ -1606,7 +1789,7 @@ def list_watchlists(store: Store = Depends(tenant_store)) -> dict:
 
 @app.put("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
 def set_watchlist_policy(watchlist_id: str, body: dict,
-                         store: Store = Depends(tenant_store)) -> dict:
+                         store: Store = Depends(admin_store)) -> dict:
     """Replace the settings this watchlist overrides. Takes effect on its next run.
 
     Name only what differs from the tenant policy — `{"notice_min_severity":
@@ -1623,7 +1806,7 @@ def set_watchlist_policy(watchlist_id: str, body: dict,
 
 @app.delete("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
 def clear_watchlist_policy(watchlist_id: str,
-                           store: Store = Depends(tenant_store)) -> dict:
+                           store: Store = Depends(admin_store)) -> dict:
     """Back to the tenant policy for everything."""
     if not store.set_watchlist_policy(watchlist_id, None):
         raise HTTPException(404, "No such watchlist.")
@@ -1648,7 +1831,7 @@ def run_watchlist(watchlist_id: str, request: Request,
 
 @app.delete("/v1/watchlists/{watchlist_id}", tags=["watchlists"])
 def deactivate_watchlist(watchlist_id: str,
-                         store: Store = Depends(tenant_store)) -> dict:
+                         store: Store = Depends(admin_store)) -> dict:
     if not store.set_watchlist_active(watchlist_id, False):
         raise HTTPException(404, "No such watchlist.")
     return {"watchlist_id": watchlist_id, "active": False}
@@ -1714,7 +1897,7 @@ def _decision_error(outcome: str) -> None:
 
 @app.post("/v1/notices/{notice_id}/approve", tags=["notices"])
 def approve_notice(notice_id: str, body: NoticeDecision,
-                   tenant: str = Depends(require_tenant)) -> dict:
+                   tenant: str = Depends(require_admin)) -> dict:
     """Approve a notice for delivery, optionally with an edited body.
 
     Approval records a decision; it does not itself send. Delivery still depends
@@ -1750,7 +1933,7 @@ def approve_notice(notice_id: str, body: NoticeDecision,
 
 @app.post("/v1/notices/{notice_id}/reject", tags=["notices"])
 def reject_notice(notice_id: str, body: NoticeDecision,
-                  tenant: str = Depends(require_tenant)) -> dict:
+                  tenant: str = Depends(require_admin)) -> dict:
     """Reject a notice.
 
     Worth capturing the reason: rejections are the only labelled false-positive

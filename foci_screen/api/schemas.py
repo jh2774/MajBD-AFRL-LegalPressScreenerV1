@@ -79,7 +79,10 @@ class AlertSubscriptionRequest(BaseModel):
     """Who to email about a portfolio. Companies come from the portfolio key."""
     subscription_id: str = Field("", max_length=40)
     name: str = Field("Portfolio", max_length=120)
-    emails: list[str] = Field(..., min_length=1, max_length=MAX_ALERT_RECIPIENTS)
+    # May be empty when updating a list: a visitor to a public site adds to
+    # the addresses already on it rather than restating them (they are not
+    # shown in full). The route refuses a list that would end up with none.
+    emails: list[str] = Field(default_factory=list, max_length=MAX_ALERT_RECIPIENTS)
     portfolio_key: str = Field(..., min_length=1, max_length=64_000)
     active: bool = True
 
@@ -95,8 +98,6 @@ class AlertSubscriptionRequest(BaseModel):
                 (cleaned if re.match(EMAIL_RX, part) else bad).append(part.lower())
         if bad:
             raise ValueError(f"Not an email address: {', '.join(bad[:5])}")
-        if not cleaned:
-            raise ValueError("Add at least one email address.")
         self.emails = list(dict.fromkeys(cleaned))[:MAX_ALERT_RECIPIENTS]
         return self
 
