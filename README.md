@@ -361,6 +361,43 @@ draft. Set `FOCI_EMAIL_REDIRECT_TO` to your own address for the entirety of any 
 
 An unresolved KO is never guessed at: the notice is written to disk and logged as `suppressed`.
 
+**Only an approved notice reaches Gmail.** `screen --notify` and `notify --run` write each
+notice as an `.eml` file to read and nothing more, whatever the guards say; every screen also
+queues its notices for review, and approval is the only way on to Gmail.
+
+### From approval to Gmail
+
+Approving a notice in the review queue is the decision; delivery follows it, under the same
+three guards. What an approval turns into:
+
+| Settings | The notice becomes | Status |
+|---|---|---|
+| `GMAIL_ENABLED=false` (default) | Nothing leaves. Download the `.eml` and route it by hand | `approved`, with the reason |
+| `GMAIL_ENABLED=true` | A **Gmail draft** for a person to open and send | `drafted` |
+| `GMAIL_ENABLED=true`, `GMAIL_SEND=true` | Sent | `sent` |
+
+What goes to Gmail is the **approved text** — the reviewer's edit if there was one — not a
+re-render of the finding. With `FOCI_EMAIL_REDIRECT_TO` set it goes to that address instead,
+with the intended officer named in the subject (`[for ko@agency.mil] …`). Every delivered notice
+records where it went and when; the review queue shows it on the card.
+
+Delivery that does not happen leaves the approval standing. Approved while Gmail was off, not
+yet signed in, or refused by Gmail: the card says why and offers **Deliver now**, and
+`foci-screen deliver-notices` sweeps every such notice at once. Nothing can be delivered that a
+person has not approved, and nothing is delivered twice.
+
+**Sign in once, from a machine with a browser:**
+
+```bash
+foci-screen gmail-auth          # writes token.json (GMAIL_TOKEN)
+foci-screen deliver-notices     # anything approved while it was off
+```
+
+The web service never starts a sign-in itself — there is nobody to complete it, and the request
+would hang. On a server, copy `token.json` to the path `GMAIL_TOKEN` names. `/health` reports
+what an approval turns into (`notices.mode`) and warns when Gmail is switched on with no
+sign-in in place.
+
 ---
 
 ## Running as a service
@@ -421,7 +458,8 @@ every night on a deploy that was screening nothing.
 | `PUT / DELETE /v1/watchlists/{id}/policy` | The screening-policy settings one watchlist changes — the rest follow the tenant |
 | `POST /v1/watchlists/{id}/resume` | Put a paused watchlist back on the nightly sweep (`DELETE /v1/watchlists/{id}` pauses it) |
 | `GET /v1/notices` | The review queue |
-| `POST /v1/notices/{id}/approve` | The human gate. Records a decision — does not send |
+| `POST /v1/notices/{id}/approve` | The human gate. Records the decision, then hands the notice to Gmail if delivery is switched on |
+| `POST /v1/notices/{id}/deliver` | Try again for an approved notice that has not reached Gmail |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |
 
 **Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset, every

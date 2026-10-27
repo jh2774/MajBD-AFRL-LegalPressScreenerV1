@@ -2226,7 +2226,12 @@ async function viewNotices() {
              <button class="reject">Reject</button>`
           : `<span class="muted" style="align-self:center">
                decided by ${esc(n.decided_by || "—")}${n.decision_note ? ` · ${esc(n.decision_note)}` : ""}</span>`}
+        ${n.status === "approved"
+          ? `<button class="deliver" title="Hand this approved notice to Gmail">Deliver now</button>`
+          : ""}
       </div>
+      ${noticeDelivery(n)}
+      <div class="deliver-error error" hidden></div>
       <div class="decide-panel" hidden>
         <div class="edit-area" hidden>
           <label class="decide-prompt" for="body-${esc(n.notice_id)}">
@@ -2252,8 +2257,9 @@ async function viewNotices() {
   view.innerHTML = `
     <div class="page-head">
       <h1>Notices</h1>
-      <div class="sub">${pending} awaiting review. Approving records a decision —
-        it does not transmit anything unless Gmail delivery is armed on the server.</div>
+      <div class="sub">${pending} awaiting review. Approving records a decision and
+        hands the notice to Gmail if delivery is switched on for this server — as a
+        draft for someone to send, unless sending has been turned on as well.</div>
     </div>${cards}`;
 
   const PROMPTS = {
@@ -2283,6 +2289,20 @@ async function viewNotices() {
     const errorBox = panel.querySelector(".panel-error");
     const dl = card.querySelector(".dl");
     if (dl) dl.onclick = () => downloadNotice(id);
+    const dv = card.querySelector(".deliver");
+    if (dv) dv.onclick = async () => {
+      const box = card.querySelector(".deliver-error");
+      dv.disabled = true;
+      try {
+        await apiPost(`/v1/notices/${encodeURIComponent(id)}/deliver`, {});
+        route();
+      } catch (e) {
+        box.innerHTML = `<strong>${esc(e.title)}</strong>
+          <div class="muted" style="margin-top:4px">${esc(e.message)}</div>`;
+        box.hidden = false;
+        dv.disabled = false;
+      }
+    };
 
     const open = (mode) => {
       panel.querySelector(".note-prompt").textContent = PROMPTS[mode].label;
@@ -2320,6 +2340,23 @@ async function viewNotices() {
     const cancel = card.querySelector(".cancel");
     if (cancel) cancel.onclick = () => { panel.hidden = true; };
   });
+}
+
+/* Where an approved notice went. Approval and delivery are separate events,
+ * and a reviewer should never have to guess which one happened. */
+function noticeDelivery(n) {
+  const line = (text) =>
+    `<div class="muted" style="font-size:12.5px;margin-top:6px">${text}</div>`;
+  if (n.status === "drafted")
+    return line(`Gmail draft created for <span class="mono">${esc(n.delivered_to || "")}</span>
+      · ${esc(day(n.delivered_at))}. It has not been sent; open Gmail's drafts to send it.`);
+  if (n.status === "sent")
+    return line(`Sent through Gmail to <span class="mono">${esc(n.delivered_to || "")}</span>
+      · ${esc(day(n.delivered_at))}.`);
+  if (n.status === "approved")
+    return line(`<strong>Not delivered.</strong> ${esc(n.delivery_detail ||
+      "Approved before delivery was attempted.")}`);
+  return "";
 }
 
 function plainDiff(lines) {

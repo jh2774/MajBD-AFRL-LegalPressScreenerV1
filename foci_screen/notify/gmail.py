@@ -15,6 +15,15 @@ The guards, outermost first:
 Default posture with no configuration: notices are written to disk as .eml
 files and nothing touches the network.
 
+One way in: `deliver_notice`, which takes a row from the review queue once a
+person has approved it, and sends the approved text — which may have been
+edited — rather than a re-render. There is deliberately no path from a raw
+finding to Gmail; `render_finding` (the CLI's `--notify`) only writes .eml
+files. `deliver_notice` runs inside the web service, where there is nobody to
+complete a browser sign-in, so it never starts one: without a usable token.json
+it reports why and the notice stays approved, to be delivered once
+`foci-screen gmail-auth` has been run.
+
 Why drafts rather than sends, even once enabled: these notices go to federal
 contracting officers about named companies. A false positive mailed
 automatically is a real harm to a real contractor. A human should read each one.
@@ -30,7 +39,8 @@ Setup:
   3. Credentials -> OAuth client ID -> Desktop app -> download credentials.json
   4. pip install google-api-python-client google-auth-oauthlib
   5. set GMAIL_ENABLED=true and GMAIL_SENDER=you@yourdomain.gov in .env
-  6. first run opens a browser once and writes token.json
+  6. `foci-screen gmail-auth` opens a browser once and writes token.json
+     (on a server, run it locally and copy token.json to GMAIL_TOKEN)
 """
 from __future__ import annotations
 
@@ -65,6 +75,7 @@ class GmailNotifier:
     def __init__(self, config) -> None:
         self.cfg = config
         self._service = None
+        self.connect_error = ""
 
     # ------------------------------------------------------------- guards
     def _resolve_recipient(self, finding: Finding) -> tuple[str, str]:
@@ -79,57 +90,97 @@ class GmailNotifier:
         return officer.email, f"resolved from {officer.source} ({officer.confidence})"
 
     # ------------------------------------------------------------ delivery
-    def deliver(self, finding: Finding, run_id: str = "") -> DeliveryResult:
+    def render_finding(self, finding: Finding, run_id: str = "") -> DeliveryResult:
+        """Write a finding's notice to disk as an .eml. Never touches Gmail.
+
+        This is what the CLI's `--notify` and `notify --run` produce. It used to
+        be a delivery path in its own right, drafting or sending straight from
+        a finding once GMAIL_ENABLED was set — past the review queue, so a
+        notice could reach Gmail without anyone having approved it. Gmail is
+        now reachable only through `deliver_notice`, which takes a notice a
+        person has approved. Whatever the settings, this writes a file.
+        """
         recipient, note = self._resolve_recipient(finding)
         subject = render.subject_for(finding)
-
+        sender = self.cfg.gmail_sender or "foci-screen@localhost"
         if not recipient:
-            path = render.write_eml(finding, self.cfg.out_dir,
-                                    sender=self.cfg.gmail_sender or "foci-screen@localhost",
+            path = render.write_eml(finding, self.cfg.out_dir, sender=sender,
                                     recipient="UNRESOLVED-KO@example.invalid",
                                     run_id=run_id)
             return DeliveryResult("suppressed", "", subject,
                                   detail=note, path=str(path))
+        path = render.write_eml(finding, self.cfg.out_dir, sender=sender,
+                                recipient=recipient, run_id=run_id)
+        return DeliveryResult("rendered", recipient, subject,
+                              detail=f"wrote .eml for reading; {note}", path=str(path))
 
-        # Guard 1 — the whole Gmail path is off by default.
+    def deliver_notice(self, notice: dict, *, interactive: bool = False) -> DeliveryResult:
+        """Hand one approved notice to Gmail, under the same three guards.
+
+        The caller is responsible for the notice being approved; this only
+        decides where it goes and how. Outcomes:
+
+          * rendered — GMAIL_ENABLED is false. Nothing left; the .eml can be
+            downloaded from the review queue and routed by hand.
+          * drafted / sent — Gmail accepted it.
+          * error — Gmail was meant to take it and did not. The reason is kept
+            and the notice can be tried again.
+        """
+        intended = (notice.get("recipient") or "").strip()
+        subject = notice.get("subject") or "FOCI/IP screening notice"
+        if not intended:
+            return DeliveryResult("error", "", subject,
+                                  detail="no contracting officer address on the notice")
+
+        recipient, note = intended, f"addressed to {intended}"
+        if self.cfg.email_redirect_to:
+            # The intended officer goes in the subject, as the alert mailer
+            # does, so whoever reads the pilot inbox can see who it was for.
+            recipient = self.cfg.email_redirect_to
+            subject = f"[for {intended}] {subject}"
+            note = f"redirected from {intended} by FOCI_EMAIL_REDIRECT_TO"
+
         if not self.cfg.gmail_enabled:
-            path = render.write_eml(finding, self.cfg.out_dir,
-                                    sender=self.cfg.gmail_sender or "foci-screen@localhost",
-                                    recipient=recipient, run_id=run_id)
             return DeliveryResult("rendered", recipient, subject,
-                                  detail=f"GMAIL_ENABLED is false; wrote .eml. {note}",
-                                  path=str(path))
+                                  detail="GMAIL_ENABLED is false, so nothing was sent; "
+                                         "download the .eml to route it by hand.")
 
-        service = self._connect()
+        service = self._connect(interactive=interactive)
         if service is None:
-            path = render.write_eml(finding, self.cfg.out_dir,
-                                    sender=self.cfg.gmail_sender or "foci-screen@localhost",
-                                    recipient=recipient, run_id=run_id)
             return DeliveryResult("error", recipient, subject,
-                                  detail="Gmail client unavailable; wrote .eml instead",
-                                  path=str(path))
+                                  detail=self.connect_error or "Gmail client unavailable")
 
-        msg = render.build_message(finding, sender=self.cfg.gmail_sender,
-                                   recipient=recipient, run_id=run_id)
+        msg = render.message_from_notice({**notice, "subject": subject},
+                                         sender=self.cfg.gmail_sender,
+                                         recipient=recipient)
         raw = base64.urlsafe_b64encode(bytes(msg)).decode()
-
         try:
-            # Guard 2 — sending requires an explicit second opt-in.
             if self.cfg.gmail_send:
                 sent = service.users().messages().send(
                     userId="me", body={"raw": raw}).execute()
                 return DeliveryResult("sent", recipient, subject,
-                                      detail=f"gmail message id {sent.get('id')}. {note}")
+                                      detail=f"gmail message id {sent.get('id')}; {note}")
             draft = service.users().drafts().create(
                 userId="me", body={"message": {"raw": raw}}).execute()
             return DeliveryResult("drafted", recipient, subject,
-                                  detail=f"gmail draft id {draft.get('id')}. {note}")
-        except Exception as exc:  # pragma: no cover - needs live creds
-            log.warning("gmail delivery failed: %s", exc)
-            return DeliveryResult("error", recipient, subject, detail=str(exc))
+                                  detail=f"gmail draft id {draft.get('id')}; {note}")
+        except Exception as exc:  # noqa: BLE001 - any API failure is a retryable outcome
+            # The first line only, as the alert mailer does: an auth error can
+            # echo what was sent.
+            first = str(exc).splitlines()[0][:300] if str(exc) else ""
+            log.warning("gmail delivery of notice %s failed: %s",
+                        notice.get("notice_id"), type(exc).__name__)
+            return DeliveryResult("error", recipient, subject,
+                                  detail=f"Gmail refused it: {type(exc).__name__}"
+                                         + (f": {first}" if first else ""))
 
     # ------------------------------------------------------------- client
-    def _connect(self):
+    def _connect(self, interactive: bool = True):
+        """The Gmail service, or None with `connect_error` saying why.
+
+        `interactive=False` never opens a browser: inside the web service there
+        is nobody to sign in, and `run_local_server` would wait forever.
+        """
         if self._service is not None:
             return self._service
         try:
@@ -138,6 +189,8 @@ class GmailNotifier:
             from google_auth_oauthlib.flow import InstalledAppFlow  # type: ignore
             from googleapiclient.discovery import build  # type: ignore
         except ImportError:
+            self.connect_error = ('the Gmail libraries are not installed '
+                                  '(pip install -e ".[gmail]")')
             log.warning("Gmail libraries not installed. "
                         "pip install google-api-python-client google-auth-oauthlib")
             return None
@@ -149,10 +202,22 @@ class GmailNotifier:
             creds = Credentials.from_authorized_user_file(str(token_path), scopes)
         if not creds or not creds.valid:
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except Exception as exc:  # noqa: BLE001 - revoked or expired grant
+                    self.connect_error = (f"the saved Gmail sign-in could not be renewed "
+                                          f"({type(exc).__name__}); run "
+                                          f"`foci-screen gmail-auth` again")
+                    return None
+            elif not interactive:
+                self.connect_error = (f"Gmail has not been signed in to on this machine "
+                                      f"(no usable {token_path}); run "
+                                      f"`foci-screen gmail-auth` once")
+                return None
             else:
                 cred_path = Path(self.cfg.gmail_credentials)
                 if not cred_path.is_file():
+                    self.connect_error = f"Gmail credentials not found at {cred_path}"
                     log.warning("Gmail credentials not found at %s", cred_path)
                     return None
                 flow = InstalledAppFlow.from_client_secrets_file(str(cred_path), scopes)

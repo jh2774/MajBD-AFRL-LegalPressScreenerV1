@@ -471,7 +471,7 @@ class TestGmailGuards(unittest.TestCase):
             finding = engine.build_finding(
                 ENTITY, contracts,
                 engine.evaluate_contracts(contracts, ENTITY), run_id="r1")
-            result = GmailNotifier(cfg).deliver(finding, run_id="r1")
+            result = GmailNotifier(cfg).render_finding(finding, run_id="r1")
             self.assertEqual(result.status, "rendered")
             self.assertTrue(Path(result.path).is_file())
 
@@ -486,7 +486,7 @@ class TestGmailGuards(unittest.TestCase):
             finding = engine.build_finding(
                 ENTITY, contracts,
                 engine.evaluate_contracts(contracts, ENTITY), run_id="r2")
-            result = GmailNotifier(cfg).deliver(finding, run_id="r2")
+            result = GmailNotifier(cfg).render_finding(finding, run_id="r2")
             self.assertEqual(result.recipient, "analyst@example.gov")
 
     def test_unresolved_ko_is_suppressed_not_guessed(self):
@@ -499,9 +499,32 @@ class TestGmailGuards(unittest.TestCase):
             finding = engine.build_finding(
                 ENTITY, contracts,
                 engine.evaluate_contracts(contracts, ENTITY), run_id="r3")
-            result = GmailNotifier(cfg).deliver(finding, run_id="r3")
+            result = GmailNotifier(cfg).render_finding(finding, run_id="r3")
             self.assertEqual(result.status, "suppressed")
             self.assertEqual(result.recipient, "")
+
+    def test_a_finding_never_reaches_gmail_without_approval(self):
+        """Regression: `--notify` used to draft or send straight from a finding
+        once GMAIL_ENABLED was set, past the review queue."""
+        from foci_screen.config import Config
+        from foci_screen.notify.gmail import GmailNotifier
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Config(out_dir=tmp, gmail_enabled=True, gmail_send=True)
+            notifier = GmailNotifier(cfg)
+
+            def connect(*a, **k):
+                raise AssertionError("Gmail was contacted for an unreviewed finding")
+
+            notifier._connect = connect
+            contracts = [make_contract()]
+            finding = engine.build_finding(
+                ENTITY, contracts,
+                engine.evaluate_contracts(contracts, ENTITY), run_id="r4")
+            result = notifier.render_finding(finding, run_id="r4")
+            self.assertEqual(result.status, "rendered")
+            self.assertTrue(Path(result.path).is_file())
+            self.assertFalse(hasattr(notifier, "deliver"))
 
 
 class TestFPDSParsing(unittest.TestCase):

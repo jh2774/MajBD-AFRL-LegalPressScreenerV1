@@ -4,6 +4,8 @@
     foci-screen screen --agency "Department of the Navy" --months 6 --entities 3
     foci-screen screen --agency "..." --domain "LEIDOS INC=leidos.com"
     foci-screen notify --run <run_id>
+    foci-screen gmail-auth
+    foci-screen deliver-notices
     foci-screen history
 """
 from __future__ import annotations
@@ -142,10 +144,16 @@ def cmd_screen(args, cfg) -> int:
 
 
 def _notify(cfg, store: Store, findings: list[Finding], run_id: str) -> None:
+    """Write each finding's notice to disk for reading. Nothing reaches Gmail.
+
+    Gmail only ever receives a notice a person has approved in the review
+    queue; `deliver-notices` hands those over.
+    """
     notifier = GmailNotifier(cfg)
-    print("\n" + status_banner(cfg))
+    print("\nWriting notices as .eml files to read. Nothing is drafted or sent from "
+          "here: approve them in the review queue, then `foci-screen deliver-notices`.")
     for f in findings:
-        res = notifier.deliver(f, run_id=run_id)
+        res = notifier.render_finding(f, run_id=run_id)
         store.log_notification(run_id, f.entity.key(), res.recipient,
                                res.subject, res.status, res.detail)
         location = f" -> {res.path}" if res.path else ""
@@ -188,6 +196,45 @@ def cmd_notify(args, cfg) -> int:
     _notify(cfg, store, findings, args.run)
     store.close()
     return 0
+
+
+def cmd_gmail_auth(args, cfg) -> int:
+    """Sign in to Gmail once, here, so the service never has to."""
+    if not cfg.gmail_enabled:
+        print("GMAIL_ENABLED is false. Set it (and GMAIL_SENDER) first, so the "
+              "sign-in asks for the right permissions.", file=sys.stderr)
+        return 2
+    notifier = GmailNotifier(cfg)
+    if notifier._connect(interactive=True) is None:
+        print(f"Not signed in: {notifier.connect_error}", file=sys.stderr)
+        return 1
+    print(f"Signed in. The sign-in is saved at {cfg.gmail_token}; on a server, put "
+          f"that file at the path GMAIL_TOKEN names.")
+    print(status_banner(cfg))
+    return 0
+
+
+def cmd_deliver_notices(args, cfg) -> int:
+    """Hand every approved, undelivered notice to Gmail."""
+    store = Store(cfg.dsn, tenant_id=args.tenant)
+    notices = store.undelivered_notices(args.limit)
+    print(status_banner(cfg))
+    if not notices:
+        print("No approved notices are waiting to be delivered.")
+        store.close()
+        return 0
+    notifier = GmailNotifier(cfg)
+    failed = 0
+    for notice in notices:
+        res = notifier.deliver_notice(notice, interactive=False)
+        store.record_notice_delivery(notice["notice_id"], res.status,
+                                     delivered_to=res.recipient, detail=res.detail)
+        failed += res.status == "error"
+        print(f"  [{res.status}] {notice['entity_name']} -> {res.recipient or '(none)'}")
+        if res.detail:
+            print(f"      {res.detail}")
+    store.close()
+    return 1 if failed else 0
 
 
 def cmd_history(args, cfg) -> int:
@@ -297,15 +344,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip downloading filing bodies (labels only)")
     s.add_argument("--no-web", action="store_true", help="skip company website crawl")
     s.add_argument("--notify", action="store_true",
-                   help="render notices (Gmail drafts only if GMAIL_ENABLED=true)")
+                   help="also write each notice as an .eml file to read "
+                        "(never drafted or sent; approve in the review queue)")
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(func=cmd_screen)
 
-    n = sub.add_parser("notify", help="render or draft notices for a stored run")
+    n = sub.add_parser("notify", help="write a stored run's notices as .eml files to read")
     n.add_argument("--run", required=True, help="run id from a previous screen")
     n.add_argument("--preview", action="store_true",
                    help="print the notices to stdout and exit")
     n.set_defaults(func=cmd_notify)
+
+    g = sub.add_parser("gmail-auth", help="sign in to Gmail once and save token.json")
+    g.set_defaults(func=cmd_gmail_auth)
+
+    d = sub.add_parser("deliver-notices",
+                       help="hand approved notices that have not been delivered to Gmail")
+    d.add_argument("--tenant", default="default", help="whose notices (default: default)")
+    d.add_argument("--limit", type=int, default=200)
+    d.set_defaults(func=cmd_deliver_notices)
 
     h = sub.add_parser("history", help="recent findings")
     h.add_argument("--limit", type=int, default=25)
