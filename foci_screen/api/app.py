@@ -42,6 +42,7 @@ from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
 from ..connectors.vehicles import VehicleConnector, default_phrase, phrase_problem
 from ..jobs import HOLD_SECONDS, JobQueue, _hold_open
+from ..notify import bounces
 from ..notify import render as render_notice
 from ..notify.gmail import GmailNotifier
 from ..notify.mailer import LABEL as LABEL_OF_MAIL
@@ -316,7 +317,9 @@ def health() -> dict:
             # misconfigured — and through which service. No addresses, no keys.
             "alerts": {"mode": mail.status()["mode"],
                        "provider": LABEL_OF_MAIL.get(mail.transport, ""),
-                       "paused": cfg.alerts_paused},
+                       "paused": cfg.alerts_paused,
+                       # Whether bounces can be heard about at all.
+                       "bounce_reports": _bounce_reports()},
             # What an approved notice turns into: render_only, draft, send or
             # redirected.
             "notices": {"mode": _delivery_state()["mode"]},
@@ -1015,11 +1018,20 @@ def _shown_list(store: Store, sub: dict, admin: bool) -> dict:
     # they added is gone — and not type it back in.
     opted_out = [{"email": email, "at": at} for email, at
                  in sorted(store.opted_out(sub["subscription_id"]).items())]
+    # Addresses still on the list that the mail service says are dead or
+    # complained. They stay listed so the owner can see and correct them.
+    bounced = [{"email": r["email"], "kind": r["kind"], "at": r["last_at"],
+                "reason": r.get("reason") or "", "description": bounces.describe(r)}
+               for r in sorted(store.suppressed(sub["emails"]).values(),
+                               key=lambda r: r["email"])]
     if not admin:
         recipients = [{**r, "email": consent.mask(r["email"])} for r in recipients]
         opted_out = [{**o, "email": consent.mask(o["email"])} for o in opted_out]
+        bounced = [{**b, "email": consent.mask(b["email"]),
+                    "reason": consent.mask_text(b["reason"]),
+                    "description": consent.mask_text(b["description"])} for b in bounced]
     return {**sub, "emails": [r["email"] for r in recipients],
-            "recipients": recipients, "opted_out": opted_out,
+            "recipients": recipients, "opted_out": opted_out, "bounced": bounced,
             "can_edit_addresses": admin}
 
 
@@ -1042,7 +1054,81 @@ def get_alerts(store: Store = Depends(tenant_store),
             "subscriptions": [_shown_list(store, s, admin)
                               for s in store.alert_subscriptions()],
             "deliveries": [_shown_delivery(d, admin)
-                           for d in store.alert_deliveries(limit=30)]}
+                           for d in store.alert_deliveries(limit=30)],
+            "bounce_reports": _bounce_reports()}
+
+
+def _bounce_reports() -> str:
+    """Which mail service can tell this site about bounces: brevo, resend or ""."""
+    return ("resend" if cfg.resend_webhook_secret else
+            "brevo" if cfg.mail_webhook_secret else "")
+
+
+@app.delete("/v1/alerts/bounces/{email}", status_code=204, tags=["alerts"])
+def clear_bounce(email: str, store: Store = Depends(admin_store)) -> Response:
+    """Mail an address again: it was mistyped and has been fixed, or the
+    mailbox works again.
+
+    Only an address on one of this tenant's lists. A spam complaint cannot be
+    cleared here: it is the reader saying no, and overruling them is not the
+    list owner's call. On a public site it needs the admin key, like taking
+    an address off a list: visitors see addresses masked.
+    """
+    email = email.strip().lower()
+    if not any(email in (e.lower() for e in s["emails"])
+               for s in store.alert_subscriptions()):
+        raise HTTPException(404, "That address is not on any of your alert lists.")
+    outcome = store.clear_suppression(email)
+    if outcome == "not_found":
+        raise HTTPException(404, "That address has no bounce on record.")
+    if outcome == "complaint":
+        raise HTTPException(
+            409, "This person marked an alert as spam, so it will not be sent to them "
+                 "again from here. If they ask to be mailed again, an operator can "
+                 "clear it with `foci-screen mail-suppressions --clear`.")
+    return Response(status_code=204)
+
+
+# ------------------------------------------------------------ bounce reports
+# Called by the mail service, not by a person, so no API key; each provider's
+# own proof of origin is checked instead (notify/bounces.py).
+
+async def _mail_report(request: Request, parse, verify) -> Response:
+    body = await request.body()
+    try:
+        verify(body)
+    except bounces.NotAuthentic as exc:
+        log.warning("refused a mail report from %s: %s", request.url.path, exc)
+        raise HTTPException(401, str(exc)) from exc
+    try:
+        payload = json.loads(body or b"null")
+    except ValueError as exc:
+        raise HTTPException(400, "The report is not JSON.") from exc
+    store = store_for(auth.DEFAULT_TENANT)      # the table is not tenant-scoped
+    events = parse(payload)
+    for e in events:
+        store.suppress_address(e.email, e.kind, e.reason, e.provider)
+        log.info("mail service reported %s for an alert address", e.kind)
+    return Response(status_code=204)
+
+
+@app.post("/hooks/mail/brevo", include_in_schema=False)
+async def brevo_report(request: Request, token: str = Query("")) -> Response:
+    def verify(_body: bytes) -> None:
+        presented = token
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            presented = header[7:].strip()
+        bounces.check_shared_secret(cfg.mail_webhook_secret, presented)
+    return await _mail_report(request, bounces.parse_brevo, verify)
+
+
+@app.post("/hooks/mail/resend", include_in_schema=False)
+async def resend_report(request: Request) -> Response:
+    def verify(body: bytes) -> None:
+        bounces.check_svix_signature(cfg.resend_webhook_secret,
+                                     dict(request.headers), body)
+    return await _mail_report(request, bounces.parse_resend, verify)
 
 
 @app.post("/v1/alerts/subscriptions", tags=["alerts"])
@@ -1201,6 +1287,10 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
             store.unlock("alerts")
     finally:
         _alerts_running.release()
+    if not admin:
+        # What went to whom names addresses; visitors see them masked.
+        result["emails"] = [{**e, "detail": consent.mask_text(e.get("detail") or "")}
+                            for e in result["emails"]]
     return {"status": "checked", **result}
 
 

@@ -926,6 +926,12 @@ decides.
 * **Only to addresses that agreed.** On a public site an address a visitor adds gets one email
   asking it to confirm, and nothing else until it does. The confirmation link and the
   unsubscribe link share one token per address per list.
+* **A dead address stops being mailed.** With a bounce webhook set up (DEPLOY.md, "Hearing
+  about bounces"), Brevo or Resend tell the site when an alert bounces or is marked as spam.
+  The address is skipped from then on and shown on the Portfolio page with the reason; the
+  alert log names it too. Reports are believed only with the shared secret (Brevo) or a valid
+  signature (Resend). A bounce can be cleared from the page; a spam complaint only by an
+  operator, with `foci-screen mail-suppressions`.
 * A check runs when the Portfolio page is opened and the last one was most of a day ago, and
   once a day from a GitHub Actions workflow if that is set up. Two checks never run at once.
 * `GET /health` reports whether alerts actually leave (`send`, `redirect`, `draft` or

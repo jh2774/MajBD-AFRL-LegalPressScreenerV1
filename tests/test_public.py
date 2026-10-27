@@ -145,6 +145,7 @@ ADMIN_ONLY = [
     ("post", "/v1/notices/n1/reject", {"reviewer": "x"}),
     ("post", "/v1/notices/n1/deliver", None),
     ("delete", "/v1/alerts/subscriptions/s1", None),
+    ("delete", "/v1/alerts/bounces/ko@agency.gov", None),
     ("get", "/v1/system/check", None),
 ]
 

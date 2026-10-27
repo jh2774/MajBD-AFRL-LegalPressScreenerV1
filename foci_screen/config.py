@@ -190,6 +190,12 @@ class Config:
     # Where a reply to an alert goes, when the sending address has no mailbox
     # behind it. Optional.
     alerts_reply_to: str = field(default_factory=lambda: _env("ALERTS_REPLY_TO"))
+    # Bounce and complaint reports from the mail service (notify/bounces.py).
+    # Brevo cannot sign its webhooks, so it is given this secret to send back;
+    # Resend signs them, and RESEND_WEBHOOK_SECRET (whsec_...) checks that.
+    mail_webhook_secret: str = field(default_factory=lambda: _env("MAIL_WEBHOOK_SECRET"))
+    resend_webhook_secret: str = field(
+        default_factory=lambda: _env("RESEND_WEBHOOK_SECRET"))
     # Where the links in an alert point. Without it, links use whatever
     # address the request that triggered the alerts came in on.
     public_url: str = field(default_factory=_public_url)

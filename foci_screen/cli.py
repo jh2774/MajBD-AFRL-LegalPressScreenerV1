@@ -249,6 +249,33 @@ def cmd_history(args, cfg) -> int:
     return 0
 
 
+def cmd_mail_suppressions(args, cfg) -> int:
+    """Addresses alerts are not sent to, because the mail service reported them."""
+    from .notify.bounces import describe
+
+    store = Store(cfg.dsn)
+    try:
+        if args.clear:
+            outcome = store.clear_suppression(args.clear, allow_complaint=args.complaint)
+            if outcome == "complaint":
+                print(f"{args.clear} marked an alert as spam. Clear it only if they have "
+                      f"asked to be mailed again, with --complaint.", file=sys.stderr)
+                return 2
+            if outcome == "not_found":
+                print(f"{args.clear} is not suppressed.", file=sys.stderr)
+                return 1
+            print(f"Cleared. Alerts will go to {args.clear} again.")
+            return 0
+        rows = store.suppressed()
+        if not rows:
+            print("No addresses are suppressed.")
+        for row in rows.values():
+            print(f"  [{row['kind']}] {describe(row)}")
+        return 0
+    finally:
+        store.close()
+
+
 def cmd_copy_db(args, cfg) -> int:
     """Copy every table from one database to another — for moving hosts."""
     import os
@@ -367,6 +394,13 @@ def build_parser() -> argparse.ArgumentParser:
     h = sub.add_parser("history", help="recent findings")
     h.add_argument("--limit", type=int, default=25)
     h.set_defaults(func=cmd_history)
+
+    m = sub.add_parser("mail-suppressions",
+                       help="list addresses alerts skip because they bounced or complained")
+    m.add_argument("--clear", metavar="EMAIL", help="mail this address again")
+    m.add_argument("--complaint", action="store_true",
+                   help="allow --clear to lift a spam complaint (only if they asked)")
+    m.set_defaults(func=cmd_mail_suppressions)
 
     c = sub.add_parser(
         "copy-db", help="copy every table to another database, for moving hosts",

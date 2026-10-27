@@ -138,6 +138,21 @@ exactly as it would be sent, and nothing leaves.
   asking you to confirm (check spam the first time). Confirm it, then press **Send a test
   email**.
 
+### Hear about bounces (recommended, five minutes)
+
+Without this, an address that does not exist goes on being sent every alert, and the site
+never knows. With it, Resend tells the site, which stops mailing that address and shows it
+on the Portfolio page under **Not being emailed**.
+
+1. Resend → **Webhooks** → **Add endpoint**. URL:
+   `https://contractscreener.com/hooks/mail/resend`. Events: `email.bounced` and
+   `email.complained`.
+2. Copy the endpoint's **signing secret** (it starts `whsec_`). In Vercel → **Environment
+   Variables**, add `RESEND_WEBHOOK_SECRET` = that secret, and redeploy.
+
+`https://contractscreener.com/health` then shows `"bounce_reports": "resend"`. DEPLOY.md,
+"Hearing about bounces", says what happens to a reported address.
+
 **To read alerts yourself first**, also set `FOCI_EMAIL_REDIRECT_TO` to your own address:
 every email, including the requests to confirm, then comes to you alone, with the intended
 recipients named in the subject line. Remove it when you are happy with them. To stop
