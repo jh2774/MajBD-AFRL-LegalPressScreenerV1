@@ -1829,9 +1829,19 @@ def run_watchlist(watchlist_id: str, request: Request,
     return {"run_id": run_id, "status": "queued", **_execute_link(run_id)}
 
 
+@app.post("/v1/watchlists/{watchlist_id}/resume", tags=["watchlists"])
+def resume_watchlist(watchlist_id: str, store: Store = Depends(tenant_store)) -> dict:
+    """Put a paused watchlist back on the nightly sweep."""
+    if not store.set_watchlist_active(watchlist_id, True):
+        raise HTTPException(404, "No such watchlist.")
+    return {"watchlist_id": watchlist_id, "active": True}
+
+
 @app.delete("/v1/watchlists/{watchlist_id}", tags=["watchlists"])
 def deactivate_watchlist(watchlist_id: str,
-                         store: Store = Depends(admin_store)) -> dict:
+                         store: Store = Depends(tenant_store)) -> dict:
+    """Pause a watchlist. Nothing is removed, and resuming is open to all, so
+    pausing is too."""
     if not store.set_watchlist_active(watchlist_id, False):
         raise HTTPException(404, "No such watchlist.")
     return {"watchlist_id": watchlist_id, "active": False}

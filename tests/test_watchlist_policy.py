@@ -213,3 +213,18 @@ def test_a_database_from_before_watchlist_policies_is_upgraded(tmp_path):
         assert s.watchlist_policy("w1") == {"notice_min_severity": "low"}
     finally:
         s.close()
+
+
+def test_a_paused_watchlist_can_be_resumed(client):
+    wid = client.post("/v1/watchlists", headers=AUTH, json={
+        "name": "navy", "screen": {"agency": "Department of Defense"}}).json()["watchlist_id"]
+    def active():
+        rows = client.get("/v1/watchlists", headers=AUTH).json()["watchlists"]
+        return bool(rows[0]["active"])
+
+    client.delete(f"/v1/watchlists/{wid}", headers=AUTH)
+    assert active() is False
+
+    assert client.post(f"/v1/watchlists/{wid}/resume", headers=AUTH).json()["active"] is True
+    assert active() is True
+    assert client.post("/v1/watchlists/nope/resume", headers=AUTH).status_code == 404

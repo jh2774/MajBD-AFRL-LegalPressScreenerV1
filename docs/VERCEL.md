@@ -164,12 +164,12 @@ The site is open: anyone who has the address can see everything on it — every 
 contractor, portfolio and alert list — and use it.
 
 **Without a key**, anyone can search, screen agencies and contractors, build portfolios,
-pick a contractor's SEC record, look up its funds, mark findings, create and run
+pick a contractor's SEC record, look up its funds, mark findings, create, run, pause and resume
 watchlists, and start or add to an alert list.
 
 **With the admin key** only:
 
-* deleting a screen, a watchlist or an alert list;
+* deleting a screen or an alert list;
 * changing the screening rules or policy, for the site or for one watchlist;
 * approving or rejecting a notice to a contracting officer;
 * the **System check** page, which writes to the database and calls six outside services

@@ -419,6 +419,7 @@ every night on a deploy that was screening nothing.
 | `POST /v1/portfolio` | Open a key into a dashboard of those companies |
 | `POST /v1/watchlists` | Agencies to re-screen on a schedule, optionally with their own `policy` |
 | `PUT / DELETE /v1/watchlists/{id}/policy` | The screening-policy settings one watchlist changes — the rest follow the tenant |
+| `POST /v1/watchlists/{id}/resume` | Put a paused watchlist back on the nightly sweep (`DELETE /v1/watchlists/{id}` pauses it) |
 | `GET /v1/notices` | The review queue |
 | `POST /v1/notices/{id}/approve` | The human gate. Records a decision — does not send |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |
@@ -429,7 +430,7 @@ reachable because someone deployed it before setting a variable.
 
 **Public mode is the deliberate exception.** `FOCI_PUBLIC=true` opens the site to anyone with
 its address, as tenant `default`, with no key. A key from `FOCI_API_KEYS` is then an admin key,
-needed only to delete a screen, watchlist or alert list, change the screening rules or policy,
+needed only to delete a screen or alert list, change the screening rules or policy,
 approve or reject a notice, and open the system check; with no key configured those are closed
 (403), not opened. Visitors see alert-list addresses masked, can add to a list but not take an
 address off, and each address they add must confirm before it receives anything

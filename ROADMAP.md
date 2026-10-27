@@ -141,8 +141,13 @@ before acting.
    the policy follow it: what is screened for, and what raises a notice.
 
    Still open on this: **per-person attribution** of policy changes, which records
-   `api-key:<tenant>` for the same reason decisions do; and a settings page for watchlist
-   policies — today they are set through the API.
+   `api-key:<tenant>` for the same reason decisions do.
+
+   **Built on it: a Watchlists page** (`#/watchlists`). Scheduled screening had no page at
+   all — watchlists could only be created, run or paused through the API, and a paused one
+   could not be resumed by any route. The page lists each watchlist with what it screens, its
+   last run and its policy in words; runs one now; pauses and resumes; and edits the policy,
+   where "Follow Screening settings" means not overriding that setting at all.
 4. ~~**Server-side pagination.**~~ **Done for search.** `/v1/search` takes an `offset` and
    returns `more` per kind; the "All" tab links to a kind's own tab when it has another page,
    and that tab pages with Previous / Next. The decision the roadmap left open went to the flag

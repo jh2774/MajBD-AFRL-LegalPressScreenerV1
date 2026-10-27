@@ -141,7 +141,6 @@ ADMIN_ONLY = [
     ("put", "/v1/rules/R1", {"enabled": False}),
     ("delete", "/v1/rules/R1", None),
     ("put", "/v1/watchlists/w1/policy", {}),
-    ("delete", "/v1/watchlists/w1", None),
     ("post", "/v1/notices/n1/approve", {"reviewer": "x"}),
     ("post", "/v1/notices/n1/reject", {"reviewer": "x"}),
     ("delete", "/v1/alerts/subscriptions/s1", None),
