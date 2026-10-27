@@ -246,11 +246,13 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
     status       TEXT NOT NULL,
     detail       TEXT
 );
--- Whether each address on a list has agreed to be emailed: pending (asked,
--- not yet answered), confirmed, or unsubscribed. The token, in the links
--- each email carries, is all that confirming or stopping takes. An address
--- with no row was put on its list before this existed, by someone holding a
--- key, and is taken as confirmed (`consent.recipients`).
+-- One row per address on an alert list: whether it has agreed to be emailed
+-- — pending (asked, not yet answered), confirmed, or unsubscribed — and the
+-- token behind the links its emails carry, which is all that confirming or
+-- unsubscribing takes. An address with no row was put on its list before
+-- this existed, by someone holding a key, and is taken as confirmed. A row
+-- outlives the address's removal from the list on purpose: someone who
+-- unsubscribed is not quietly put back by whoever next saves the list.
 CREATE TABLE IF NOT EXISTS alert_recipients (
     subscription_id TEXT NOT NULL,
     email        TEXT NOT NULL,
@@ -260,6 +262,10 @@ CREATE TABLE IF NOT EXISTS alert_recipients (
     added_at     TEXT NOT NULL,
     asked_at     TEXT,
     answered_at  TEXT,
+    -- Whether unsubscribing is what took the address off the list. Only then
+    -- does "undo" put it back: someone the list's owner removed must not be
+    -- able to re-add themselves through an old email's link.
+    restorable   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (subscription_id, email)
 );
 -- One row per tenant: what it screens for and what raises a notice. JSON
@@ -438,6 +444,7 @@ COLUMN_ADDITIONS = [
     ("contracts", "is_subaward", "INTEGER DEFAULT 0"),
     ("contracts", "prime_award_id", "TEXT"),
     ("contracts", "prime_recipient_name", "TEXT"),
+    ("alert_recipients", "restorable", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -1543,6 +1550,74 @@ class Store:
                       (subscription_id,))
         return True
 
+    # ----------------------------------------------------- unsubscribing
+    def unsubscribe_token(self, subscription_id: str, email: str) -> str:
+        """The secret behind one address's links. An address on a list with no
+        record yet was put there before records were kept, by someone holding a
+        key, and is recorded now as confirmed.
+
+        Random rather than derived from a server secret, so there is no key to
+        configure or rotate, and a link stays valid for as long as its row does.
+        """
+        email = email.strip().lower()
+        row = self.alert_recipients(subscription_id).get(email) \
+            or self.add_alert_recipient(subscription_id, email, "confirmed")
+        return row["token"]
+
+    def optout_by_token(self, token: str) -> dict | None:
+        """The row behind a link, whichever tenant it belongs to, with
+        `opted_out_at` set when the address has unsubscribed.
+
+        Deliberately not tenant-scoped: the person clicking has no key, and
+        the token is what identifies the tenant.
+        """
+        row = self.alert_recipient_by_token(token)
+        if row is None:
+            return None
+        return {**row, "opted_out_at": row["answered_at"]
+                if row["status"] == "unsubscribed" else None}
+
+    def opted_out(self, subscription_id: str) -> dict[str, str]:
+        """{address: when} for everyone who has unsubscribed from a list."""
+        return {r["email"]: r["answered_at"] for r in self._query(
+            "SELECT email, answered_at FROM alert_recipients WHERE tenant_id=?"
+            " AND subscription_id=? AND status='unsubscribed'",
+            (self.tenant_id, subscription_id))}
+
+    def set_opted_out(self, token: str, out: bool) -> dict | None:
+        """Unsubscribe, or undo it. Returns the updated row, or None for an
+        unknown token.
+
+        Unsubscribing takes the address off the list. Undoing clears the
+        opt-out, and puts the address back only if unsubscribing is what took
+        it off — not if the list's owner had already removed it. Either way
+        the link proved the address is theirs, so undoing confirms it.
+        """
+        row = self.optout_by_token(token)
+        if row is None or row["tenant_id"] != self.tenant_id:
+            return None
+        if bool(row["opted_out_at"]) == out:
+            return row                              # already so; a second click
+        sub = self.alert_subscription(row["subscription_id"])
+        listed = sub is not None and row["email"] in {e.lower() for e in sub["emails"]}
+        with self._tx() as c:
+            if out:
+                c.execute("UPDATE alert_recipients SET status='unsubscribed', answered_at=?,"
+                          " restorable=? WHERE token=?", (_now(), 1 if listed else 0, token))
+                emails = [e for e in sub["emails"] if e.lower() != row["email"]] \
+                    if listed else None
+            else:
+                c.execute("UPDATE alert_recipients SET status='confirmed', answered_at=?,"
+                          " restorable=0 WHERE token=?", (_now(), token))
+                emails = sub["emails"] + [row["email"]] \
+                    if sub is not None and row["restorable"] and not listed else None
+            if emails is not None:
+                c.execute("UPDATE alert_subscriptions SET emails=?, updated_at=?"
+                          " WHERE tenant_id=? AND subscription_id=?",
+                          (json.dumps(emails), _now(), self.tenant_id,
+                           row["subscription_id"]))
+        return self.optout_by_token(token)
+
     def alert_already_sent(self, subscription_id: str) -> set[str]:
         return {r["item_id"] for r in self._query(
             "SELECT item_id FROM alert_sent WHERE subscription_id=?", (subscription_id,))}
@@ -1592,24 +1667,20 @@ class Store:
         return {r["email"]: r for r in rows}
 
     def add_alert_recipient(self, subscription_id: str, email: str, status: str) -> dict:
-        """Record an address as on a list, as `status`. One already pending or
-        confirmed is left as it is; one that unsubscribed starts again at
-        `status`, keeping when it was last asked, so being added back cannot
-        bring a second request to confirm the same day."""
+        """Record an address as on a list, as `status`. One already recorded is
+        left as it is: an unsubscribe is undone only by the person, from their
+        own link (`set_opted_out`)."""
+        email = email.strip().lower()
         existing = self.alert_recipients(subscription_id).get(email)
-        if existing and existing["status"] != "unsubscribed":
+        if existing:
             return existing
         with self._tx() as c:
-            if existing:
-                c.execute("UPDATE alert_recipients SET status=?, added_at=?, answered_at=NULL"
-                          " WHERE subscription_id=? AND email=?",
-                          (status, _now(), subscription_id, email))
-            else:
-                c.execute("INSERT INTO alert_recipients (subscription_id, email, tenant_id,"
-                          " token, status, added_at) VALUES (?,?,?,?,?,?)"
-                          " ON CONFLICT (subscription_id, email) DO NOTHING",
-                          (subscription_id, email, self.tenant_id,
-                           secrets.token_urlsafe(24), status, _now()))
+            # Another process may have recorded it first; theirs is kept.
+            c.execute("INSERT INTO alert_recipients (subscription_id, email, tenant_id,"
+                      " token, status, added_at) VALUES (?,?,?,?,?,?)"
+                      " ON CONFLICT (subscription_id, email) DO NOTHING",
+                      (subscription_id, email, self.tenant_id,
+                       secrets.token_urlsafe(24), status, _now()))
         return self.alert_recipients(subscription_id)[email]
 
     def mark_alert_recipient_asked(self, subscription_id: str, email: str) -> None:
@@ -1633,26 +1704,19 @@ class Store:
 
     def alert_recipient_by_token(self, token: str) -> dict | None:
         """Whichever tenant's it is: the token is the whole of the authority to
-        confirm or stop that one address's emails."""
+        confirm, or unsubscribe, that one address on that one list."""
         return self._one("SELECT * FROM alert_recipients WHERE token=?", (token,))
 
-    def answer_alert_recipient(self, token: str, status: str) -> dict | None:
-        """Record a confirmation or an unsubscribe. Unsubscribing also takes
-        the address off its list, so nobody keeps seeing it there."""
+    def confirm_alert_recipient(self, token: str) -> dict | None:
+        """The person agreed, from the link in their request to confirm. An
+        address that has since unsubscribed is left unsubscribed."""
         row = self.alert_recipient_by_token(token)
-        if not row:
-            return None
-        sub = self._one("SELECT emails FROM alert_subscriptions WHERE subscription_id=?",
-                        (row["subscription_id"],))
+        if not row or row["status"] != "pending":
+            return row
         with self._tx() as c:
-            c.execute("UPDATE alert_recipients SET status=?, answered_at=? WHERE token=?",
-                      (status, _now(), token))
-            if status == "unsubscribed" and sub:
-                left = [e for e in json.loads(sub.get("emails") or "[]") if e != row["email"]]
-                c.execute("UPDATE alert_subscriptions SET emails=?, updated_at=?"
-                          " WHERE subscription_id=?",
-                          (json.dumps(left), _now(), row["subscription_id"]))
-        return {**row, "status": status}
+            c.execute("UPDATE alert_recipients SET status='confirmed', answered_at=?"
+                      " WHERE token=? AND status='pending'", (_now(), token))
+        return self.alert_recipient_by_token(token)
 
     def notices_for_entities(self, entity_keys: list[str], limit: int = 200) -> list[dict]:
         if not entity_keys:

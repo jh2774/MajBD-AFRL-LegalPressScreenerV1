@@ -179,9 +179,11 @@ watchlists, and start or add to an alert list.
 **Email addresses are protected.** Visitors see the addresses on a list masked
 (`j•••@agency.gov`). An address a visitor adds is sent one email asking it to confirm, and
 nothing else until it does; an address you add while holding the admin key is trusted
-without asking. Every alert ends with a link that stops alerts for that one address, which
-mail programs also show as an **Unsubscribe** button. Someone who stops is asked to confirm
-again if they are ever added back.
+without asking. Every alert ends with a link that unsubscribes that one address, which mail
+programs also show as an **Unsubscribe** button, and the page it opens has an undo. Someone
+who unsubscribes is not put back by anyone else, admin included: the Portfolio page names
+who left, and a save that adds them again is declined by name. They rejoin from their own
+link.
 
 **Limits that keep a visitor from running up the email or the SEC's patience:** each
 address is asked to confirm at most once a day, and the whole site sends at most 40 such

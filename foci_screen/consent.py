@@ -3,12 +3,14 @@
 A site anyone can open must not be a way to email anyone. So an address a
 visitor types into an alert list is sent one short request to confirm, and
 nothing else until it is confirmed. Every alert after that carries a link that
-stops them, for that one address and nobody else's.
+unsubscribes that one address and nobody else (`alerts.personalizer`); the
+link and the request to confirm share one token per address per list.
 
 An address added by someone holding the site's key — on a site that needs a
 key for everything, that is everyone — is taken as agreed, as it always was:
-they are vouching for it. An address added back after unsubscribing is asked
-again, whoever adds it.
+they are vouching for it. Someone who unsubscribed is not put back by anyone
+else: a save that names them is declined, and they rejoin from their own link
+(`Store.set_opted_out`).
 
 The requests are kept within the mail service's allowance: one a day at most
 to any address for any list, and a ceiling across the whole site, so that
@@ -49,40 +51,39 @@ def confirm_url(base_url: str, token: str) -> str:
     return f"{base_url.rstrip('/')}/alerts/confirm/{token}"
 
 
-def stop_url(base_url: str, token: str) -> str:
-    return f"{base_url.rstrip('/')}/alerts/stop/{token}"
-
-
 def _iso(when: datetime) -> str:
     return when.replace(microsecond=0, tzinfo=None).isoformat() + "Z"
 
 
 # --------------------------------------------------------------- who is sent
 
-def recipients(store, subscription: dict, base_url: str = "") -> tuple[list[str], dict]:
-    """(the addresses to send to, {address: its link to stop}).
+def recipients(store, subscription: dict) -> list[str]:
+    """The addresses to send to: confirmed ones only.
 
-    Only confirmed addresses. One with no record at all was put on its list
-    before records were kept, by someone holding a key, and is recorded as
-    confirmed now — which also gives it a link to stop.
+    One with no record at all was put on its list before records were kept,
+    by someone holding a key, and is recorded as confirmed now.
     """
     sid = subscription["subscription_id"]
     records = store.alert_recipients(sid)
-    to, links = [], {}
+    to = []
     for email in subscription["emails"]:
-        row = records.get(email) or store.add_alert_recipient(sid, email, CONFIRMED)
-        if row["status"] != CONFIRMED:
-            continue
-        to.append(email)
-        if base_url:
-            links[email] = stop_url(base_url, row["token"])
-    return to, links
+        row = records.get(email.lower()) or store.add_alert_recipient(sid, email, CONFIRMED)
+        if row["status"] == CONFIRMED:
+            to.append(email)
+    return to
+
+
+def waiting(store, subscription: dict) -> bool:
+    """Whether anyone on the list has yet to confirm."""
+    records = store.alert_recipients(subscription["subscription_id"])
+    return any((records.get(e.lower()) or {}).get("status") == PENDING
+               for e in subscription["emails"])
 
 
 def statuses(store, subscription: dict) -> list[dict]:
     """Each address on a list and where it stands, for the portfolio page."""
     records = store.alert_recipients(subscription["subscription_id"])
-    return [{"email": e, "status": (records.get(e) or {}).get("status", CONFIRMED)}
+    return [{"email": e, "status": (records.get(e.lower()) or {}).get("status", CONFIRMED)}
             for e in subscription["emails"]]
 
 
@@ -101,7 +102,7 @@ def add(store, mailer, subscription: dict, emails: list[str], base_url: str,
     sid = subscription["subscription_id"]
     outcome: dict[str, list] = {"asked": [], "waiting": [], "held": [], "not_sent": []}
     for email in emails:
-        before = store.alert_recipients(sid).get(email)
+        before = store.alert_recipients(sid).get(email.lower())
         if before is None and trusted:
             store.add_alert_recipient(sid, email, CONFIRMED)
         else:
@@ -163,41 +164,8 @@ def request_email(name: str, url: str, base_url: str) -> tuple[str, str, str]:
         'line-height:1.5;color:#1c1c1c;max-width:600px">'
         f"<p>Someone added this address to <strong>{e(name)}</strong>, an alert list on "
         f"FOCI-Screener ({e(site)}).</p><p>{e(what)}</p>"
-        f'<p><a href="{e(url)}" style="display:inline-block;background:#1f3a5f;color:#fff;'
+        f'<p><a href="{e(url)}" style="display:inline-block;background:#c8a24a;color:#1c1c1c;'
         f'padding:9px 16px;border-radius:4px;text-decoration:none">Confirm alerts</a></p>'
         '<p style="color:#777;font-size:13px">If you were not expecting this, ignore it. '
         "Nothing more will be sent to you unless you confirm.</p></div>")
     return subject, text, html
-
-
-# --------------------------------------------------- the pages the links open
-
-def page(title: str, message: str, button: str = "", note: str = "") -> str:
-    """A small page of its own: the links arrive in email, often on a phone,
-    and need nothing from the rest of the site to work.
-
-    A link only shows a button; pressing it (a POST) is what acts. Mail
-    security scanners open every link in a message to inspect it, and a
-    link that confirmed on being opened would confirm addresses nobody had
-    read the email at.
-    """
-    e = html_lib.escape
-    form = (f'<form method="post"><button type="submit">{e(button)}</button></form>'
-            if button else "")
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
-<title>{e(title)} · FOCI-Screener</title>
-<style>
-  body {{ font-family: Arial, Helvetica, sans-serif; background: #f5f3ee; color: #1c1c1c;
-         margin: 0; padding: 48px 16px; line-height: 1.5; }}
-  main {{ max-width: 520px; margin: 0 auto; background: #fff; border-radius: 6px;
-         padding: 28px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
-  h1 {{ font-size: 20px; margin: 0 0 12px; }}
-  button {{ font: inherit; background: #1f3a5f; color: #fff; border: 0; border-radius: 4px;
-           padding: 9px 18px; cursor: pointer; margin-top: 8px; }}
-  .note {{ color: #666; font-size: 13.5px; margin-top: 16px; }}
-</style></head>
-<body><main><h1>{e(title)}</h1><p>{e(message)}</p>{form}
-{f'<p class="note">{e(note)}</p>' if note else ""}</main></body></html>"""

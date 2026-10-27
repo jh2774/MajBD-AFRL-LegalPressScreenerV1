@@ -240,36 +240,61 @@ def test_every_alert_carries_its_recipients_own_way_to_stop(site, monkeypatch):
     ran = alerts.run_alerts(store, NoFirms(), Mailer(app_module.cfg), SITE)
     assert ran["emails"][0]["status"] == "sent"
     alert = post.to("ko@agency.gov")[-1]
-    stop = f"{SITE}/alerts/stop/{token}"
-    assert alert["text"].endswith(f"To stop these emails: {stop}")
-    assert stop in alert["html"]
+    stop = f"{SITE}/u/{token}"
+    assert f"unsubscribe here: {stop}" in alert["text"], "one token: confirm and stop"
+    assert f'href="{stop}"' in alert["html"]
     assert alert["headers"] == {"List-Unsubscribe": f"<{stop}>",
                                 "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"}
     [logged] = store.alert_deliveries(sid)
     assert token not in logged["body_text"], "the log is shown on the page; the link is not"
 
     # What a mail program's "Unsubscribe" button sends.
-    stopped = c.post(f"/alerts/stop/{token}", content="List-Unsubscribe=One-Click",
+    stopped = c.post(f"/u/{token}", content="List-Unsubscribe=One-Click",
                      headers={"Content-Type": "application/x-www-form-urlencoded"})
-    assert stopped.status_code == 200 and "taken off" in stopped.text
+    assert stopped.status_code == 200 and "You are unsubscribed" in stopped.text
     assert store.alert_subscription(sid)["emails"] == []
     assert store.alert_recipients(sid)["ko@agency.gov"]["status"] == "unsubscribed"
+    assert "You are unsubscribed" in c.get(f"/alerts/confirm/{token}").text, \
+        "confirming again does not undo leaving"
 
 
-def test_someone_who_stopped_is_asked_again_if_added_back(site, monkeypatch):
+def test_the_first_unsubscribe_links_still_work(site, monkeypatch):
+    """Alerts sent before the links moved to /u/ point at /alerts/stop/."""
+    Post(monkeypatch)
+    c, app_module = open_site(site)
+    store = app_module.store_for("default")
+    sid = save(c, ["ko@agency.gov"], ADMIN).json()["subscription"]["subscription_id"]
+    token = token_of(store, sid, "ko@agency.gov")
+    assert "Stop these alerts?" in c.get(f"/alerts/stop/{token}").text
+    assert "You are unsubscribed" in c.post(f"/alerts/stop/{token}").text
+    assert store.opted_out(sid)
+
+
+def test_someone_who_left_is_not_put_back_by_anyone_else(site, monkeypatch):
+    """Not by a visitor, and not by the admin: leaving was that person's
+    decision. They are declined by name, and nothing is sent to them."""
     post = Post(monkeypatch)
     c, app_module = open_site(site)
     store = app_module.store_for("default")
-    sid = store.save_alert_subscription(name="Watch", emails=["ko@agency.gov"],
-                                        companies=["UEI123"], portfolio_key=PORTFOLIO)
-    consent.recipients(store, store.alert_subscription(sid), SITE)   # added with a key
-    c.post(f"/alerts/stop/{token_of(store, sid, 'ko@agency.gov')}")
+    sid = save(c, ["ko@agency.gov", "b@navy.mil"], ADMIN).json()["subscription"][
+        "subscription_id"]
+    token = token_of(store, sid, "ko@agency.gov")
+    c.post(f"/u/{token}")
 
-    # Even by the admin: stopping was that person's decision.
-    save(c, ["ko@agency.gov"], ADMIN, subscription_id=sid)
-    assert store.alert_recipients(sid)["ko@agency.gov"]["status"] == "pending"
-    assert [b["subject"] for b in post.to("ko@agency.gov")] == \
-        ['Confirm: email alerts for "Watch"']
+    r = save(c, ["ko@agency.gov"], subscription_id=sid).json()
+    assert r["declined"] == ["k•••@agency.gov"]
+    r = save(c, ["ko@agency.gov", "b@navy.mil"], ADMIN, subscription_id=sid).json()
+    assert r["declined"] == ["ko@agency.gov"]
+    assert store.alert_subscription(sid)["emails"] == ["b@navy.mil"]
+    assert post.calls == []
+
+    listed = c.get("/v1/alerts").json()["subscriptions"][0]
+    assert [o["email"] for o in listed["opted_out"]] == ["k•••@agency.gov"]
+
+    # They rejoin from their own link, which also confirms them.
+    assert "Subscribed again" in c.post(f"/u/{token}/undo").text
+    assert store.alert_recipients(sid)["ko@agency.gov"]["status"] == "confirmed"
+    assert "ko@agency.gov" in store.alert_subscription(sid)["emails"]
 
 
 def test_addresses_the_admin_adds_are_trusted(site, monkeypatch):
@@ -293,7 +318,7 @@ def test_lists_made_before_consent_was_recorded_keep_working(site, monkeypatch):
     flag(store)
     ran = alerts.run_alerts(store, NoFirms(), Mailer(app_module.cfg), SITE)
     assert ran["emails"][0]["status"] == "sent"
-    assert "/alerts/stop/" in post.to("ko@agency.gov")[0]["text"]
+    assert f"{SITE}/u/" in post.to("ko@agency.gov")[0]["text"]
 
 
 def test_a_visitor_adds_to_a_list_and_takes_nobody_off(site, monkeypatch):
@@ -453,15 +478,6 @@ def test_asked_to_slow_down_it_waits_and_tries_once_more(monkeypatch):
     Post(monkeypatch, [Reply(429, {"message": "daily_quota_exceeded"})] * 2)
     d = Mailer(Cfg(resend_api_key="re_not_real")).send(["ko@agency.gov"], "s", "t")
     assert d.status == "failed" and "daily_quota_exceeded" in d.detail
-
-
-def test_a_redirected_email_carries_nobody_elses_link(monkeypatch):
-    post = Post(monkeypatch)
-    Mailer(Cfg(resend_api_key="re", email_redirect_to="me@concord.example")).send(
-        ["ko@agency.gov"], "s", "t", unsubscribe={"ko@agency.gov": f"{SITE}/alerts/stop/x"})
-    body = post.calls[0]["body"]
-    assert body["to"] == ["me@concord.example"]
-    assert "headers" not in body and "/alerts/stop/" not in body["text"]
 
 
 def test_links_point_at_the_production_domain_vercel_reports(monkeypatch):

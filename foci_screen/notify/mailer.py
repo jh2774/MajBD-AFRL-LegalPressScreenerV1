@@ -18,9 +18,9 @@ even with a service connected.
 
 Every recipient gets a message of their own. A list holds people at different
 organisations who have no reason to learn each other's addresses, and one
-address that bounces should not hold up the rest. It also lets each message
-carry its own link to stop them, in the body and in the List-Unsubscribe
-header mail programs show as an "Unsubscribe" button.
+address that bounces should not hold up the rest. It is also what lets each
+message carry its own unsubscribe link: `send(personalize=...)` is asked for
+each address's body and headers just before that address's message goes.
 
 Outcomes, recorded for every email:
 
@@ -38,12 +38,12 @@ before anyone else receives one.
 """
 from __future__ import annotations
 
-import html as html_lib
 import logging
 import smtplib
 import ssl
 import time
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formataddr, make_msgid
 
@@ -68,20 +68,16 @@ HOW_TO_CONNECT = (
 RETRY_AFTER_MAX = 5
 
 
+# (text, html, extra headers) for one address.
+Content = tuple[str, "str | None", dict]
+Personalize = Callable[[str], Content]
+
+
 @dataclass
 class Delivery:
     status: str                 # drafted | sent | partial | failed
     recipients: list[str]       # who it was addressed to, after any redirect
     detail: str = ""
-
-
-@dataclass
-class Outgoing:
-    """One recipient's copy: the shared text, plus their own link to stop."""
-    address: str
-    text: str
-    html: str | None = None
-    headers: dict = field(default_factory=dict)
 
 
 class Mailer:
@@ -185,18 +181,20 @@ class Mailer:
     # ------------------------------------------------------------------ sending
     def send(self, to: list[str], subject: str, text: str,
              html: str | None = None,
-             unsubscribe: dict[str, str] | None = None) -> Delivery:
-        """`unsubscribe` maps an address to its own link for stopping these
-        emails; each copy carries its recipient's, and none goes elsewhere."""
+             personalize: Personalize | None = None) -> Delivery:
+        """Send one message per recipient.
+
+        `personalize(address)`, when given, returns that address's own
+        (text, html, headers) in place of the shared ones — for an unsubscribe
+        link that only works for the person it was sent to.
+        """
         recipients = [a for a in dict.fromkeys(x.strip() for x in to) if a]
         if not recipients:
             return Delivery("failed", [], "No recipients.")
 
-        links = dict(unsubscribe or {})
         if self.redirect:
             subject = f"[for {', '.join(recipients)}] {subject}"
             recipients = [self.redirect]
-            links = {}          # theirs, not the redirect address's to use
 
         if self.switched_off:
             return Delivery("drafted", recipients,
@@ -208,10 +206,12 @@ class Mailer:
             return Delivery("failed", recipients,
                             f"Not sent: {' and '.join(self.missing)} not set.")
 
+        def content(address: str) -> Content:
+            return personalize(address) if personalize else (text, html, {})
+
         deliver = {"brevo": self._brevo, "resend": self._resend,
                    "smtp": self._smtp}[self.transport]
-        failures = deliver([personal(a, text, html, links.get(a, "")) for a in recipients],
-                           subject)
+        failures = deliver(recipients, subject, content)
 
         reached = [a for a in recipients if a not in failures]
         if failures:
@@ -262,41 +262,43 @@ class Mailer:
         return f"the mail service refused it ({resp.status_code}): " \
                f"{message[:240] or 'no reason given'}"
 
-    def _brevo(self, messages: list[Outgoing], subject: str) -> dict[str, str]:
+    def _brevo(self, recipients, subject, content) -> dict[str, str]:
         headers = {"api-key": self._setting("brevo_api_key"), "accept": "application/json"}
         failures = {}
-        for m in messages:
+        for address in recipients:
+            text, html, extra = content(address)
             body = {"sender": {"name": SENDER_NAME, "email": self.sender},
-                    "to": [{"email": m.address}], "subject": subject, "textContent": m.text}
-            if m.html:
-                body["htmlContent"] = m.html
-            if m.headers:
-                body["headers"] = m.headers
+                    "to": [{"email": address}], "subject": subject, "textContent": text}
+            if html:
+                body["htmlContent"] = html
+            if extra:
+                body["headers"] = extra
             if self.reply_to:
                 body["replyTo"] = {"email": self.reply_to}
             reason = self._post(BREVO_URL, headers, body, ok=(201, 202))
             if reason:
-                failures[m.address] = reason
+                failures[address] = reason
         return failures
 
-    def _resend(self, messages: list[Outgoing], subject: str) -> dict[str, str]:
+    def _resend(self, recipients, subject, content) -> dict[str, str]:
         headers = {"Authorization": f"Bearer {self._setting('resend_api_key')}"}
         failures = {}
-        for m in messages:
-            body = {"from": formataddr((SENDER_NAME, self.sender)), "to": [m.address],
-                    "subject": subject, "text": m.text}
-            if m.html:
-                body["html"] = m.html
-            if m.headers:
-                body["headers"] = m.headers
+        for address in recipients:
+            text, html, extra = content(address)
+            body = {"from": formataddr((SENDER_NAME, self.sender)), "to": [address],
+                    "subject": subject, "text": text}
+            if html:
+                body["html"] = html
+            if extra:
+                body["headers"] = extra
             if self.reply_to:
                 body["reply_to"] = self.reply_to
             reason = self._post(RESEND_URL, headers, body, ok=(200, 201, 202))
             if reason:
-                failures[m.address] = reason
+                failures[address] = reason
         return failures
 
-    def _smtp(self, messages: list[Outgoing], subject: str) -> dict[str, str]:
+    def _smtp(self, recipients, subject, content) -> dict[str, str]:
         security = (self._setting("smtp_security") or "starttls").lower()
         host, port = self._setting("smtp_host"), int(self.cfg.smtp_port)
         failures: dict[str, str] = {}
@@ -319,25 +321,26 @@ class Mailer:
                 user, password = self._setting("smtp_user"), self._setting("smtp_password")
                 if user and password:
                     server.login(user, password)
-                for m in messages:
+                for address in recipients:
+                    text, html, extra = content(address)
                     message = EmailMessage()
                     message["From"] = formataddr((SENDER_NAME, self.sender))
-                    message["To"] = m.address
+                    message["To"] = address
                     message["Subject"] = subject
                     message["Message-ID"] = make_msgid(
                         domain=self.sender.split("@")[-1] or None)
                     if self.reply_to:
                         message["Reply-To"] = self.reply_to
-                    for name, value in m.headers.items():
+                    for name, value in extra.items():
                         message[name] = value
-                    message.set_content(m.text)
-                    if m.html:
-                        message.add_alternative(m.html, subtype="html")
+                    message.set_content(text)
+                    if html:
+                        message.add_alternative(html, subtype="html")
                     try:
                         server.send_message(message)
-                        handed_over.add(m.address)
+                        handed_over.add(address)
                     except smtplib.SMTPException as exc:
-                        failures[m.address] = reason_of(exc)
+                        failures[address] = reason_of(exc)
         except (smtplib.SMTPException, OSError) as exc:
             # Could not connect or sign in, or the connection dropped part-way:
             # everyone the server had not already taken a message for.
@@ -345,24 +348,10 @@ class Mailer:
             if isinstance(exc, TimeoutError) and port in BLOCKED_ON_FREE_RENDER:
                 why += (f" — port {port} is blocked on Render's free plan; use port "
                         f"2525 or RESEND_API_KEY")
-            for m in messages:
-                if m.address not in handed_over:
-                    failures.setdefault(m.address, why)
+            for address in recipients:
+                if address not in handed_over:
+                    failures.setdefault(address, why)
         return failures
-
-
-def personal(address: str, text: str, html: str | None, link: str) -> Outgoing:
-    """One recipient's copy. With a link, it ends with it, and carries it as
-    the one-click unsubscribe header (RFC 8058) mail programs act on."""
-    if not link:
-        return Outgoing(address, text, html)
-    text = f"{text}\n\nTo stop these emails: {link}"
-    if html:
-        html += (f'<p style="color:#777;font-size:12.5px"><a href="{html_lib.escape(link)}">'
-                 f"Stop these emails</a></p>")
-    return Outgoing(address, text, html, {
-        "List-Unsubscribe": f"<{link}>",
-        "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"})
 
 
 def _retry_after(resp) -> float:

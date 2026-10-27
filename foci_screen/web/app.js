@@ -2745,7 +2745,13 @@ async function alertsCard(key, portfolioName) {
       </label>
       ${!editable ? `<p class="muted" style="font-size:12.5px">Each new address is first
         sent an email asking it to confirm. Nothing else is sent to it until it does, and
-        every alert ends with a link to stop them.</p>` : ""}
+        every alert ends with a link to unsubscribe.</p>` : ""}
+      ${list && (list.opted_out || []).length ? `<p class="muted" style="font-size:12.5px">
+        Unsubscribed themselves, from the link in an alert:
+        ${list.opted_out.map((o) => `<span class="mono">${esc(o.email)}</span>
+          (${esc(day(o.at))})`).join(", ")}.
+        They are not emailed again, even if added back here; they can rejoin from that
+        same link.</p>` : ""}
       ${outOfDate ? `<p class="muted" style="font-size:12.5px">This portfolio has changed
         since the list was saved. Save again to watch the new companies.</p>` : ""}
       <div class="actions">
@@ -2823,7 +2829,10 @@ function wireAlerts(key, portfolioName) {
         portfolio_key: key,
       });
       rememberAlertListId(r.subscription.subscription_id);
-      alertSaveNote = consentNote(r.consent);
+      alertSaveNote = [
+        (r.declined || []).length ? `Not added: ${r.declined.join(", ")} unsubscribed `
+          + "themselves, and can rejoin from the link in their last alert." : "",
+        consentNote(r.consent)].filter(Boolean).join(" ");
       viewPortfolio();
     } catch (e) {
       save.disabled = false;
