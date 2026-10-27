@@ -255,3 +255,50 @@ def test_a_lock_is_shared_between_two_connections(pg):
     two.unlock("something-else")
     one.close()
     two.close()
+
+
+def test_consent_unsubscribing_bounces_sends_and_sign_in_behave_the_same_here(pg):
+    """The tables added for the open site, Resend, bounces, notice sends and
+    signing in, through the same calls the app makes."""
+    store = Store(pg, tenant_id="default")
+    try:
+        sid = store.save_alert_subscription(name="W", emails=["a@agency.gov"],
+                                            companies=["UEI1"], portfolio_key="k")
+        token = store.unsubscribe_token(sid, "A@Agency.gov")
+        assert token == store.unsubscribe_token(sid, "a@agency.gov")
+        store.add_alert_recipient(sid, "b@navy.mil", "pending")
+        store.mark_alert_recipient_asked(sid, "b@navy.mil")
+        assert store.alert_recipient_last_asked("b@navy.mil")
+        assert store.alert_recipients_asked_since("2000-01-01T00:00:00Z") == 1
+        b = store.alert_recipients(sid)["b@navy.mil"]
+        assert store.confirm_alert_recipient(b["token"])["status"] == "confirmed"
+
+        store.set_opted_out(token, True)
+        assert store.alert_subscription(sid)["emails"] == []
+        assert "a@agency.gov" in store.opted_out(sid)
+        store.set_opted_out(token, False)
+        assert store.alert_subscription(sid)["emails"] == ["a@agency.gov"]
+
+        store.suppress_address("a@agency.gov", "complaint", "spam", "resend")
+        store.suppress_address("a@agency.gov", "bounce", "gone", "resend")
+        assert store.suppressed(["a@agency.gov"])["a@agency.gov"]["kind"] == "complaint"
+
+        store.log_notice_send("n1", role="officer", recipient="ko@mail.mil", via="resend",
+                              status="sent", sent_by="me@concord.example")
+        store.log_notice_send("n1", role="copy", recipient="me@concord.example",
+                              via="resend", status="sent")
+        assert [r["role"] for r in store.notice_sends(["n1"])["n1"]] == ["officer", "copy"]
+
+        store.create_sign_in_link("h1", "me@concord.example", "2999-01-01T00:00:00Z")
+        assert store.sign_in_links_since("me@concord.example", "2000-01-01T00:00:00Z") == 1
+        assert store.use_sign_in_link("h1") == "me@concord.example"
+        assert store.use_sign_in_link("h1") == "", "once only"
+        store.create_session("s1", "me@concord.example", "2999-01-01T00:00:00Z")
+        assert store.session_email("s1") == "me@concord.example"
+        store.end_session("s1")
+        assert store.session_email("s1") == ""
+
+        assert store.delete_alert_subscription(sid)
+        assert store.optout_by_token(token) is None
+    finally:
+        store.close()

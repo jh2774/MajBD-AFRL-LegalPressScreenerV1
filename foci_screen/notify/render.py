@@ -248,12 +248,15 @@ def message_from_notice(notice: dict, *, sender: str,
     msg["X-FOCI-Severity"] = notice.get("severity") or ""
     msg["X-FOCI-Notice"] = notice.get("notice_id") or ""
     msg.set_content(body)
-    msg.add_alternative(
-        "<html><body style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
-        "font-size:14px;line-height:1.5;color:#1a1a1a\"><pre style=\"white-space:"
-        "pre-wrap;font-family:inherit\">" + html.escape(body) + "</pre></body></html>",
-        subtype="html")
+    msg.add_alternative(notice_html(body), subtype="html")
     return msg
+
+
+def notice_html(body: str) -> str:
+    """A notice's text as HTML that keeps its line breaks and nothing else."""
+    return ("<html><body style=\"font-family:-apple-system,Segoe UI,Roboto,sans-serif;"
+            "font-size:14px;line-height:1.5;color:#1a1a1a\"><pre style=\"white-space:"
+            "pre-wrap;font-family:inherit\">" + html.escape(body) + "</pre></body></html>")
 
 
 def write_eml(finding: Finding, out_dir: str, *, sender: str, recipient: str,

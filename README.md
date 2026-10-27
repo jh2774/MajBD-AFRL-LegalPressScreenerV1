@@ -458,8 +458,9 @@ every night on a deploy that was screening nothing.
 | `PUT / DELETE /v1/watchlists/{id}/policy` | The screening-policy settings one watchlist changes — the rest follow the tenant |
 | `POST /v1/watchlists/{id}/resume` | Put a paused watchlist back on the nightly sweep (`DELETE /v1/watchlists/{id}` pauses it) |
 | `GET /v1/notices` | The review queue |
-| `POST /v1/notices/{id}/approve` | The human gate. Records the decision, then hands the notice to Gmail if delivery is switched on |
-| `POST /v1/notices/{id}/deliver` | Try again for an approved notice that has not reached Gmail |
+| `POST /v1/notices/{id}/approve` | The human gate. Records the decision, then sends the notice as `send_to` says: `officer` (the default), `copy` (to `copy_to`), `both` or `none` |
+| `POST /v1/notices/{id}/deliver` | Send an approved notice later — to the officer once at most, a copy to `copy_to` as often as asked |
+| `POST /v1/auth/sign-in` | Email a sign-in link to an address in `FOCI_ADMIN_EMAILS` (`GET /v1/auth` says who is signed in) |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |
 
 **Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset, every
@@ -474,6 +475,18 @@ approve or reject a notice, and open the system check; with no key configured th
 address off, and each address they add must confirm before it receives anything
 (`foci_screen/consent.py`). [docs/VERCEL.md](docs/VERCEL.md), "Who can do what", has the
 detail.
+
+**Signing in** (`foci_screen/api/signin.py`) does what a key does, for the addresses in
+`FOCI_ADMIN_EMAILS`, and records the person by name on approvals and sends — a shared key
+records only `api-key:default`. A one-use link is emailed; the session is an HttpOnly,
+SameSite=Lax cookie stored only as a hash, and counts on a change only with the header the
+site's own pages send. It also lets a closed site (no `FOCI_PUBLIC`) be used without handing
+out keys.
+
+**Sending notices.** Approved notices go to the contracting officer, a chosen address, or both
+(`foci_screen/notify/notices.py`): through Gmail when `GMAIL_ENABLED`, otherwise through the
+site's mail service, where reaching an officer also needs `NOTICES_SEND=true` because there are
+no drafts. Every send is logged in `notice_sends`, which outlives the screen behind it.
 
 **Tenancy.** Runs, findings, notices and watchlists are tenant-scoped. Snapshots deliberately
 are not — a document's hash is a fact about the world, not about who is watching, so ten

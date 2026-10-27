@@ -12,6 +12,7 @@ reviewer, and never implied by anything else.
 from __future__ import annotations
 
 import hashlib
+import html as html_lib
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from ..connectors.usaspending import USASpendingConnector
 from ..connectors.vehicles import VehicleConnector, default_phrase, phrase_problem
 from ..jobs import HOLD_SECONDS, JobQueue, _hold_open
 from ..notify import bounces
+from ..notify import notices as notice_sending
 from ..notify import render as render_notice
 from ..notify.gmail import GmailNotifier
 from ..notify.mailer import LABEL as LABEL_OF_MAIL
@@ -55,26 +57,44 @@ from .schemas import (
     IdentityDecision,
     ManagerRequest,
     NoticeDecision,
+    NoticeSend,
     PortfolioEdit,
     PortfolioKey,
     PortfolioRequest,
     RuleSetting,
     ScreenRequest,
     SignalDisposition,
+    SignInRequest,
     VehicleRequest,
     WatchlistRequest,
 )
+from .signin import ASKED as SIGNIN_ASKED
+from .signin import COOKIE as SESSION_COOKIE
+from .signin import SignIn
+from .signin import link_email as signin_mail
+from .signin import secure as signin_secure
 
 log = logging.getLogger("foci.api")
 
 cfg = get_config()
 keymap = auth.parse_keys(cfg.api_keys)
-require_tenant = auth.make_dependency(keymap, public=cfg.public)
+# Signing in by email (signin.py), for whoever FOCI_ADMIN_EMAILS lists: what a
+# key does, with the person's name on it.
+signin = SignIn(lambda: store_for(auth.DEFAULT_TENANT), cfg)
+require_tenant = auth.make_dependency(keymap, public=cfg.public, session=signin.email_for,
+                                      sign_in=signin.configured)
 # Removing recorded work, changing how the site screens for everyone, and
 # approving a notice to a federal official. The same as require_tenant unless
-# the site is public, where these alone need a key.
-require_admin = auth.make_admin_dependency(keymap, public=cfg.public)
-is_admin = auth.make_admin_flag(keymap, public=cfg.public)
+# the site is public, where these alone need a key or a sign-in.
+require_admin = auth.make_admin_dependency(keymap, public=cfg.public,
+                                           session=signin.email_for,
+                                           sign_in=signin.configured)
+is_admin = auth.make_admin_flag(keymap, public=cfg.public, session=signin.email_for)
+
+
+def signed_in(request: Request) -> str:
+    """Who the request is signed in as, or "" — for recording who did what."""
+    return signin.email_for(request)
 queue = JobQueue(cfg)
 
 app = FastAPI(
@@ -150,7 +170,7 @@ def deployment_warnings() -> list[str]:
     host = cfg.managed_host
     on_sqlite = not cfg.dsn.startswith("postgres")
 
-    if not keymap and not cfg.public:
+    if not keymap and not cfg.public and not signin.configured:
         warnings.append(
             "FOCI_API_KEYS is not set: every authenticated route returns 503 and "
             "the web interface will show nothing. To open the site to anyone with "
@@ -200,6 +220,11 @@ def deployment_warnings() -> list[str]:
         warnings.append("Email alerts: " + mail["explanation"])
     if cfg.alerts_paused:
         warnings.append(ALERTS_PAUSED_NOTE)
+    if signin.configured and not Mailer(cfg).configured:
+        warnings.append(
+            "Sign-in is set up (FOCI_ADMIN_EMAILS) but no mail service is connected, so "
+            "no sign-in link can be sent. Connect one (RESEND_API_KEY and ALERTS_FROM), "
+            "or use the admin key.")
     # The same for notices: Gmail switched on but never signed in means every
     # approval silently stops short of Gmail.
     if cfg.gmail_enabled and not Path(cfg.gmail_token).is_file():
@@ -287,7 +312,7 @@ for _warning in deployment_warnings():
     # logging may not be configured yet under some servers, so print as well.
     log.error(_warning)
     print(f"\n*** {_warning}\n", flush=True)
-if not keymap and not cfg.public:
+if not keymap and not cfg.public and not signin.configured:
     # The long form says how to set it; the health warning stays short enough
     # to read in a banner.
     print(f"*** {auth.STARTUP_WARNING}\n", flush=True)
@@ -322,7 +347,9 @@ def health() -> dict:
                        "bounce_reports": _bounce_reports()},
             # What an approved notice turns into: render_only, draft, send or
             # redirected.
-            "notices": {"mode": _delivery_state()["mode"]},
+            "notices": {"mode": notice_sending.state(cfg)["mode"]},
+            # Whether anyone may sign in by email; nobody's address.
+            "sign_in": signin.configured,
             "warnings": deployment_warnings()}
 
 
@@ -2058,7 +2085,7 @@ def list_watchlists(store: Store = Depends(tenant_store)) -> dict:
 
 @app.put("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
 def set_watchlist_policy(watchlist_id: str, body: dict,
-                         store: Store = Depends(admin_store)) -> dict:
+                         store: Store = Depends(tenant_store)) -> dict:
     """Replace the settings this watchlist overrides. Takes effect on its next run.
 
     Name only what differs from the tenant policy — `{"notice_min_severity":
@@ -2075,7 +2102,7 @@ def set_watchlist_policy(watchlist_id: str, body: dict,
 
 @app.delete("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
 def clear_watchlist_policy(watchlist_id: str,
-                           store: Store = Depends(admin_store)) -> dict:
+                           store: Store = Depends(tenant_store)) -> dict:
     """Back to the tenant policy for everything."""
     if not store.set_watchlist_policy(watchlist_id, None):
         raise HTTPException(404, "No such watchlist.")
@@ -2127,9 +2154,32 @@ NOTICE_STATUS = "^(|pending|approved|rejected|drafted|sent|suppressed|superseded
 @app.get("/v1/notices", tags=["notices"])
 def list_notices(status: str = Query("", pattern=NOTICE_STATUS),
                  limit: int = Query(50, ge=1, le=200),
-                 store: Store = Depends(tenant_store)) -> dict:
+                 store: Store = Depends(tenant_store),
+                 admin: bool = Depends(is_admin)) -> dict:
     notices = store.list_notices(status=status, limit=limit)
-    return {"notices": [{**n, "edits": store.notice_edits(n)} for n in notices]}
+    sends = store.notice_sends([n["notice_id"] for n in notices])
+    return {"notices": [_shown_notice(store, n, sends.get(n["notice_id"], []), admin)
+                        for n in notices],
+            "sending": {k: v for k, v in notice_sending.state(cfg).items()
+                        if admin or k != "detail"},
+            "reply_to": bool(Mailer(cfg).reply_to), "can_decide": admin}
+
+
+def _shown_notice(store: Store, notice: dict, sends: list[dict], admin: bool) -> dict:
+    """A notice as the page shows it. The officer's address is public record
+    (it comes from the award); where a copy went, and who sent it, may be a
+    private address, and visitors to a public site see those masked."""
+    out = {**notice, "edits": store.notice_edits(notice), "sends": [
+        {k: r[k] for k in ("role", "recipient", "via", "status", "detail", "sent_by",
+                           "sent_at")} for r in sends]}
+    if not admin:
+        for key in ("delivered_to", "delivery_detail", "decided_by"):
+            out[key] = consent.mask_text(out.get(key) or "") or None
+        out["sends"] = [{**r, "recipient": consent.mask_text(r["recipient"]),
+                         "detail": consent.mask_text(r["detail"] or ""),
+                         "sent_by": consent.mask_text(r["sent_by"] or "")}
+                        for r in out["sends"]]
+    return out
 
 
 # Declared before /v1/notices/{notice_id}: routes match in definition order, and
@@ -2147,22 +2197,26 @@ def download_notice(notice_id: str, store: Store = Depends(tenant_store)) -> Res
 
 
 @app.get("/v1/notices/{notice_id}", tags=["notices"])
-def get_notice(notice_id: str, store: Store = Depends(tenant_store)) -> dict:
+def get_notice(notice_id: str, store: Store = Depends(tenant_store),
+               admin: bool = Depends(is_admin)) -> dict:
     notice = store.get_notice(notice_id)
     if notice is None:
         raise HTTPException(404, "No such notice.")
-    return {**notice, "edits": store.notice_edits(notice)}
+    return _shown_notice(store, notice, store.notice_sends([notice_id]).get(notice_id, []),
+                         admin)
 
 
-def _decider(body: NoticeDecision, tenant: str) -> str:
+def _decider(body: NoticeDecision, tenant: str, who: str = "") -> str:
     """Who to record as having decided.
 
-    Keys are shared per tenant, so without a name in the request the honest
-    attribution is the key, labelled as one. The bare tenant id was used before,
-    and a tenant called "default" produced "decided by default" — which reads as
-    an automatic approval on exactly the record meant to prove a person looked.
+    Someone signed in is recorded by their address, whatever the request
+    says. Keys are shared per tenant, so without a name in the request the
+    honest attribution is the key, labelled as one. The bare tenant id was used
+    before, and a tenant called "default" produced "decided by default" — which
+    reads as an automatic approval on exactly the record meant to prove a person
+    looked.
     """
-    return body.decided_by.strip() or f"api-key:{tenant}"
+    return who or body.decided_by.strip() or f"api-key:{tenant}"
 
 
 def _decision_error(outcome: str) -> None:
@@ -2176,15 +2230,17 @@ def _decision_error(outcome: str) -> None:
 
 @app.post("/v1/notices/{notice_id}/approve", tags=["notices"])
 def approve_notice(notice_id: str, body: NoticeDecision,
-                   tenant: str = Depends(require_admin)) -> dict:
-    """Approve a notice, optionally with an edited body, and hand it to Gmail.
+                   tenant: str = Depends(require_admin),
+                   who: str = Depends(signed_in)) -> dict:
+    """Approve a notice, optionally with an edited body, then send it.
 
-    Approval is the decision; delivery follows it under the same guards as
-    everything else: nothing leaves unless `GMAIL_ENABLED`, it becomes a draft
-    rather than a send unless `GMAIL_SEND`, and while `FOCI_EMAIL_REDIRECT_TO` is
-    set it goes to that address instead of the officer. If delivery does not
-    happen — switched off, not signed in, refused — the approval still stands
-    and `POST /v1/notices/{id}/deliver` tries again.
+    Approval is the decision; sending follows it, to whoever `send_to` names:
+    the contracting officer on the notice (as approving always has), an
+    address the reviewer chooses (`copy_to`), both, or nobody yet. Where it
+    can go and how is `notify.notices`: Gmail, or the site's mail service
+    once NOTICES_SEND allows officers, and FOCI_EMAIL_REDIRECT_TO over both.
+    If sending does not happen — switched off, refused — the approval still
+    stands and `POST /v1/notices/{id}/deliver` tries again.
 
     An edit may change anything except the limitations statement. That paragraph
     is what makes the notice a screening result rather than an assertion about a
@@ -2194,43 +2250,58 @@ def approve_notice(notice_id: str, body: NoticeDecision,
     notice = store.get_notice(notice_id)
     if notice is None:
         raise HTTPException(404, "No such notice.")
-    if not (notice.get("recipient") or "").strip():
+    if body.to_officer and not (notice.get("recipient") or "").strip():
         raise HTTPException(
-            409, "This notice has no resolved contracting officer; it cannot be "
-                 "addressed. Download the .eml and route it manually.")
+            409, "This notice has no resolved contracting officer, so it cannot be sent "
+                 "to one. Approve it with a copy to an address you choose, or download "
+                 "the .eml and route it yourself.")
     if body.body_text and not render_notice.has_disclaimer(body.body_text):
         raise HTTPException(
             422, "The edited notice no longer contains the limitations statement. "
                  "It can be reworded around, but not removed: without it the notice "
                  "reads as a finding against the contractor rather than a screen.")
 
+    decider = _decider(body, tenant, who)
     _decision_error(store.decide_notice(
-        notice_id, "approved", decided_by=_decider(body, tenant),
-        note=body.note, body_text=body.body_text))
+        notice_id, "approved", decided_by=decider, note=body.note,
+        body_text=body.body_text))
     edited = bool((store.get_notice(notice_id) or {}).get("original_body_text"))
-    delivery = _deliver(store, notice_id)
-    return {"notice_id": notice_id, "status": delivery.pop("notice_status"),
-            "edited": edited, "delivery": delivery}
+    sent = _send(store, notice_id, body, sent_by=decider)
+    return {"notice_id": notice_id, "edited": edited, **sent}
 
 
 @app.post("/v1/notices/{notice_id}/deliver", tags=["notices"])
-def deliver_notice(notice_id: str, store: Store = Depends(admin_store)) -> dict:
-    """Try again to deliver an approved notice that has not reached Gmail.
+def deliver_notice(notice_id: str, body: NoticeSend | None = None,
+                   tenant: str = Depends(require_admin),
+                   who: str = Depends(signed_in)) -> dict:
+    """Send an approved notice: to the officer, an address you choose, or both.
 
-    For a notice approved while delivery was off, or whose delivery failed.
-    Only an approved notice qualifies: a pending one has not been decided, and
-    one already drafted or sent is not sent twice.
+    To the officer only once: for a notice approved while sending was off,
+    or whose sending failed. A copy to a chosen address can go from any
+    approved notice, delivered or not, and as often as asked. A notice not
+    yet approved, or rejected, goes nowhere.
     """
+    store = store_for(tenant)
+    body = body or NoticeSend()
     notice = store.get_notice(notice_id)
     if notice is None:
         raise HTTPException(404, "No such notice.")
-    if notice["status"] != "approved":
+    if body.to_officer and notice["status"] != "approved":
         raise HTTPException(
-            409, f"Only an approved notice that has not been delivered can be; this "
-                 f"one is {notice['status']}.")
-    delivery = _deliver(store, notice_id)
-    return {"notice_id": notice_id, "status": delivery.pop("notice_status"),
-            "delivery": delivery}
+            409, f"Only an approved notice that has not reached the officer can be sent "
+                 f"to them; this one is {notice['status']}."
+                 + (" A copy to an address you choose can still go."
+                    if notice["status"] in ("drafted", "sent") else ""))
+    if notice["status"] not in ("approved", "drafted", "sent"):
+        raise HTTPException(409, f"Only an approved notice can be sent; this one is "
+                                 f"{notice['status']}.")
+    if body.to_officer and not (notice.get("recipient") or "").strip():
+        raise HTTPException(409, "This notice has no resolved contracting officer. Send a "
+                                 "copy to an address you choose instead.")
+    if body.send_to == "none":
+        raise HTTPException(400, "Say who to send it to.")
+    return {"notice_id": notice_id,
+            **_send(store, notice_id, body, sent_by=_decider(NoticeDecision(), tenant, who))}
 
 
 # One notifier for the process, so a Gmail connection is made once rather than
@@ -2238,24 +2309,44 @@ def deliver_notice(notice_id: str, store: Store = Depends(admin_store)) -> dict:
 _gmail = GmailNotifier(cfg)
 
 
-def _deliver(store: Store, notice_id: str) -> dict:
-    """Hand an approved notice to Gmail and record the outcome on it."""
+def _send(store: Store, notice_id: str, body: NoticeSend, *, sent_by: str) -> dict:
+    """Send an approved notice where `body` says, recording each attempt.
+
+    `delivery` is the officer's copy, as it always was — `outcome` says what
+    happened, "not_requested" when it was not asked for — and `copy` the copy
+    to a chosen address, if any.
+    """
     notice = store.get_notice(notice_id) or {}
-    result = _gmail.deliver_notice(notice)
-    if store.record_notice_delivery(notice_id, result.status,
-                                    delivered_to=result.recipient,
-                                    detail=result.detail) != "ok":
-        # Decided by someone else between the read and the write; what Gmail
-        # did is still worth saying, but the row is theirs.
-        log.warning("notice %s changed state during delivery", notice_id)
+    state = notice_sending.state(cfg)
+    delivery = {**state, "outcome": "not_requested", "to": "",
+                "detail": "Not sent to the contracting officer."}
+    copy = None
+    targets = []
+    if body.to_officer:
+        targets.append((notice_sending.OFFICER, notice.get("recipient") or ""))
+    if body.copy_to:
+        targets.append((notice_sending.COPY, body.copy_to))
+    for role, address in targets:
+        out = notice_sending.send(cfg, _gmail, notice, role=role, address=address)
+        store.log_notice_send(notice_id, role=role, recipient=out.to, via=out.via,
+                              status=out.status, detail=out.detail, sent_by=sent_by)
+        if role == notice_sending.OFFICER:
+            if store.record_notice_delivery(notice_id, out.status, delivered_to=out.to,
+                                            detail=out.detail) != "ok":
+                # Decided by someone else between the read and the write; what
+                # happened is still worth saying, but the row is theirs.
+                log.warning("notice %s changed state during delivery", notice_id)
+            delivery = {**state, "outcome": out.status, "to": out.to, "detail": out.detail}
+        else:
+            copy = {"outcome": out.status, "to": out.to, "detail": out.detail}
     current = store.get_notice(notice_id) or {}
-    return {**_delivery_state(), "outcome": result.status, "to": result.recipient,
-            "detail": result.detail, "notice_status": current.get("status", "")}
+    return {"status": current.get("status", ""), "delivery": delivery, "copy": copy}
 
 
 @app.post("/v1/notices/{notice_id}/reject", tags=["notices"])
 def reject_notice(notice_id: str, body: NoticeDecision,
-                  tenant: str = Depends(require_admin)) -> dict:
+                  tenant: str = Depends(require_admin),
+                  who: str = Depends(signed_in)) -> dict:
     """Reject a notice.
 
     Worth capturing the reason: rejections are the only labelled false-positive
@@ -2263,22 +2354,76 @@ def reject_notice(notice_id: str, body: NoticeDecision,
     """
     store = store_for(tenant)
     _decision_error(store.decide_notice(
-        notice_id, "rejected", decided_by=_decider(body, tenant), note=body.note))
+        notice_id, "rejected", decided_by=_decider(body, tenant, who), note=body.note))
     return {"notice_id": notice_id, "status": "rejected"}
 
 
-def _delivery_state() -> dict:
-    if not cfg.gmail_enabled:
-        return {"mode": "render_only",
-                "detail": "GMAIL_ENABLED is false; download the .eml to route it."}
-    if cfg.email_redirect_to:
-        return {"mode": "redirected",
-                "detail": f"Approved notices go to {cfg.email_redirect_to} instead of the "
-                          f"officer, as Gmail "
-                          f"{'sends' if cfg.gmail_send else 'drafts'}."}
-    return {"mode": "send" if cfg.gmail_send else "draft",
-            "detail": "Approved notices become Gmail drafts for someone to send."
-                      if not cfg.gmail_send else "Approved notices are sent through Gmail."}
+# --------------------------------------------------------------- signing in
+# signin.py says why. The link in the email opens a page with a button, as
+# every link this site emails does; pressing it starts the session.
+
+@app.get("/v1/auth", tags=["meta"])
+def who_am_i(request: Request) -> dict:
+    """Whether anyone may sign in here, and who this browser is signed in as."""
+    return {"sign_in": signin.configured, "email": signin.email_for(request)}
+
+
+@app.post("/v1/auth/sign-in", tags=["meta"])
+def ask_for_sign_in(body: SignInRequest, request: Request) -> dict:
+    """Email a sign-in link, if the address may sign in. The answer is the same
+    whether it may or not."""
+    if not signin.configured:
+        raise HTTPException(404, "Signing in is not set up on this site.")
+    mailer = Mailer(cfg)
+    if not mailer.configured:
+        raise HTTPException(503, "Signing in needs the site's mail service, which is not "
+                                 "connected. Use the admin key.")
+    secret = signin.link_for(body.email)
+    if secret:
+        base = _base_url(request)
+        subject, text, html = signin_mail(f"{base}/auth/sign-in/{secret}", base)
+        delivery = mailer.send([body.email.strip().lower()], subject, text, html,
+                               asked_for=True)
+        if delivery.status != "sent":
+            log.warning("sign-in link not sent: %s", delivery.detail)
+    return {"status": "asked", "detail": SIGNIN_ASKED}
+
+
+@app.get("/auth/sign-in/{secret}", include_in_schema=False)
+def sign_in_page(secret: str) -> HTMLResponse:
+    if not signin.link_usable(secret):
+        return _link_page("Link no longer works",
+                          "<p>This sign-in link has been used, has expired, or is not one "
+                          "this site sent. Ask for a new one from the site.</p>", 404)
+    return _link_page(
+        "Sign in to FOCI-Screener",
+        f'<form method="post" action="/auth/sign-in/{html_lib.escape(secret)}">'
+        f'<button type="submit">Sign in</button></form>'
+        f'<p class="muted" style="margin-top:16px">This browser stays signed in for '
+        f"30 days, or until you sign out.</p>")
+
+
+@app.post("/auth/sign-in/{secret}", include_in_schema=False)
+def sign_in(secret: str, request: Request) -> Response:
+    email = signin.use_link(secret)
+    if not email:
+        return _link_page("Link no longer works",
+                          "<p>This sign-in link has been used, has expired, or is not one "
+                          "this site sent. Ask for a new one from the site.</p>", 404)
+    value, lifetime = signin.start_session(email)
+    log.info("signed in: %s", consent.mask(email))
+    response = Response(status_code=303, headers={"Location": "/#/"})
+    response.set_cookie(SESSION_COOKIE, value, max_age=lifetime, httponly=True,
+                        secure=signin_secure(request), samesite="lax", path="/")
+    return response
+
+
+@app.post("/v1/auth/sign-out", tags=["meta"])
+def sign_out(request: Request) -> Response:
+    signin.end_session(request)
+    response = Response(status_code=204)
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
 
 
 # ---------------------------------------------------------------------- web

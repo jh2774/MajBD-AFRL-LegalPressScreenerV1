@@ -140,7 +140,6 @@ ADMIN_ONLY = [
     ("delete", "/v1/policy", None),
     ("put", "/v1/rules/R1", {"enabled": False}),
     ("delete", "/v1/rules/R1", None),
-    ("put", "/v1/watchlists/w1/policy", {}),
     ("post", "/v1/notices/n1/approve", {"reviewer": "x"}),
     ("post", "/v1/notices/n1/reject", {"reviewer": "x"}),
     ("post", "/v1/notices/n1/deliver", None),
@@ -497,3 +496,21 @@ def test_the_daily_check_needs_only_the_sites_address():
                 / "alerts.yml").read_text(encoding="utf-8")
     assert 'if [ -z "$SITE" ]; then' in workflow
     assert '[ -z "$KEY" ]' not in workflow, "a key is sent only where one is set"
+
+
+def test_the_daily_sweep_runs_only_active_watchlists_and_waits_for_each(site):
+    """Nothing on Vercel sweeps watchlists in the background; the workflow does.
+    `active` comes back as 1 or 0 — and jq counts 0 as true."""
+    workflow = (Path(__file__).resolve().parent.parent / ".github" / "workflows"
+                / "watchlists.yml").read_text(encoding="utf-8")
+    assert "select(.active == 1 or .active == true)" in workflow
+    assert "$SITE$execute" in workflow, "on Vercel the request is the screen"
+
+    c, app_module = site(FOCI_PUBLIC="true")
+    store = app_module.store_for("default")
+    live = store.create_watchlist("live", {"agency": "DoD"})
+    paused = store.create_watchlist("paused", {"agency": "DoD"})
+    store.set_watchlist_active(paused, False)
+    listed = {w["watchlist_id"]: w["active"] for w in c.get("/v1/watchlists").json()[
+        "watchlists"]}
+    assert listed[live] in (1, True) and listed[paused] in (0, False)

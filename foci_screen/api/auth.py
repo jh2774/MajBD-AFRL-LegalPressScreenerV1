@@ -20,12 +20,17 @@ without a key. A key is then an admin key, needed only for what removes work
 or changes the site for everyone, and for the one action that emails a federal
 official — see `make_admin_dependency`. Alert emails need no key because each
 address has to confirm before it receives one (`consent`).
+
+**Signing in** (`signin.py`, when FOCI_ADMIN_EMAILS lists anyone) does what a
+key does, as the default tenant, and names the person. Each dependency takes
+`session`, which answers who a request is signed in as.
 """
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
 
 CLOSED_DETAIL = (
     "FOCI_API_KEYS is not set, so the API is closed and no data can be read. "
@@ -85,15 +90,23 @@ def resolve_tenant(keymap: dict[str, str], presented: str) -> str:
 
 
 ADMIN_NEEDED = (
-    "This needs the site's admin key: it removes recorded work, changes how the "
-    "site screens for everyone, or emails a federal official. Enter the key with "
-    "\"Admin key\" at the top right.")
+    "This needs the site's admin key or a sign-in: it removes recorded work, "
+    "changes how the site screens for everyone, or emails a federal official. "
+    "Use the button at the top right.")
 
 ADMIN_UNSET = (
     "This needs an admin key, and this site has none. It is open to anyone with "
     "its address (FOCI_PUBLIC), so removing recorded work, changing how the site "
     "screens and approving notices are switched off until FOCI_API_KEYS is set "
-    "to a key for whoever looks after it.")
+    "to a key for whoever looks after it, or FOCI_ADMIN_EMAILS lists who may sign "
+    "in.")
+
+# Who a request is signed in as, or "". Supplied by the app (signin.SignIn).
+Session = Callable[[Request], str]
+
+
+def _nobody(_request: Request) -> str:
+    return ""
 
 
 def _presented(authorization: str, x_api_key: str) -> str:
@@ -103,10 +116,16 @@ def _presented(authorization: str, x_api_key: str) -> str:
     return presented
 
 
-def make_dependency(keymap: dict[str, str], public: bool = False):
-    """Build the FastAPI dependency that yields a tenant id."""
+def make_dependency(keymap: dict[str, str], public: bool = False,
+                    session: Session = _nobody, sign_in: bool = False):
+    """Build the FastAPI dependency that yields a tenant id.
+
+    `sign_in` says whether anyone may sign in, which keeps a closed site with
+    no keys from reporting itself as unconfigured.
+    """
 
     async def require_tenant(
+        request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> str:
@@ -118,7 +137,9 @@ def make_dependency(keymap: dict[str, str], public: bool = False):
             return (resolve_tenant(keymap, presented) if presented else "") \
                 or DEFAULT_TENANT
 
-        if not keymap:
+        if not presented and session(request):
+            return DEFAULT_TENANT
+        if not keymap and not sign_in:
             # Say how to fix it. The symptom otherwise is a web page that shows
             # nothing, which looks like missing data rather than missing config.
             raise HTTPException(
@@ -128,7 +149,9 @@ def make_dependency(keymap: dict[str, str], public: bool = False):
         if not presented:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Supply a key in Authorization: Bearer <key> or X-API-Key.",
+                detail="Sign in, or supply a key in Authorization: Bearer <key> or "
+                       "X-API-Key." if sign_in else
+                       "Supply a key in Authorization: Bearer <key> or X-API-Key.",
                 headers={"WWW-Authenticate": "Bearer"})
 
         tenant = resolve_tenant(keymap, presented)
@@ -140,38 +163,44 @@ def make_dependency(keymap: dict[str, str], public: bool = False):
     return require_tenant
 
 
-def make_admin_dependency(keymap: dict[str, str], public: bool = False):
+def make_admin_dependency(keymap: dict[str, str], public: bool = False,
+                          session: Session = _nobody, sign_in: bool = False):
     """The dependency for routes that remove recorded work, change how the
     site screens for everyone, or email a federal official.
 
-    Outside public mode every caller already holds a key, and any key will
-    do, as before. In public mode a key from FOCI_API_KEYS is required; with
-    none configured these routes are closed (403), not opened.
+    Outside public mode every caller already holds a key or is signed in, and
+    either will do, as before. In public mode one of them is required; with
+    neither configured these routes are closed (403), not opened.
     """
     if not public:
-        return make_dependency(keymap)
+        return make_dependency(keymap, session=session, sign_in=sign_in)
 
     async def require_admin(
+        request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> str:
-        if not keymap:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ADMIN_UNSET)
         presented = _presented(authorization, x_api_key)
+        if not presented and session(request):
+            return DEFAULT_TENANT
+        if not keymap and not sign_in:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ADMIN_UNSET)
         tenant = resolve_tenant(keymap, presented) if presented else ""
         if not tenant:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail=ADMIN_NEEDED if not presented else "That admin key is not "
-                       "one this site knows. Check it under \"Admin key\".",
+                       "one this site knows. Check it at the top right.",
                 headers={"WWW-Authenticate": "Bearer"})
         return tenant
 
     return require_admin
 
 
-def make_admin_flag(keymap: dict[str, str], public: bool = False):
-    """A dependency answering whether this request carries a known key.
+def make_admin_flag(keymap: dict[str, str], public: bool = False,
+                    session: Session = _nobody):
+    """A dependency answering whether this request carries a known key or a
+    sign-in.
 
     Always yes outside public mode, where a request without one never gets
     this far. In public mode it decides what a visitor is shown of other
@@ -180,12 +209,15 @@ def make_admin_flag(keymap: dict[str, str], public: bool = False):
     """
 
     async def is_admin(
+        request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> bool:
         if not public:
             return True
         presented = _presented(authorization, x_api_key)
-        return bool(presented and resolve_tenant(keymap, presented))
+        if presented:
+            return bool(resolve_tenant(keymap, presented))
+        return bool(session(request))
 
     return is_admin

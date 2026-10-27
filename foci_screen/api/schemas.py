@@ -146,11 +146,44 @@ class PortfolioEdit(BaseModel):
     names: dict[str, str] = Field(default_factory=dict)
 
 
-class NoticeDecision(BaseModel):
-    """An approve or reject. `body_text` lets a reviewer correct wording first."""
+class NoticeSend(BaseModel):
+    """Who an approved notice goes to: the contracting officer on it, an address
+    the reviewer chooses (`copy_to`), both, or — on approval — nobody yet."""
+    send_to: Literal["officer", "copy", "both", "none"] = "officer"
+    copy_to: str = Field("", max_length=254)
+
+    @model_validator(mode="after")
+    def clean_copy_to(self) -> NoticeSend:
+        import re
+
+        self.copy_to = self.copy_to.strip().lower()
+        if self.send_to in ("copy", "both"):
+            if not self.copy_to:
+                raise ValueError("Give the address to send the notice to.")
+            if not re.match(EMAIL_RX, self.copy_to):
+                raise ValueError(f"Not an email address: {self.copy_to}")
+        else:
+            self.copy_to = ""
+        return self
+
+    @property
+    def to_officer(self) -> bool:
+        return self.send_to in ("officer", "both")
+
+
+class NoticeDecision(NoticeSend):
+    """An approve or reject. `body_text` lets a reviewer correct wording first.
+
+    On approval, the notice is then sent as `send_to` says — to the officer
+    unless told otherwise, as approving always has. A reject sends nothing.
+    """
     note: str = ""
     body_text: str = ""
     decided_by: str = ""
+
+
+class SignInRequest(BaseModel):
+    email: str = Field(..., max_length=254)
 
 
 class RuleSetting(BaseModel):

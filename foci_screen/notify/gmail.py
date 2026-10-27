@@ -114,11 +114,14 @@ class GmailNotifier:
         return DeliveryResult("rendered", recipient, subject,
                               detail=f"wrote .eml for reading; {note}", path=str(path))
 
-    def deliver_notice(self, notice: dict, *, interactive: bool = False) -> DeliveryResult:
+    def deliver_notice(self, notice: dict, *, interactive: bool = False,
+                       recipient: str = "") -> DeliveryResult:
         """Hand one approved notice to Gmail, under the same three guards.
 
         The caller is responsible for the notice being approved; this only
-        decides where it goes and how. Outcomes:
+        decides where it goes and how. `recipient` addresses it to someone
+        other than the officer on the notice — a copy for the reviewer, say;
+        the redirect still applies. Outcomes:
 
           * rendered — GMAIL_ENABLED is false. Nothing left; the .eml can be
             downloaded from the review queue and routed by hand.
@@ -126,7 +129,7 @@ class GmailNotifier:
           * error — Gmail was meant to take it and did not. The reason is kept
             and the notice can be tried again.
         """
-        intended = (notice.get("recipient") or "").strip()
+        intended = (recipient or notice.get("recipient") or "").strip()
         subject = notice.get("subject") or "FOCI/IP screening notice"
         if not intended:
             return DeliveryResult("error", "", subject,

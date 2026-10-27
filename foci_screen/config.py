@@ -224,6 +224,10 @@ class Config:
     # that remove work or change the site for everyone (see api.auth). Off
     # unless set, so a deployment is never opened by accident.
     public: bool = field(default_factory=lambda: _flag("FOCI_PUBLIC", False))
+    # Who may sign in by email, comma separated. Signing in does what the admin
+    # key does, and records the person by name (api/signin.py). Empty: no
+    # sign-in, and the key alone.
+    admin_emails: str = field(default_factory=lambda: _env("FOCI_ADMIN_EMAILS"))
     cors_origins: str = field(default_factory=lambda: _env("FOCI_CORS_ORIGINS"))
 
     # --- HTTP behaviour ---
@@ -244,6 +248,11 @@ class Config:
     # Safety valve: while set, every draft is addressed here instead of the KO.
     email_redirect_to: str = field(
         default_factory=lambda: _env("FOCI_EMAIL_REDIRECT_TO"))
+    # Without Gmail, an approved notice can reach a contracting officer through
+    # the site's own mail service (Resend) — but only once this is set. There
+    # are no drafts there, so it is the deliberate act GMAIL_SEND is for Gmail.
+    # A copy to an address the reviewer chooses needs only the mail service.
+    notices_send: bool = field(default_factory=lambda: _flag("NOTICES_SEND", False))
 
     def ensure_dirs(self) -> None:
         for d in (self.cache_dir, self.out_dir):
@@ -286,6 +295,12 @@ class Config:
     @property
     def api_key_list(self) -> list[str]:
         return [k.strip() for k in self.api_keys.split(",") if k.strip()]
+
+    @property
+    def admin_email_list(self) -> list[str]:
+        return list(dict.fromkeys(
+            e.strip().lower() for e in self.admin_emails.replace(";", ",").split(",")
+            if "@" in e))
 
     @property
     def cors_origin_list(self) -> list[str]:

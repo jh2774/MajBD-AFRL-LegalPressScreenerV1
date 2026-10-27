@@ -55,6 +55,25 @@
   </form>
 </dialog>
 
+<dialog id="signin-dialog">
+  <form method="dialog" id="signin-form">
+    <h2>Sign in</h2>
+    <p class="muted" id="signin-explain">
+      Nobody needs to sign in to use this site. Signing in is for the people who look
+      after it: it does what the admin key does, and puts your name on what you approve
+      and send. A link to sign in is emailed to you.
+    </p>
+    <input id="signin-email" type="email" placeholder="you@example.com" autocomplete="email">
+    <p id="signin-status" class="muted" style="font-size:13px" aria-live="polite"></p>
+    <div class="dialog-actions">
+      <button value="cancel" class="ghost">Close</button>
+      <button type="button" class="ghost" id="signin-use-key">Use the admin key</button>
+      <button type="button" class="ghost" id="signin-out" hidden>Sign out</button>
+      <button type="button" class="primary" id="signin-send">Email me a link</button>
+    </div>
+  </form>
+</dialog>
+
 <footer class="foot">
   Screening output from public records. Not a FOCI determination, a sanctions
   adjudication, or a finding of non-compliance.

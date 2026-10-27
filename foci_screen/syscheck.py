@@ -32,7 +32,8 @@ log = logging.getLogger("foci.syscheck")
 # Every setting the application reads (`config.py`), so the ones in use on an
 # old site can be carried to a new one. A test holds this to the config.
 SETTINGS = (
-    "FOCI_API_KEYS", "FOCI_PUBLIC", "FOCI_USER_AGENT", "FOCI_PUBLIC_URL", "FOCI_CORS_ORIGINS",
+    "FOCI_API_KEYS", "FOCI_PUBLIC", "FOCI_ADMIN_EMAILS", "FOCI_USER_AGENT", "FOCI_PUBLIC_URL",
+    "FOCI_CORS_ORIGINS", "NOTICES_SEND",
     "DATABASE_URL", "INSTANCE_CONNECTION_NAME", "CLOUD_SQL_CONNECTION_NAME",
     "INSTANCE_UNIX_SOCKET", "DB_USER", "DB_NAME", "DB_PASS", "DB_PASSWORD",
     "DATABASE_URL_UNPOOLED", "POSTGRES_URL_NON_POOLING", "POSTGRES_URL", "FOCI_DB_SCHEMA",

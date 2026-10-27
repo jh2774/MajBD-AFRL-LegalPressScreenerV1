@@ -181,22 +181,27 @@ class Mailer:
     # ------------------------------------------------------------------ sending
     def send(self, to: list[str], subject: str, text: str,
              html: str | None = None,
-             personalize: Personalize | None = None) -> Delivery:
+             personalize: Personalize | None = None,
+             asked_for: bool = False) -> Delivery:
         """Send one message per recipient.
 
         `personalize(address)`, when given, returns that address's own
         (text, html, headers) in place of the shared ones — for an unsubscribe
         link that only works for the person it was sent to.
+
+        `asked_for` is for a message its recipient has just asked for, such as
+        a sign-in link. The redirect and ALERTS_SEND=false exist to keep mail
+        from reaching other people too early; neither applies to that.
         """
         recipients = [a for a in dict.fromkeys(x.strip() for x in to) if a]
         if not recipients:
             return Delivery("failed", [], "No recipients.")
 
-        if self.redirect:
+        if self.redirect and not asked_for:
             subject = f"[for {', '.join(recipients)}] {subject}"
             recipients = [self.redirect]
 
-        if self.switched_off:
+        if self.switched_off and not asked_for:
             return Delivery("drafted", recipients,
                             "Sending is switched off (ALERTS_SEND=false).")
         if not self.transport and not self.insisted:

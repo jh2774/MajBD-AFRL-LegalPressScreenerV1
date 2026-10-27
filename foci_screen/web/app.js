@@ -69,12 +69,20 @@ try {
   // Private mode or blocked storage: the key just will not persist.
 }
 
+/* Sent with every request. The header tells the server the request came
+ * from this site's own pages — a form on another site cannot send it — which
+ * is what lets a sign-in cookie count on a request that changes something. */
+function authHeaders() {
+  return {
+    "X-FOCI-Session": "1",
+    ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+  };
+}
+
 async function api(path) {
-  const res = await fetch(path, {
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-  });
+  const res = await fetch(path, { headers: authHeaders() });
   if (res.status === 401) {
-    throw { title: "Not authorised", message: "The API key is missing or wrong. Set it from the top right." };
+    throw { title: "Not authorised", message: "Sign in, or set the key, from the top right." };
   }
   if (res.status === 503) {
     // The server's detail names the variable and how to set it; repeating a
@@ -103,7 +111,7 @@ async function apiSend(method, path, body) {
     method,
     headers: {
       ...(body ? { "Content-Type": "application/json" } : {}),
-      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      ...authHeaders(),
     },
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
@@ -132,7 +140,7 @@ async function apiPost(path, body) {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      ...authHeaders(),
     },
     body: JSON.stringify(body || {}),
   });
@@ -2220,19 +2228,28 @@ async function viewNotices() {
       </details>` : ""}
       <div class="actions">
         <button class="dl">Download .eml</button>
-        ${n.status === "pending"
-          ? `<button class="primary approve" ${n.recipient ? "" : "disabled title='No recipient resolved'"}>Approve</button>
-             <button class="edit" ${n.recipient ? "" : "disabled title='No recipient resolved'"}>Edit, then approve</button>
+        ${n.status === "pending" && d.can_decide
+          ? `<button class="primary approve">Approve</button>
+             <button class="edit">Edit, then approve</button>
              <button class="reject">Reject</button>`
+          : n.status === "pending" ? ""
           : `<span class="muted" style="align-self:center">
                decided by ${esc(n.decided_by || "—")}${n.decision_note ? ` · ${esc(n.decision_note)}` : ""}</span>`}
-        ${n.status === "approved"
-          ? `<button class="deliver" title="Hand this approved notice to Gmail">Deliver now</button>`
-          : ""}
+        ${d.can_decide && n.status === "approved" ? '<button class="send-open">Send…</button>' : ""}
+        ${d.can_decide && ["drafted", "sent"].includes(n.status)
+          ? '<button class="send-open">Send a copy…</button>' : ""}
       </div>
       ${noticeDelivery(n)}
-      <div class="deliver-error error" hidden></div>
+      <div class="send-panel" hidden>
+        ${sendChoice(n, d, false)}
+        <div class="panel-error error" hidden></div>
+        <div class="actions">
+          <button class="primary send-confirm">Send</button>
+          <button class="ghost send-cancel">Cancel</button>
+        </div>
+      </div>
       <div class="decide-panel" hidden>
+        <div class="send-slot">${n.status === "pending" ? sendChoice(n, d, true) : ""}</div>
         <div class="edit-area" hidden>
           <label class="decide-prompt" for="body-${esc(n.notice_id)}">
             Notice text. Reword anything; the limitations statement at the end has
@@ -2257,10 +2274,13 @@ async function viewNotices() {
   view.innerHTML = `
     <div class="page-head">
       <h1>Notices</h1>
-      <div class="sub">${pending} awaiting review. Approving records a decision and
-        hands the notice to Gmail if delivery is switched on for this server — as a
-        draft for someone to send, unless sending has been turned on as well.</div>
-    </div>${cards}`;
+      <div class="sub">${pending} awaiting review. Approving records a decision; you then
+        choose who it goes to — the contracting officer named on it, an address you choose,
+        or both.${d.sending.detail ? ` ${esc(d.sending.detail)}` : ""}</div>
+    </div>
+    ${d.can_decide ? "" : `<div class="card muted" style="font-size:13px">Approving, rejecting
+      and sending notices need the admin key or a sign-in (top right).</div>`}
+    ${cards}`;
 
   const PROMPTS = {
     approve: {
@@ -2289,18 +2309,25 @@ async function viewNotices() {
     const errorBox = panel.querySelector(".panel-error");
     const dl = card.querySelector(".dl");
     if (dl) dl.onclick = () => downloadNotice(id);
-    const dv = card.querySelector(".deliver");
-    if (dv) dv.onclick = async () => {
-      const box = card.querySelector(".deliver-error");
-      dv.disabled = true;
+
+    const sendPanel = card.querySelector(".send-panel");
+    wireSendChoice(sendPanel);
+    wireSendChoice(panel);
+    const so = card.querySelector(".send-open");
+    if (so) so.onclick = () => { sendPanel.hidden = !sendPanel.hidden; };
+    sendPanel.querySelector(".send-cancel").onclick = () => { sendPanel.hidden = true; };
+    const sc = sendPanel.querySelector(".send-confirm");
+    sc.onclick = async () => {
+      const box = sendPanel.querySelector(".panel-error");
+      sc.disabled = true;
       try {
-        await apiPost(`/v1/notices/${encodeURIComponent(id)}/deliver`, {});
+        await apiPost(`/v1/notices/${encodeURIComponent(id)}/deliver`, readSendChoice(sendPanel));
         route();
       } catch (e) {
         box.innerHTML = `<strong>${esc(e.title)}</strong>
           <div class="muted" style="margin-top:4px">${esc(e.message)}</div>`;
         box.hidden = false;
-        dv.disabled = false;
+        sc.disabled = false;
       }
     };
 
@@ -2309,6 +2336,7 @@ async function viewNotices() {
       const confirm = panel.querySelector(".confirm");
       confirm.textContent = PROMPTS[mode].confirm;
       editArea.hidden = mode !== "edit";
+      panel.querySelector(".send-slot").hidden = mode === "reject";
       errorBox.hidden = true;
       confirm.onclick = async () => {
         const action = mode === "reject" ? "reject" : "approve";
@@ -2317,7 +2345,8 @@ async function viewNotices() {
         const bodyText = mode === "edit" && bodyBox.value.trim() !== original.trim()
           ? bodyBox.value : "";
         confirm.disabled = true;
-        const failure = await decide(id, action, noteBox.value, bodyText);
+        const failure = await decide(id, action, noteBox.value, bodyText,
+                                     action === "approve" ? readSendChoice(panel) : null);
         confirm.disabled = false;
         if (failure) {
           // Shown in place: replacing the page would discard a long edit over
@@ -2343,20 +2372,88 @@ async function viewNotices() {
 }
 
 /* Where an approved notice went. Approval and delivery are separate events,
- * and a reviewer should never have to guess which one happened. */
+ * and a reviewer should never have to guess which one happened. Copies sent to
+ * other addresses are listed after the officer's. */
 function noticeDelivery(n) {
   const line = (text) =>
     `<div class="muted" style="font-size:12.5px;margin-top:6px">${text}</div>`;
+  const VIA = { gmail: "Gmail", resend: "Resend", brevo: "Brevo", smtp: "SMTP" };
+  const lastOfficer = [...(n.sends || [])].reverse().find((s) => s.role === "officer");
+  const via = lastOfficer && VIA[lastOfficer.via] ? ` through ${VIA[lastOfficer.via]}` : "";
+  const out = [];
   if (n.status === "drafted")
-    return line(`Gmail draft created for <span class="mono">${esc(n.delivered_to || "")}</span>
-      · ${esc(day(n.delivered_at))}. It has not been sent; open Gmail's drafts to send it.`);
+    out.push(line(`Gmail draft created for <span class="mono">${esc(n.delivered_to || "")}</span>
+      · ${esc(day(n.delivered_at))}. It has not been sent; open Gmail's drafts to send it.`));
   if (n.status === "sent")
-    return line(`Sent through Gmail to <span class="mono">${esc(n.delivered_to || "")}</span>
-      · ${esc(day(n.delivered_at))}.`);
+    out.push(line(`Sent to the officer${via} at <span class="mono">${esc(n.delivered_to || "")}</span>
+      · ${esc(day(n.delivered_at))}.`));
   if (n.status === "approved")
-    return line(`<strong>Not delivered.</strong> ${esc(n.delivery_detail ||
-      "Approved before delivery was attempted.")}`);
-  return "";
+    out.push(line(`<strong>Not sent to the officer.</strong> ${esc(n.delivery_detail ||
+      "Approved without sending it to the officer.")}`));
+  const word = { sent: "sent", drafted: "Gmail draft made", rendered: "not sent",
+                 error: "failed" };
+  for (const s of (n.sends || []).filter((x) => x.role === "copy")) {
+    out.push(line(`Copy ${esc(word[s.status] || s.status)} to <span class="mono">${esc(s.recipient)}</span>
+      · ${esc(day(s.sent_at))}${s.sent_by ? ` · by ${esc(s.sent_by)}` : ""}${
+      ["rendered", "error"].includes(s.status) && s.detail ? ` — ${esc(s.detail)}` : ""}`));
+  }
+  return out.join("");
+}
+
+const NOTICE_COPY_STORAGE = "foci.noticecopy";
+
+function rememberedCopyTo() {
+  try { return localStorage.getItem(NOTICE_COPY_STORAGE) || ""; } catch { return ""; }
+}
+
+/* Who a notice goes to: the officer named on it, an address you choose, both,
+ * or — when approving — nobody yet. What this site cannot do is shown, and why,
+ * rather than left to fail. */
+function sendChoice(n, d, approving) {
+  const sending = d.sending || {};
+  const name = `send-${n.notice_id}-${approving ? "approve" : "later"}`;
+  const officerWhy = !n.recipient ? "no contracting officer was resolved"
+    : sending.mode === "render_only" ? "not switched on for this site (NOTICES_SEND)"
+      : !approving && n.status !== "approved" ? "already sent to the officer" : "";
+  const copyWhy = sending.copies ? "" : "no mail service is connected";
+  const pick = !officerWhy ? "officer" : !copyWhy ? "copy" : approving ? "none" : "";
+  const opt = (value, label, why) => `<label class="check" style="display:block;margin:3px 0">
+      <input type="radio" name="${esc(name)}" value="${value}" ${value === pick ? "checked" : ""}
+        ${why ? "disabled" : ""}> <span>${label}${why
+        ? ` <span class="muted">— ${esc(why)}</span>` : ""}</span></label>`;
+  return `<div class="send-choice" style="margin:10px 0">
+      <div class="decide-prompt">${approving ? "Once approved, send it to" : "Send it to"}</div>
+      ${opt("officer", `the contracting officer${n.recipient
+        ? ` · <span class="mono">${esc(n.recipient)}</span>` : ""}`, officerWhy)}
+      ${opt("copy", "an address I choose", copyWhy)}
+      ${opt("both", "both", officerWhy || copyWhy)}
+      ${approving ? opt("none", "nobody yet — I will send it later", "") : ""}
+      <input type="email" class="copy-to" placeholder="you@example.com" autocomplete="email"
+        value="${esc(rememberedCopyTo())}" style="margin-top:6px;width:100%;max-width:340px"
+        ${["copy", "both"].includes(pick) ? "" : "hidden"}>
+      ${!officerWhy && !d.reply_to ? `<div class="muted" style="font-size:12px;margin-top:6px">
+        Replies from the officer will go to the address this site sends from, which nobody
+        reads, until ALERTS_REPLY_TO is set to one you do.</div>` : ""}
+    </div>`;
+}
+
+function wireSendChoice(box) {
+  const input = box.querySelector(".copy-to");
+  if (!input) return;
+  box.querySelectorAll('.send-choice input[type="radio"]').forEach((r) => {
+    r.onchange = () => { input.hidden = !["copy", "both"].includes(r.value); };
+  });
+}
+
+function readSendChoice(box) {
+  const picked = box.querySelector('.send-choice input[type="radio"]:checked');
+  const send_to = picked ? picked.value : "none";
+  const copy_to = ["copy", "both"].includes(send_to)
+    ? box.querySelector(".copy-to").value.trim() : "";
+  if (copy_to) {
+    try { localStorage.setItem(NOTICE_COPY_STORAGE, copy_to); } catch { /* not kept */ }
+  }
+  return { send_to, copy_to };
 }
 
 function plainDiff(lines) {
@@ -2367,8 +2464,8 @@ function plainDiff(lines) {
 
 /* Returns an error object on failure rather than rendering it, so the caller
  * can show it next to whatever the reviewer was typing. */
-async function decide(id, action, note, bodyText) {
-  const payload = { note: note || "" };
+async function decide(id, action, note, bodyText, sendTo) {
+  const payload = { note: note || "", ...(sendTo || {}) };
   if (bodyText) payload.body_text = bodyText;
   try {
     await apiPost(`/v1/notices/${encodeURIComponent(id)}/${action}`, payload);
@@ -2382,7 +2479,7 @@ async function decide(id, action, note, bodyText) {
 async function downloadNotice(id) {
   // Needs the auth header, so a plain link will not do.
   const res = await fetch(`/v1/notices/${encodeURIComponent(id)}.eml`, {
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    headers: authHeaders(),
   });
   if (!res.ok) {
     alert("Could not download the notice.");
@@ -3798,6 +3895,7 @@ async function refreshHealth() {
   }
   storageIsEphemeral = health.ephemeral_storage === true;
   if (health.public) showPublicKeyLabels();
+  if (health.sign_in) refreshSignIn();
   const warnings = health.warnings || [];
   if (!warnings.length) {
     banner.hidden = true;
@@ -3951,9 +4049,76 @@ document.getElementById("search-form").onsubmit = (e) => {
   location.hash = `#/search/${encodeURIComponent(q)}`;
 };
 
-document.getElementById("key-button").onclick = () => {
+function openKeyDialog() {
   document.getElementById("key-input").value = apiKey;
   keyDialog.showModal();
+}
+
+/* ---------------------------------------------------------------- sign in
+ *
+ * Where the site lets its admins sign in by email, the top-right button is
+ * for that, and the admin key stays one click away. Signing in sets a cookie
+ * the browser sends by itself; nothing is kept in this page. */
+const signinDialog = document.getElementById("signin-dialog");
+let signInOffered = false;
+let signedInAs = "";
+
+async function refreshSignIn() {
+  try {
+    const r = await api("/v1/auth");
+    signInOffered = !!r.sign_in;
+    signedInAs = r.email || "";
+  } catch {
+    return;
+  }
+  if (!signInOffered) return;
+  const button = document.getElementById("key-button");
+  button.textContent = signedInAs ? "Signed in" : "Sign in";
+  button.title = signedInAs ? `Signed in as ${signedInAs}` : "";
+}
+
+function openSignIn() {
+  const out = !!signedInAs;
+  document.getElementById("signin-email").hidden = out;
+  document.getElementById("signin-send").hidden = out;
+  document.getElementById("signin-out").hidden = !out;
+  document.getElementById("signin-status").textContent = out
+    ? `You are signed in as ${signedInAs}. What you approve and send is recorded under that
+       address.` : "";
+  signinDialog.showModal();
+}
+
+document.getElementById("key-button").onclick = () =>
+  (signInOffered ? openSignIn() : openKeyDialog());
+
+document.getElementById("signin-use-key").onclick = () => {
+  signinDialog.close();
+  openKeyDialog();
+};
+
+document.getElementById("signin-send").onclick = async () => {
+  const status = document.getElementById("signin-status");
+  const email = document.getElementById("signin-email").value.trim();
+  if (!email) {
+    status.textContent = "Enter your email address.";
+    return;
+  }
+  try {
+    const r = await apiPost("/v1/auth/sign-in", { email });
+    status.textContent = r.detail;
+  } catch (e) {
+    status.textContent = e.message || String(e);
+  }
+};
+
+document.getElementById("signin-out").onclick = async () => {
+  try {
+    await apiSend("POST", "/v1/auth/sign-out");
+  } catch { /* the cookie is cleared either way on the next answer */ }
+  signedInAs = "";
+  signinDialog.close();
+  refreshSignIn();
+  route();
 };
 
 document.getElementById("key-form").onsubmit = () => {

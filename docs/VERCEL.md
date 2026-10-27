@@ -173,6 +173,50 @@ leave it set to the admin key.
 
 To try it: **Actions** → **Daily alerts** → **Run workflow**.
 
+The same setting also drives **Daily watchlists**, which re-screens each active watchlist on
+the Watchlists page at 10:30 UTC, one at a time, so its notices are in that day's alerts.
+Nothing on Vercel runs in the background, so without it a watchlist runs only when someone
+presses **Run now**. Each screen stops after four minutes and keeps what it finished.
+
+## 7. Sending notices
+
+A notice is the email the screen drafts to the contracting officer on an award. It goes
+nowhere until someone approves it on the **Notices** page. Approving then sends it to whoever
+you pick: **the contracting officer**, **an address you choose** (your own, to read it first or
+forward it yourself), **both**, or **nobody yet**. An approved notice has a **Send…** button for
+later; one already sent has **Send a copy…**. A notice reaches the officer once at most.
+
+On this site notices go through Resend, from `ALERTS_FROM`. (Gmail, the original route, needs
+a sign-in saved on disk, which Vercel does not keep.)
+
+* **Copies to an address you choose** work as soon as Resend is connected (step 5).
+* **Sending to contracting officers** is switched off until you add `NOTICES_SEND` = `true`
+  in Vercel and redeploy. There are no drafts here, so this is the deliberate step that
+  lets an approval reach an officer.
+* **Set `ALERTS_REPLY_TO`** to an address you read before sending one to an officer, or
+  their reply goes to `alerts@contractscreener.com`, where nobody reads it.
+* `FOCI_EMAIL_REDIRECT_TO` sends every notice to that one address instead, the intended
+  officer named in the subject, as it does for alerts. A good way to try it first.
+
+Every send is listed on the notice: where it went, when, and who sent it.
+
+## 8. Signing in (recommended)
+
+The admin key works, but it is one shared secret: pasted into each browser, impossible to take
+back from one person without changing it for everyone, and recorded on every approval as
+`api-key:default`, which names nobody. Signing in fixes that. Nobody else needs to sign in;
+visitors use the site as before.
+
+1. In Vercel, add `FOCI_ADMIN_EMAILS` = the addresses that may sign in, separated by commas,
+   for example `julian@…, max@…`. Redeploy.
+2. On the site, the button at the top right now says **Sign in**. Enter your address; a link
+   arrives by email (it works once, for 20 minutes). Open it and press **Sign in**.
+
+A signed-in browser can do everything the admin key can for 30 days, or until **Sign out**,
+and what you approve and send is recorded under your address. Removing an address from
+`FOCI_ADMIN_EMAILS` signs that person out everywhere at the next request. The admin key keeps
+working alongside it, as a way in if email is down.
+
 ## Who can do what
 
 The site is open: anyone who has the address can see everything on it — every screen,
@@ -180,16 +224,17 @@ contractor, portfolio and alert list — and use it.
 
 **Without a key**, anyone can search, screen agencies and contractors, build portfolios,
 pick a contractor's SEC record, look up its funds, mark findings, create, run, pause and resume
-watchlists, and start or add to an alert list.
+watchlists and set their own policies, read notices, and start or add to an alert list.
 
-**With the admin key** only:
+**Signed in, or with the admin key**, only:
 
 * deleting a screen or an alert list;
-* changing the screening rules or policy, for the site or for one watchlist;
-* approving or rejecting a notice to a contracting officer;
+* changing the screening rules or the site-wide screening policy;
+* approving, rejecting and sending a notice;
 * the **System check** page, which writes to the database and calls six outside services
   each time it is opened;
-* seeing alert-list addresses in full, and taking an address off a list.
+* seeing alert-list addresses, and where notices were sent, in full; taking an address off a
+  list; "Mail again" for a bounced address.
 
 **Email addresses are protected.** Visitors see the addresses on a list masked
 (`j•••@agency.gov`). An address a visitor adds is sent one email asking it to confirm, and

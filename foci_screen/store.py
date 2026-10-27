@@ -139,6 +139,37 @@ CREATE TABLE IF NOT EXISTS notices (
 -- The latest reading of each investment firm's Form ADV, and every change seen
 -- between readings. Global, like document snapshots: a filing is a public
 -- fact, and two tenants watching one firm should download it once.
+-- Every time an approved notice was sent anywhere: to the contracting officer
+-- (which also moves the notice on — see notices.delivered_to) or as a copy
+-- to an address the reviewer chose. Who asked, where it went after any
+-- redirect, by which route, and what happened.
+CREATE TABLE IF NOT EXISTS notice_sends (
+    send_id      TEXT PRIMARY KEY,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    notice_id    TEXT NOT NULL,
+    role         TEXT NOT NULL,
+    recipient    TEXT NOT NULL,
+    via          TEXT,
+    status       TEXT NOT NULL,
+    detail       TEXT,
+    sent_by      TEXT,
+    sent_at      TEXT NOT NULL
+);
+-- Signing in by email (api/signin.py). Only a hash of each secret is kept: a
+-- copy of the database is not a way in.
+CREATE TABLE IF NOT EXISTS sign_in_links (
+    token_hash   TEXT PRIMARY KEY,
+    email        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    used_at      TEXT
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    session_hash TEXT PRIMARY KEY,
+    email        TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS adv_snapshots (
     crd          TEXT PRIMARY KEY,
     snapshot     TEXT NOT NULL,
@@ -408,6 +439,8 @@ CREATE TABLE IF NOT EXISTS watchlists (
 
 INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_recipients_token ON alert_recipients(token);
+CREATE INDEX IF NOT EXISTS idx_notice_sends ON notice_sends(tenant_id, notice_id);
+CREATE INDEX IF NOT EXISTS idx_sign_in_links_email ON sign_in_links(email, created_at);
 CREATE INDEX IF NOT EXISTS idx_findings_entity ON findings(entity_key);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_tenant ON findings(tenant_id, id);
@@ -907,6 +940,9 @@ class Store:
         For undoing a screen somebody did not want — one run against the wrong
         agency puts contractors on the dashboard that nobody chose to watch,
         and there was no way to take them off.
+
+        `notice_sends` is left alone: what was emailed, to whom and by whom
+        stays on record after the screen behind it is gone.
         """
         removed = self.run_footprint(run_id)
         with self._tx() as c:
@@ -1887,6 +1923,77 @@ class Store:
             if c.rowcount() == 0:
                 return "not_approved"
         return "ok"
+
+    def log_notice_send(self, notice_id: str, *, role: str, recipient: str, via: str,
+                        status: str, detail: str = "", sent_by: str = "") -> str:
+        # Ordered by time to the microsecond: two sends in the same second —
+        # the officer's and a copy — are listed in the order they were made.
+        send_id = f"{time.time_ns() // 1000:014x}{uuid.uuid4().hex[:6]}"
+        with self._tx() as c:
+            c.execute("INSERT INTO notice_sends (send_id, tenant_id, notice_id, role,"
+                      " recipient, via, status, detail, sent_by, sent_at)"
+                      " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                      (send_id, self.tenant_id, notice_id, role, recipient, via or "",
+                       status, detail[:1000], sent_by, _now()))
+        return send_id
+
+    def notice_sends(self, notice_ids: list[str]) -> dict[str, list[dict]]:
+        """{notice id: its sends, oldest first} for the notices asked about."""
+        if not notice_ids:
+            return {}
+        marks = ",".join("?" for _ in notice_ids)
+        out: dict[str, list[dict]] = {}
+        for r in self._query(f"SELECT * FROM notice_sends WHERE tenant_id=? AND notice_id"
+                             f" IN ({marks}) ORDER BY sent_at, send_id",
+                             (self.tenant_id, *notice_ids)):
+            out.setdefault(r["notice_id"], []).append(r)
+        return out
+
+    # ------------------------------------------------------- signing in
+    # Not tenant-scoped: whoever signs in works as the default tenant, as a
+    # visitor to a public site does.
+    def create_sign_in_link(self, token_hash: str, email: str, expires_at: str) -> None:
+        now = _now()
+        with self._tx() as c:
+            c.execute("DELETE FROM sign_in_links WHERE expires_at < ?", (now,))
+            c.execute("INSERT INTO sign_in_links (token_hash, email, created_at, expires_at)"
+                      " VALUES (?,?,?,?)", (token_hash, email, now, expires_at))
+
+    def sign_in_links_since(self, email: str, when: str) -> int:
+        row = self._one("SELECT COUNT(*) AS n FROM sign_in_links WHERE email=?"
+                        " AND created_at >= ?", (email, when))
+        return int(row["n"]) if row else 0
+
+    def sign_in_link(self, token_hash: str) -> dict | None:
+        return self._one("SELECT * FROM sign_in_links WHERE token_hash=?", (token_hash,))
+
+    def use_sign_in_link(self, token_hash: str) -> str:
+        """The address a link was for, if it is unused and in date; it cannot
+        be used again. "" otherwise."""
+        now = _now()
+        with self._tx() as c:
+            c.execute("UPDATE sign_in_links SET used_at=? WHERE token_hash=?"
+                      " AND used_at IS NULL AND expires_at > ?", (now, token_hash, now))
+            if c.rowcount() != 1:
+                return ""
+        row = self.sign_in_link(token_hash)
+        return row["email"] if row else ""
+
+    def create_session(self, session_hash: str, email: str, expires_at: str) -> None:
+        now = _now()
+        with self._tx() as c:
+            c.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
+            c.execute("INSERT INTO sessions (session_hash, email, created_at, expires_at)"
+                      " VALUES (?,?,?,?)", (session_hash, email, now, expires_at))
+
+    def session_email(self, session_hash: str) -> str:
+        row = self._one("SELECT email FROM sessions WHERE session_hash=? AND expires_at > ?",
+                        (session_hash, _now()))
+        return row["email"] if row else ""
+
+    def end_session(self, session_hash: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM sessions WHERE session_hash=?", (session_hash,))
 
     def undelivered_notices(self, limit: int = 200) -> list[dict]:
         """Approved notices that have not yet become a Gmail draft or a send."""
