@@ -302,3 +302,24 @@ def test_consent_unsubscribing_bounces_sends_and_sign_in_behave_the_same_here(pg
         assert store.optout_by_token(token) is None
     finally:
         store.close()
+
+
+def test_kept_portfolios_and_emailed_ones_behave_the_same_here(pg):
+    store = Store(pg, tenant_id="default")
+    try:
+        pid = store.save_portfolio("a@x.example", "W", "KEY1")
+        assert store.save_portfolio("a@x.example", "W2", "KEY2", pid) == pid
+        assert store.save_portfolio("b@x.example", "W", "KEY3", pid) == "", "not theirs"
+        assert store.link_portfolio_alerts(pid, "a@x.example", "sub1")
+        [row] = store.saved_portfolios("a@x.example")
+        assert (row["name"], row["portfolio_key"], row["subscription_id"]) == \
+            ("W2", "KEY2", "sub1")
+        assert store.saved_portfolios("b@x.example") == []
+        store.log_portfolio_email("a@x.example", "W2", ["c@x.example", "d@x.example"],
+                                  "sent")
+        assert store.portfolio_emails_since("a@x.example", "2000-01-01T00:00:00Z") == 2
+        assert store.sign_in_links_since("", "2000-01-01T00:00:00Z") == 0
+        assert store.delete_saved_portfolio(pid, "a@x.example")
+        assert not store.delete_saved_portfolio(pid, "a@x.example")
+    finally:
+        store.close()

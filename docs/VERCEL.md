@@ -217,6 +217,32 @@ and what you approve and send is recorded under your address. Removing an addres
 `FOCI_ADMIN_EMAILS` signs that person out everywhere at the next request. The admin key keeps
 working alongside it, as a way in if email is down.
 
+### Accounts for everyone else (optional)
+
+To let colleagues keep their portfolios too, add `FOCI_SIGN_IN` in Vercel and redeploy:
+
+* `FOCI_SIGN_IN` = `concordgroup.com` (one or more email domains, separated by commas) lets
+  anyone with an address there sign in; or
+* `FOCI_SIGN_IN` = `anyone` lets anyone with an email address sign in.
+
+Signing in this way gives **no admin powers**. It gives an account:
+
+* **Portfolios kept for you.** Build or open a portfolio while signed in and it is kept under
+  your address. It opens on any browser where you sign in, and a change made on one shows on
+  the others. **Your portfolios** on the Portfolio page lists them; a portfolio opened from a
+  key has **Keep this portfolio in my account**.
+* **Alert lists that follow.** An alert list started from a kept portfolio follows its edits
+  from then on, wherever they are made: a company added on your laptop is watched without
+  anyone re-saving the list. Your own address on a list is not asked to confirm; signing in
+  already proved it is yours.
+* **Email a portfolio**, to yourself or up to 10 colleagues at a time: the companies, the
+  latest severity of each, a link that opens it on the site, and its key. To anyone else it
+  says it came from you, and replies go to you. Up to 25 addresses a day per person.
+
+The key still works as before, for anyone not signed in: it is the portfolio, and the account
+is where your keys are kept. Sign-in links to anyone but the admins are limited to 30 a day
+across the site, within Resend's free allowance.
+
 ## Who can do what
 
 The site is open: anyone who has the address can see everything on it — every screen,
@@ -226,7 +252,10 @@ contractor, portfolio and alert list — and use it.
 pick a contractor's SEC record, look up its funds, mark findings, create, run, pause and resume
 watchlists and set their own policies, read notices, and start or add to an alert list.
 
-**Signed in, or with the admin key**, only:
+**Signed in to an account** (section 8), as well: keep portfolios, open them on any browser,
+and email them.
+
+**Signed in as an admin, or with the admin key**, only:
 
 * deleting a screen or an alert list;
 * changing the screening rules or the site-wide screening policy;

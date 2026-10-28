@@ -83,6 +83,7 @@ class Delivery:
 class Mailer:
     def __init__(self, cfg) -> None:
         self.cfg = cfg
+        self._reply_to = ""
 
     def _setting(self, name: str) -> str:
         return str(getattr(self.cfg, name, "") or "").strip()
@@ -107,7 +108,7 @@ class Mailer:
 
     @property
     def reply_to(self) -> str:
-        return self._setting("alerts_reply_to")
+        return self._reply_to or self._setting("alerts_reply_to")
 
     @property
     def missing(self) -> list[str]:
@@ -182,7 +183,7 @@ class Mailer:
     def send(self, to: list[str], subject: str, text: str,
              html: str | None = None,
              personalize: Personalize | None = None,
-             asked_for: bool = False) -> Delivery:
+             asked_for: bool = False, reply_to: str = "") -> Delivery:
         """Send one message per recipient.
 
         `personalize(address)`, when given, returns that address's own
@@ -192,7 +193,11 @@ class Mailer:
         `asked_for` is for a message its recipient has just asked for, such as
         a sign-in link. The redirect and ALERTS_SEND=false exist to keep mail
         from reaching other people too early; neither applies to that.
+
+        `reply_to`, for a message a person sends through the site, sends replies
+        to them rather than to ALERTS_REPLY_TO.
         """
+        self._reply_to = reply_to
         recipients = [a for a in dict.fromkeys(x.strip() for x in to) if a]
         if not recipients:
             return Delivery("failed", [], "No recipients.")

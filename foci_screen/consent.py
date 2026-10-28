@@ -90,7 +90,7 @@ def statuses(store, subscription: dict) -> list[dict]:
 # ------------------------------------------------------------------- asking
 
 def add(store, mailer, subscription: dict, emails: list[str], base_url: str,
-        trusted: bool) -> dict:
+        trusted: bool, own: str = "") -> dict:
     """Record addresses just put on a list, and ask the ones that must agree.
 
     Then ask any still waiting that were never asked — added while no mail
@@ -98,12 +98,15 @@ def add(store, mailer, subscription: dict, emails: list[str], base_url: str,
     sends their requests. Returns the addresses by what happened to them:
     asked, already asked today, held back by the site's daily ceiling, or
     not sent (with why).
+
+    `own` is the address of whoever is signed in: signing in proved it is
+    theirs, so it is not asked to confirm.
     """
     sid = subscription["subscription_id"]
     outcome: dict[str, list] = {"asked": [], "waiting": [], "held": [], "not_sent": []}
     for email in emails:
         before = store.alert_recipients(sid).get(email.lower())
-        if before is None and trusted:
+        if before is None and (trusted or (own and email.lower() == own.lower())):
             store.add_alert_recipient(sid, email, CONFIRMED)
         else:
             store.add_alert_recipient(sid, email, PENDING)

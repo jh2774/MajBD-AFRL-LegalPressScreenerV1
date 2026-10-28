@@ -29,7 +29,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import alerts as alerts_engine
-from .. import consent, fund_managers, syscheck
+from .. import consent, fund_managers, portfolio_mail, syscheck
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from .. import vehicles as vehicles_engine
@@ -59,9 +59,11 @@ from .schemas import (
     NoticeDecision,
     NoticeSend,
     PortfolioEdit,
+    PortfolioEmailRequest,
     PortfolioKey,
     PortfolioRequest,
     RuleSetting,
+    SavedPortfolioRequest,
     ScreenRequest,
     SignalDisposition,
     SignInRequest,
@@ -81,15 +83,15 @@ keymap = auth.parse_keys(cfg.api_keys)
 # Signing in by email (signin.py), for whoever FOCI_ADMIN_EMAILS lists: what a
 # key does, with the person's name on it.
 signin = SignIn(lambda: store_for(auth.DEFAULT_TENANT), cfg)
-require_tenant = auth.make_dependency(keymap, public=cfg.public, session=signin.email_for,
+require_tenant = auth.make_dependency(keymap, public=cfg.public, session=signin.session,
                                       sign_in=signin.configured)
 # Removing recorded work, changing how the site screens for everyone, and
 # approving a notice to a federal official. The same as require_tenant unless
 # the site is public, where these alone need a key or a sign-in.
 require_admin = auth.make_admin_dependency(keymap, public=cfg.public,
-                                           session=signin.email_for,
+                                           session=signin.session,
                                            sign_in=signin.configured)
-is_admin = auth.make_admin_flag(keymap, public=cfg.public, session=signin.email_for)
+is_admin = auth.make_admin_flag(keymap, public=cfg.public, session=signin.session)
 
 
 def signed_in(request: Request) -> str:
@@ -654,7 +656,7 @@ def edit_portfolio(req: PortfolioEdit, store: Store = Depends(tenant_store)) -> 
         except portfolio_keys.PortfolioKeyError as exc:
             raise HTTPException(400, str(exc)) from exc
     else:
-        current = portfolio_keys.Portfolio(name=req.name)
+        current = portfolio_keys.Portfolio(name=req.name or "Portfolio")
 
     dropping = {k.strip().upper() for k in req.remove if k.strip()}
     keys = [c.key for c in current.companies if c.key.upper() not in dropping]
@@ -678,7 +680,8 @@ def edit_portfolio(req: PortfolioEdit, store: Store = Depends(tenant_store)) -> 
                 "detail": "That leaves no companies, so there is no key."}
 
     built = portfolio_keys.from_entity_keys(
-        req.name or current.name, keys, {k.upper(): v for k, v in names.items()})
+        req.name or current.name or "Portfolio", keys,
+        {k.upper(): v for k, v in names.items()})
     return {"key": portfolio_keys.encode(built), "companies": len(built.companies),
             "name": built.name}
 
@@ -1033,12 +1036,12 @@ def find_fund_managers(entity_key: str, body: ManagerRequest,
 
 # ------------------------------------------------------------ email alerts
 
-def _shown_list(store: Store, sub: dict, admin: bool) -> dict:
+def _shown_list(store: Store, sub: dict, admin: bool, who: str = "") -> dict:
     """A list as the page shows it: each address and whether it has agreed.
 
     On a public site a visitor sees addresses masked — a list holds people at
     other organisations, and the page is open to anyone. Holding the admin
-    key shows them in full.
+    key shows them in full; someone signed in sees their own.
     """
     recipients = consent.statuses(store, sub)
     # Who took themselves off, so the list's owner can see why an address
@@ -1052,8 +1055,11 @@ def _shown_list(store: Store, sub: dict, admin: bool) -> dict:
                for r in sorted(store.suppressed(sub["emails"]).values(),
                                key=lambda r: r["email"])]
     if not admin:
-        recipients = [{**r, "email": consent.mask(r["email"])} for r in recipients]
-        opted_out = [{**o, "email": consent.mask(o["email"])} for o in opted_out]
+        def mask(address: str) -> str:
+            return address if who and address.lower() == who else consent.mask(address)
+
+        recipients = [{**r, "email": mask(r["email"])} for r in recipients]
+        opted_out = [{**o, "email": mask(o["email"])} for o in opted_out]
         bounced = [{**b, "email": consent.mask(b["email"]),
                     "reason": consent.mask_text(b["reason"]),
                     "description": consent.mask_text(b["description"])} for b in bounced]
@@ -1072,13 +1078,14 @@ def _shown_delivery(d: dict, admin: bool) -> dict:
 
 @app.get("/v1/alerts", tags=["alerts"])
 def get_alerts(store: Store = Depends(tenant_store),
-               admin: bool = Depends(is_admin)) -> dict:
+               admin: bool = Depends(is_admin),
+               who: str = Depends(signed_in)) -> dict:
     """Subscriptions, what sending will do, and what was sent recently."""
     sending = Mailer(cfg).status()
     if not admin:
         sending = {**sending, "explanation": consent.mask_text(sending["explanation"])}
     return {"sending": sending, "public": cfg.public, "can_edit_addresses": admin,
-            "subscriptions": [_shown_list(store, s, admin)
+            "subscriptions": [_shown_list(store, s, admin, who)
                               for s in store.alert_subscriptions()],
             "deliveries": [_shown_delivery(d, admin)
                            for d in store.alert_deliveries(limit=30)],
@@ -1161,7 +1168,8 @@ async def resend_report(request: Request) -> Response:
 @app.post("/v1/alerts/subscriptions", tags=["alerts"])
 def save_subscription(body: AlertSubscriptionRequest, request: Request,
                       store: Store = Depends(tenant_store),
-                      admin: bool = Depends(is_admin)) -> dict:
+                      admin: bool = Depends(is_admin),
+                      who: str = Depends(signed_in)) -> dict:
     """Create or update who is emailed about a portfolio.
 
     Whatever is already known about the portfolio's companies is marked as
@@ -1171,7 +1179,11 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
     An address added here by a visitor to a public site is sent a request to
     confirm and nothing else until it does (`consent`). Such a visitor adds
     to a list; taking an address off is for the address itself, through the
-    link in every email, or for someone holding the admin key.
+    link in every email, or for someone holding the admin key. Someone signed
+    in is not asked to confirm their own address.
+
+    With `portfolio_id`, the list is tied to that portfolio in the signed-in
+    person's account, and follows its edits from then on, from any browser.
     """
     try:
         loaded = portfolio_keys.decode(body.portfolio_key)
@@ -1209,14 +1221,16 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
         active=body.active if admin or not existing else existing["active"])
     sub = store.alert_subscription(sub_id)
     asked = consent.add(store, Mailer(cfg), sub, [e for e in emails if e not in had],
-                        _base_url(request), trusted=admin)
+                        _base_url(request), trusted=admin, own=who)
+    if body.portfolio_id and who:
+        store_for(auth.DEFAULT_TENANT).link_portfolio_alerts(body.portfolio_id, who, sub_id)
     if not admin:
         asked = {k: [consent.mask(a) if isinstance(a, str)
                      else {**a, "email": consent.mask(a["email"])} for a in v]
                  for k, v in asked.items()}
     baselined = alerts_engine.baseline(store, sub_id,
                                        [c for c in companies if c not in before])
-    return {"subscription": _shown_list(store, sub, admin), "baselined": baselined,
+    return {"subscription": _shown_list(store, sub, admin, who), "baselined": baselined,
             "declined": shown, "consent": asked}
 
 
@@ -2364,8 +2378,136 @@ def reject_notice(notice_id: str, body: NoticeDecision,
 
 @app.get("/v1/auth", tags=["meta"])
 def who_am_i(request: Request) -> dict:
-    """Whether anyone may sign in here, and who this browser is signed in as."""
-    return {"sign_in": signin.configured, "email": signin.email_for(request)}
+    """Whether anyone may sign in here, who besides the admins may, and who
+    this browser is signed in as."""
+    email, admin = signin.session(request)
+    return {"sign_in": signin.configured, "members": signin.members,
+            "email": email, "admin": admin}
+
+
+# -------------------------------------------------------- your portfolios
+# Kept by the address you sign in with, so they open on any browser. The key
+# is still the portfolio: each one here is a key, and editing it keeps the
+# newer key. An alert list started from one follows its edits.
+
+def signed_in_person(request: Request) -> str:
+    email = signin.email_for(request)
+    if email:
+        return email
+    if not signin.configured:
+        raise HTTPException(404, "Signing in is not set up on this site.")
+    raise HTTPException(401, "Sign in to keep portfolios in your account and email them.")
+
+
+def _account() -> Store:
+    # Accounts belong to the default tenant, as signing in does.
+    return store_for(auth.DEFAULT_TENANT)
+
+
+def _shown_saved(row: dict) -> dict:
+    try:
+        companies = len(portfolio_keys.decode(row["portfolio_key"]).companies)
+    except portfolio_keys.PortfolioKeyError:
+        companies = None
+    return {k: row[k] for k in ("portfolio_id", "name", "portfolio_key", "subscription_id",
+                                "created_at", "updated_at")} | {"companies": companies}
+
+
+def _follow_portfolio(store: Store, subscription_id: str, key: str) -> None:
+    """Bring an alert list into line with its portfolio's newer key, so a
+    company added from any browser is watched — and its history is not sent
+    as news."""
+    sub = store.alert_subscription(subscription_id)
+    if not sub:
+        return
+    loaded = portfolio_keys.decode(key)
+    companies = [c.key for c in loaded.companies]
+    store.save_alert_subscription(subscription_id=subscription_id, name=loaded.name,
+                                  emails=sub["emails"], companies=companies,
+                                  portfolio_key=key, active=sub["active"])
+    alerts_engine.baseline(store, subscription_id,
+                           [c for c in companies if c not in set(sub["companies"])])
+
+
+@app.get("/v1/me/portfolios", tags=["portfolio"])
+def my_portfolios(who: str = Depends(signed_in_person)) -> dict:
+    return {"email": who,
+            "portfolios": [_shown_saved(r) for r in _account().saved_portfolios(who)]}
+
+
+@app.post("/v1/me/portfolios", tags=["portfolio"])
+def keep_portfolio(body: SavedPortfolioRequest,
+                   who: str = Depends(signed_in_person)) -> dict:
+    """Keep a portfolio in your account, or keep the newer key of one there."""
+    try:
+        loaded = portfolio_keys.decode(body.key)
+    except portfolio_keys.PortfolioKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    store = _account()
+    portfolio_id = store.save_portfolio(who, (body.name or loaded.name).strip()[:120]
+                                        or "Portfolio", body.key.strip(), body.portfolio_id)
+    if not portfolio_id:
+        raise HTTPException(404, "That portfolio is not in your account.")
+    row = store.saved_portfolio(portfolio_id, who)
+    if row.get("subscription_id"):
+        _follow_portfolio(store, row["subscription_id"], row["portfolio_key"])
+    return {"portfolio": _shown_saved(row)}
+
+
+@app.delete("/v1/me/portfolios/{portfolio_id}", status_code=204, tags=["portfolio"])
+def forget_portfolio(portfolio_id: str, who: str = Depends(signed_in_person)) -> Response:
+    """Take a portfolio out of your account. Its alert list, if it has one, goes
+    on: the people on it chose to be, and may not be you."""
+    if not _account().delete_saved_portfolio(portfolio_id, who):
+        raise HTTPException(404, "That portfolio is not in your account.")
+    return Response(status_code=204)
+
+
+# Addresses one person may email portfolios to in a day: plenty for sharing,
+# not enough to make the site a way to send mail.
+PORTFOLIO_EMAILS_PER_DAY = 25
+
+
+@app.post("/v1/portfolio/email", tags=["portfolio"])
+def email_portfolio(body: PortfolioEmailRequest, request: Request,
+                    store: Store = Depends(tenant_store),
+                    who: str = Depends(signed_in_person)) -> dict:
+    """Email a portfolio — the companies, their latest severity, a link that
+    opens it, and its key — to yourself, or to colleagues.
+
+    Only for someone signed in, who is named in the email to anyone else and
+    gets their replies. Copies to others go through the pilot redirect, as
+    alerts do; a copy to yourself does not.
+    """
+    try:
+        portfolio_keys.decode(body.key)
+    except portfolio_keys.PortfolioKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    since = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+        microsecond=0, tzinfo=None).isoformat() + "Z"
+    account = _account()
+    if account.portfolio_emails_since(who, since) + len(body.to) > PORTFOLIO_EMAILS_PER_DAY:
+        raise HTTPException(429, f"That would pass {PORTFOLIO_EMAILS_PER_DAY} addresses in a "
+                                 f"day, the most one person can email portfolios to. Try "
+                                 f"again tomorrow.")
+    view = load_portfolio(PortfolioKey(key=body.key), store)
+    base = _base_url(request)
+    mailer = Mailer(cfg)
+    outcomes = []
+    if who in body.to:
+        subject, text, html = portfolio_mail.compose(view, body.key, base, note=body.note)
+        outcomes.append(mailer.send([who], subject, text, html, asked_for=True))
+    others = [a for a in body.to if a != who]
+    if others:
+        subject, text, html = portfolio_mail.compose(view, body.key, base, sent_by=who,
+                                                     note=body.note)
+        outcomes.append(mailer.send(others, subject, text, html, reply_to=who))
+    statuses = {d.status for d in outcomes}
+    status = statuses.pop() if len(statuses) == 1 else "partial"
+    detail = " ".join(d.detail for d in outcomes if d.detail)
+    account.log_portfolio_email(who, view["name"], body.to, status, detail)
+    return {"status": status, "recipients": [a for d in outcomes for a in d.recipients],
+            "detail": detail}
 
 
 @app.post("/v1/auth/sign-in", tags=["meta"])

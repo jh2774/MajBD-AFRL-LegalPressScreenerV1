@@ -460,7 +460,9 @@ every night on a deploy that was screening nothing.
 | `GET /v1/notices` | The review queue |
 | `POST /v1/notices/{id}/approve` | The human gate. Records the decision, then sends the notice as `send_to` says: `officer` (the default), `copy` (to `copy_to`), `both` or `none` |
 | `POST /v1/notices/{id}/deliver` | Send an approved notice later — to the officer once at most, a copy to `copy_to` as often as asked |
-| `POST /v1/auth/sign-in` | Email a sign-in link to an address in `FOCI_ADMIN_EMAILS` (`GET /v1/auth` says who is signed in) |
+| `POST /v1/auth/sign-in` | Email a sign-in link to an admin, or anyone `FOCI_SIGN_IN` lets in (`GET /v1/auth` says who is signed in) |
+| `GET / POST /v1/me/portfolios` | The signed-in person's kept portfolios; keep one, or its newer key (`DELETE …/{id}` forgets it) |
+| `POST /v1/portfolio/email` | Email a portfolio to yourself or colleagues (signed in) |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |
 
 **Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset, every
@@ -482,6 +484,15 @@ records only `api-key:default`. A one-use link is emailed; the session is an Htt
 SameSite=Lax cookie stored only as a hash, and counts on a change only with the header the
 site's own pages send. It also lets a closed site (no `FOCI_PUBLIC`) be used without handing
 out keys.
+
+**Accounts.** `FOCI_SIGN_IN` (`anyone`, or email domains) lets people other than the admins
+sign in, with no admin powers: their portfolio keys are kept under their address
+(`saved_portfolios`), so a portfolio opens on any browser and outlives the session; an alert
+list started from a kept portfolio follows its edits on the server; their own address is
+trusted on an alert list; and they can email a portfolio — companies, latest severity, a link
+that opens it, and its key (`foci_screen/portfolio_mail.py`) — to themselves or colleagues,
+rationed per person. The key is still the portfolio; the account is where a person's keys
+live.
 
 **Sending notices.** Approved notices go to the contracting officer, a chosen address, or both
 (`foci_screen/notify/notices.py`): through Gmail when `GMAIL_ENABLED`, otherwise through the

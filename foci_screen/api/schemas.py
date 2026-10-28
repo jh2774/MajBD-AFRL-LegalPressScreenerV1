@@ -85,6 +85,9 @@ class AlertSubscriptionRequest(BaseModel):
     emails: list[str] = Field(default_factory=list, max_length=MAX_ALERT_RECIPIENTS)
     portfolio_key: str = Field(..., min_length=1, max_length=64_000)
     active: bool = True
+    # The portfolio in the signed-in person's account this list is for. The
+    # list then follows the portfolio's edits, from whatever browser.
+    portfolio_id: str = Field("", max_length=40)
 
     @model_validator(mode="after")
     def clean_emails(self) -> AlertSubscriptionRequest:
@@ -138,7 +141,9 @@ class PortfolioEdit(BaseModel):
     contractor page does not need the reader to have built one first.
     """
     key: str = Field("", max_length=64_000)
-    name: str = Field("Portfolio", max_length=120)
+    # Empty keeps the name the portfolio has. A default of "Portfolio" here
+    # renamed every portfolio that had a company added or removed.
+    name: str = Field("", max_length=120)
     add: list[str] = Field(default_factory=list, max_length=500)
     remove: list[str] = Field(default_factory=list, max_length=500)
     # Display names for what is being added, when the database cannot supply
@@ -184,6 +189,43 @@ class NoticeDecision(NoticeSend):
 
 class SignInRequest(BaseModel):
     email: str = Field(..., max_length=254)
+
+
+class SavedPortfolioRequest(BaseModel):
+    """Keep a portfolio key in your account — a new one, or the newer key of
+    one already kept (`portfolio_id`)."""
+    key: str = Field(..., min_length=1, max_length=64_000)
+    name: str = Field("", max_length=120)
+    portfolio_id: str = Field("", max_length=40)
+
+
+MAX_PORTFOLIO_RECIPIENTS = 10
+
+
+class PortfolioEmailRequest(BaseModel):
+    """Email a portfolio to yourself, or to colleagues."""
+    key: str = Field(..., min_length=1, max_length=64_000)
+    to: list[str] = Field(..., min_length=1, max_length=MAX_PORTFOLIO_RECIPIENTS)
+    note: str = Field("", max_length=1000)
+
+    @model_validator(mode="after")
+    def clean_to(self) -> PortfolioEmailRequest:
+        import re
+
+        cleaned, bad = [], []
+        for raw in self.to:
+            for part in re.split(r"[,;\s]+", raw or ""):
+                if part:
+                    (cleaned if re.match(EMAIL_RX, part) else bad).append(part.lower())
+        if bad:
+            raise ValueError(f"Not an email address: {', '.join(bad[:5])}")
+        if not cleaned:
+            raise ValueError("Add at least one email address.")
+        if len(set(cleaned)) > MAX_PORTFOLIO_RECIPIENTS:
+            raise ValueError(f"At most {MAX_PORTFOLIO_RECIPIENTS} addresses at a time.")
+        self.to = list(dict.fromkeys(cleaned))
+        self.note = self.note.strip()
+        return self
 
 
 class RuleSetting(BaseModel):

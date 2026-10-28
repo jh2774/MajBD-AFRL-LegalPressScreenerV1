@@ -1464,8 +1464,7 @@ function drawVehicles(card, key, d, busy = "", busyAt = "#vh-status") {
           const r = await apiPost("/v1/portfolio/edit", {
             key: savedPortfolioKey(), add: [firm], names: { [firm]: b.dataset.name },
           });
-          rememberPortfolioKey(r.key);
-          await syncAlertList(r.key);
+          await portfolioChanged(r.key);
           b.outerHTML = '<a href="#/portfolio">In your portfolio →</a>';
         } catch (e) {
           b.disabled = false;
@@ -2519,6 +2518,56 @@ function rememberPortfolioKey(key) {
   } catch { /* private mode: the file is the copy that counts anyway */ }
 }
 
+/* Which portfolio in the signed-in person's account is the one open here, if
+ * any. The account's copy is the one that counts: it is what another browser
+ * opens, and what the alert list follows. */
+const PORTFOLIO_ID_STORAGE = "foci.portfolio.id";
+
+function savedPortfolioId() {
+  try { return localStorage.getItem(PORTFOLIO_ID_STORAGE) || ""; } catch { return ""; }
+}
+
+function rememberPortfolioId(id) {
+  try {
+    if (id) localStorage.setItem(PORTFOLIO_ID_STORAGE, id);
+    else localStorage.removeItem(PORTFOLIO_ID_STORAGE);
+  } catch { /* the account still has it */ }
+}
+
+/* After any change to the portfolio open here: keep the new key in this
+ * browser, and in the account if it is kept there — which brings its alert
+ * list along on the server. One not in an account keeps its alert list in step
+ * from here. */
+async function portfolioChanged(key) {
+  rememberPortfolioKey(key);
+  const id = savedPortfolioId();
+  if (id && key) {
+    try {
+      await apiPost("/v1/me/portfolios", { portfolio_id: id, key });
+      return;
+    } catch {
+      // Signed out, or no longer theirs: this browser's copy goes on alone.
+      rememberPortfolioId("");
+    }
+  }
+  await syncAlertList(key);
+}
+
+/* Who is signed in, asked once per page load (and again on signing in or
+ * out): {sign_in, members, email, admin}. */
+let authState = null;
+
+async function currentAuth(refresh = false) {
+  if (!authState || refresh) {
+    try {
+      authState = await api("/v1/auth");
+    } catch {
+      authState = { sign_in: false, members: "", email: "", admin: false };
+    }
+  }
+  return authState;
+}
+
 /* Adding to the portfolio is a button on the page for the thing being added,
  * never a side effect of looking at it. Searching for a company, or reading
  * its page, does not start watching it — that is a decision, and it is made
@@ -2547,8 +2596,7 @@ function wireAddToPortfolio() {
       const d = await apiPost("/v1/portfolio/edit", {
         key: savedPortfolioKey(), add: keys,
       });
-      rememberPortfolioKey(d.key);
-      await syncAlertList(d.key);
+      await portfolioChanged(d.key);
       status.innerHTML = `Added. Portfolio now holds ${num(d.companies)}
         compan${d.companies === 1 ? "y" : "ies"} —
         <a href="#/portfolio">open it</a>. Save the key to a file from there.`;
@@ -2600,6 +2648,8 @@ function portfolioTable(companies) {
       <td>${raise(r)}</td>
       <td>${pooled(r)}</td>
       <td>${r.last_screened ? day(r.last_screened) : "—"}</td>
+      <td><button class="linkish pf-remove" data-key="${esc(r.entity_key)}"
+        data-name="${esc(r.entity_name)}" title="Take it off this portfolio">Remove</button></td>
     </tr>`).join("");
 
   const firmRows = firms.map((r) => `
@@ -2610,6 +2660,8 @@ function portfolioTable(companies) {
       <td class="num">${r.fund_assets ? money(r.fund_assets) : "—"}</td>
       <td class="num">${r.foreign_owners === null || r.foreign_owners === undefined ? "—"
         : r.foreign_owners ? `<span class="pill warn">${num(r.foreign_owners)}</span>` : "none"}</td>
+      <td><button class="linkish pf-remove" data-key="${esc(r.entity_key)}"
+        data-name="${esc(r.entity_name)}" title="Take it off this portfolio">Remove</button></td>
     </tr>`).join("");
 
   return `
@@ -2617,13 +2669,13 @@ function portfolioTable(companies) {
       <thead><tr><th>Contractor</th><th>Latest severity</th><th class="num">Awards</th>
         <th class="num">Obligated</th><th title="From the company's latest SEC Form D">Latest private raise</th>
         <th title="Investment funds named after the company, and the money their latest notices report. Looked up on the contractor's page.">Funds named after it</th>
-        <th>Screened</th></tr></thead>
+        <th>Screened</th><th></th></tr></thead>
       <tbody>${contractorRows}</tbody></table>` : ""}
     ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
       <table>
       <thead><tr><th>Firm</th><th>Latest Form ADV</th><th class="num">Private funds</th>
         <th class="num">Money in those funds</th>
-        <th class="num" title="Owners of the firm that its Form ADV marks as companies based outside the United States">Owners outside the U.S.</th></tr></thead>
+        <th class="num" title="Owners of the firm that its Form ADV marks as companies based outside the United States">Owners outside the U.S.</th><th></th></tr></thead>
       <tbody>${firmRows}</tbody></table>` : ""}`;
 }
 
@@ -2685,8 +2737,7 @@ function wireAdvisers() {
             const r = await apiPost("/v1/portfolio/edit", {
               key: savedPortfolioKey(), add: [key], names: { [key]: b.dataset.name },
             });
-            rememberPortfolioKey(r.key);
-            await syncAlertList(r.key);
+            await portfolioChanged(r.key);
             viewPortfolio();
           } catch (e) {
             b.disabled = false;
@@ -2721,7 +2772,7 @@ function rememberAlertListId(id) {
 
 /* When the portfolio changes, the alert list follows it — otherwise a firm
  * added today would quietly never be watched. */
-async function syncAlertList(newKey) {
+async function syncAlertList(newKey, portfolioId = "") {
   const id = savedAlertListId();
   if (!id || !newKey) return;
   try {
@@ -2733,7 +2784,7 @@ async function syncAlertList(newKey) {
     await apiPost("/v1/alerts/subscriptions", {
       subscription_id: id, name: list.name,
       emails: list.can_edit_addresses === false ? [] : list.emails,
-      portfolio_key: newKey, active: list.active,
+      portfolio_key: newKey, active: list.active, portfolio_id: portfolioId,
     });
   } catch { /* shown as out of date on the portfolio page instead */ }
 }
@@ -2949,6 +3000,7 @@ function wireAlerts(key, portfolioName) {
         name: portfolioName || "Portfolio",
         emails: [document.getElementById("alert-emails").value],
         portfolio_key: key,
+        portfolio_id: savedPortfolioId(),
       });
       rememberAlertListId(r.subscription.subscription_id);
       alertSaveNote = [
@@ -3178,22 +3230,47 @@ async function viewAdviser(crd) {
 }
 
 async function viewPortfolio() {
-  const key = savedPortfolioKey();
+  setBusy("Opening portfolio…");
+  // Signed in, the account's copy wins: it may have been changed on another
+  // browser since this one last saw it.
+  const auth = await currentAuth();
+  let mine = null;
+  if (auth.email) {
+    try { mine = (await api("/v1/me/portfolios")).portfolios; } catch { mine = null; }
+  }
+  let key = savedPortfolioKey();
+  let current = null;
+  if (mine) {
+    const id = savedPortfolioId();
+    // On a browser that has none open, the most recently changed one.
+    current = mine.find((p) => p.portfolio_id === id)
+      || (key ? mine.find((p) => p.portfolio_key === key) : mine[0]) || null;
+    if (current) {
+      key = current.portfolio_key;
+      rememberPortfolioKey(key);
+      rememberPortfolioId(current.portfolio_id);
+      if (current.subscription_id) rememberAlertListId(current.subscription_id);
+    } else {
+      rememberPortfolioId("");
+    }
+  }
   if (!key) {
-    view.innerHTML = portfolioEmpty();
-    wirePortfolio(null);
+    view.innerHTML = portfolioEmpty() + accountCard(auth, mine, null, "");
+    wirePortfolio(null, auth);
+    wireAccount(auth, mine, null, "", "");
     wireAdvisers();
     return;
   }
-  setBusy("Opening portfolio…");
   let d;
   try {
     d = await apiPost("/v1/portfolio", { key });
   } catch (e) {
     // A stored key that no longer loads must not trap the page: show the
     // reason and the form, with the key still in the box to be corrected.
-    view.innerHTML = portfolioEmpty(key, e.message || String(e));
-    wirePortfolio(null);
+    view.innerHTML = portfolioEmpty(key, e.message || String(e))
+      + accountCard(auth, mine, current, "");
+    wirePortfolio(null, auth);
+    wireAccount(auth, mine, current, "", "");
     wireAdvisers();
     return;
   }
@@ -3232,6 +3309,10 @@ async function viewPortfolio() {
 
     ${alertsHtml}
 
+    ${accountCard(auth, mine, current, key)}
+
+    ${emailCard(auth)}
+
     ${advisersCard()}
 
     <div class="card">
@@ -3249,9 +3330,234 @@ async function viewPortfolio() {
         <button class="ghost" id="pf-forget">Forget on this browser</button>
       </div>
     </div>`;
-  wirePortfolio(d.name);
+  wirePortfolio(d.name, auth);
   wireAlerts(key, d.name);
+  wireAccount(auth, mine, current, key, d.name);
+  wireEmail(key);
+  wireRemove(key);
   wireAdvisers();
+}
+
+/* Portfolios kept in the signed-in person's account, which open on any
+ * browser where they sign in. Not signed in, where others may sign in, the
+ * card says what signing in would do. */
+function accountCard(auth, mine, current, key) {
+  if (!auth.sign_in) return "";
+  if (!auth.email) {
+    if (!auth.members) return "";
+    return `<div class="card">
+      <h2>Keep your portfolios</h2>
+      <p class="muted">Sign in and the portfolios you build are kept for you: they open
+      on any browser where you sign in, an alert list follows the one it is for, and you
+      can email a portfolio to yourself or a colleague. ${auth.members === "anyone"
+        ? "Anyone can sign in with an email address."
+        : `Addresses at ${esc(auth.members)} can sign in.`}</p>
+      <div class="actions"><button class="primary" id="acct-signin">Sign in</button></div>
+    </div>`;
+  }
+  const rows = (mine || []).map((p) => `
+    <tr>
+      <td>${current && current.portfolio_id === p.portfolio_id
+        ? `<strong>${esc(p.name)}</strong> <span class="pill">open</span>` : esc(p.name)}</td>
+      <td class="num">${p.companies === null ? "—" : num(p.companies)}</td>
+      <td>${p.subscription_id ? "alerts on" : '<span class="muted">—</span>'}</td>
+      <td>${esc(day(p.updated_at))}</td>
+      <td class="wl-actions">
+        ${current && current.portfolio_id === p.portfolio_id ? ""
+          : `<button class="linkish acct-open" data-id="${esc(p.portfolio_id)}">Open</button>`}
+        <button class="linkish acct-forget" data-id="${esc(p.portfolio_id)}">Remove</button>
+      </td>
+    </tr>`).join("");
+  return `<div class="card">
+    <h2>Your portfolios</h2>
+    <p class="muted" style="font-size:12.5px">Kept for ${esc(auth.email)}. They open on any
+      browser where you sign in, and changes made on one show on the others.</p>
+    ${rows ? `<table><thead><tr><th>Portfolio</th><th class="num">Companies</th>
+      <th>Email alerts</th><th>Changed</th><th></th></tr></thead><tbody>${rows}</tbody></table>`
+      : '<p class="muted">None kept yet.</p>'}
+    <div class="actions">
+      ${key && !current ? '<button class="primary" id="acct-keep">Keep this portfolio in my account</button>' : ""}
+      ${key ? '<button id="acct-new">Start a new one</button>' : ""}
+    </div>
+    <p class="muted" id="acct-status" style="font-size:12.5px"></p>
+  </div>`;
+}
+
+function wireAccount(auth, mine, current, key, name) {
+  const signIn = document.getElementById("acct-signin");
+  if (signIn) signIn.onclick = () => openSignIn();
+  const status = document.getElementById("acct-status");
+  const byId = Object.fromEntries((mine || []).map((p) => [p.portfolio_id, p]));
+  document.querySelectorAll(".acct-open").forEach((b) => {
+    b.onclick = () => {
+      const p = byId[b.dataset.id];
+      rememberPortfolioKey(p.portfolio_key);
+      rememberPortfolioId(p.portfolio_id);
+      rememberAlertListId(p.subscription_id || "");
+      viewPortfolio();
+    };
+  });
+  document.querySelectorAll(".acct-forget").forEach((b) => {
+    b.onclick = async () => {
+      const p = byId[b.dataset.id];
+      if (!confirm(`Take "${p.name}" out of your account? Its key still opens it, and its `
+                   + "alert list, if it has one, goes on.")) return;
+      try {
+        await apiSend("DELETE", `/v1/me/portfolios/${encodeURIComponent(p.portfolio_id)}`);
+        if (p.portfolio_id === savedPortfolioId()) rememberPortfolioId("");
+        viewPortfolio();
+      } catch (e) {
+        status.textContent = e.message || String(e);
+      }
+    };
+  });
+  const keep = document.getElementById("acct-keep");
+  if (keep) {
+    keep.onclick = async () => {
+      keep.disabled = true;
+      try {
+        const r = await apiPost("/v1/me/portfolios", { key, name: name || "" });
+        rememberPortfolioId(r.portfolio.portfolio_id);
+        // An alert list already running for it follows it from now on.
+        await syncAlertList(key, r.portfolio.portfolio_id);
+        viewPortfolio();
+      } catch (e) {
+        keep.disabled = false;
+        status.textContent = e.message || String(e);
+      }
+    };
+  }
+  const fresh = document.getElementById("acct-new");
+  if (fresh) {
+    fresh.onclick = () => {
+      rememberPortfolioKey("");
+      rememberPortfolioId("");
+      rememberAlertListId("");
+      viewPortfolio();
+    };
+  }
+}
+
+/* Emailing the portfolio: its companies, their latest severity, a link that
+ * opens it, and its key. Only signed in, because the email says who sent it. */
+function emailCard(auth) {
+  if (!auth.email) return "";
+  return `<div class="card">
+    <h2>Email this portfolio</h2>
+    <p class="muted" style="font-size:12.5px">Sends the companies, the latest severity of
+      each, a link that opens this portfolio, and its key. To someone else it says it came
+      from you, and their replies come to you. Up to 10 addresses at a time.</p>
+    <label class="field" style="display:block">To
+      <input id="pf-mail-to" type="text" value="${esc(auth.email)}" autocomplete="email"
+        style="width:100%;margin-top:4px"></label>
+    <label class="field" style="display:block;margin-top:8px">A note (optional)
+      <textarea id="pf-mail-note" rows="2" style="width:100%;margin-top:4px"></textarea></label>
+    <div class="actions"><button class="primary" id="pf-mail-send">Send</button></div>
+    <p class="muted" id="pf-mail-status" style="font-size:12.5px"></p>
+  </div>`;
+}
+
+function wireEmail(key) {
+  const send = document.getElementById("pf-mail-send");
+  if (!send) return;
+  const status = document.getElementById("pf-mail-status");
+  send.onclick = async () => {
+    send.disabled = true;
+    status.textContent = "Sending…";
+    try {
+      const r = await apiPost("/v1/portfolio/email", {
+        key, to: [document.getElementById("pf-mail-to").value],
+        note: document.getElementById("pf-mail-note").value,
+      });
+      status.textContent = {
+        sent: `Sent to ${r.recipients.join(", ")}. It can take a minute; check spam too.`,
+        partial: `Sent to some only. ${r.detail}`,
+        drafted: `Not sent. ${r.detail}`,
+        failed: `Not sent. ${r.detail}`,
+      }[r.status] || `${r.status}: ${r.detail}`;
+    } catch (e) {
+      status.textContent = e.message || String(e);
+    }
+    send.disabled = false;
+  };
+}
+
+/* Taking a company off the portfolio. Asked first: the alert list following
+ * the portfolio stops watching it too. */
+function wireRemove(key) {
+  document.querySelectorAll(".pf-remove").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm(`Take ${b.dataset.name} off this portfolio? Its alert list, if it has `
+                   + "one, stops watching it too.")) return;
+      b.disabled = true;
+      try {
+        const d = await apiPost("/v1/portfolio/edit", { key, remove: [b.dataset.key] });
+        if (!d.key) {
+          alert("A portfolio needs at least one company. Use “Start a new one” or "
+                + "“Forget on this browser” instead.");
+          b.disabled = false;
+          return;
+        }
+        await portfolioChanged(d.key);
+        viewPortfolio();
+      } catch (e) {
+        b.disabled = false;
+        alert(e.message || String(e));
+      }
+    };
+  });
+}
+
+/* A portfolio sent by email: the link carries its key. Opening it replaces the
+ * portfolio open in this browser, so the page says so first. */
+async function viewOpenPortfolio(key) {
+  setBusy("Reading the portfolio…");
+  let d;
+  try {
+    d = await apiPost("/v1/portfolio", { key });
+  } catch (e) {
+    showError({ title: "That portfolio link did not open", message: e.message || String(e) });
+    return;
+  }
+  const auth = await currentAuth();
+  const here = savedPortfolioKey();
+  const replacing = here && here !== key;
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${esc(d.name)}</h1>
+      <div class="sub">A portfolio of ${num(d.totals.companies)}
+        compan${d.totals.companies === 1 ? "y" : "ies"}, sent by email.</div>
+    </div>
+    <div class="card">
+      <p>${replacing ? (savedPortfolioId()
+          ? "Opening it replaces the portfolio open in this browser, which stays in your account."
+          : "Opening it replaces the portfolio open in this browser. Save that one's key first if you want it back.")
+        : "Open it to see the dashboard."}</p>
+      <div class="actions">
+        <button class="primary" id="po-open">Open it</button>
+        ${auth.email ? '<button id="po-keep">Open it and keep it in my account</button>' : ""}
+        <a href="#/portfolio" class="ghost" style="align-self:center">Cancel</a>
+      </div>
+      <p class="muted" id="po-status" style="font-size:12.5px"></p>
+    </div>`;
+  const open = (id) => {
+    rememberPortfolioKey(key);
+    rememberPortfolioId(id || "");
+    rememberAlertListId("");
+    location.hash = "#/portfolio";
+  };
+  document.getElementById("po-open").onclick = () => open("");
+  const keep = document.getElementById("po-keep");
+  if (keep) {
+    keep.onclick = async () => {
+      try {
+        const r = await apiPost("/v1/me/portfolios", { key });
+        open(r.portfolio.portfolio_id);
+      } catch (e) {
+        document.getElementById("po-status").textContent = e.message || String(e);
+      }
+    };
+  }
 }
 
 function portfolioEmpty(key = "", error = "") {
@@ -3307,13 +3613,15 @@ function downloadPortfolioKey(key, name) {
   URL.revokeObjectURL(url);
 }
 
-function wirePortfolio(loadedName) {
+function wirePortfolio(loadedName, auth = {}) {
   const open = document.getElementById("pf-open");
   if (open) {
     open.onclick = () => {
       const typed = document.getElementById("pf-key-input").value.trim();
       if (!typed) return;
       rememberPortfolioKey(typed);
+      rememberPortfolioId("");
+      rememberAlertListId("");
       viewPortfolio();
     };
   }
@@ -3332,6 +3640,15 @@ function wirePortfolio(loadedName) {
           companies,
         });
         rememberPortfolioKey(d.key);
+        rememberPortfolioId("");
+        rememberAlertListId("");
+        // Signed in, a new portfolio is kept in the account from the start.
+        if (auth.email) {
+          try {
+            const r = await apiPost("/v1/me/portfolios", { key: d.key });
+            rememberPortfolioId(r.portfolio.portfolio_id);
+          } catch { /* still open here; "Keep" is offered on the page */ }
+        }
         viewPortfolio();
       } catch (e) {
         showError(e);
@@ -3363,6 +3680,7 @@ function wirePortfolio(loadedName) {
     };
     document.getElementById("pf-forget").onclick = () => {
       rememberPortfolioKey("");
+      rememberPortfolioId("");
       viewPortfolio();
     };
   }
@@ -3828,6 +4146,7 @@ const ROUTES = [
   [/^\/portfolio$/, () => viewPortfolio()],
   [/^\/screening$/, () => viewScreening()],
   [/^\/watchlists$/, () => viewWatchlists()],
+  [/^\/portfolio\/open\/(.+)$/, (k) => viewOpenPortfolio(decodeURIComponent(k))],
   [/^\/adviser\/(\d+)$/, (crd) => viewAdviser(crd)],
   [/^\/screens\/(.+)$/, (id) => viewScreen(decodeURIComponent(id))],
   [/^\/system$/, () => viewSystem()],
@@ -4064,13 +4383,9 @@ let signInOffered = false;
 let signedInAs = "";
 
 async function refreshSignIn() {
-  try {
-    const r = await api("/v1/auth");
-    signInOffered = !!r.sign_in;
-    signedInAs = r.email || "";
-  } catch {
-    return;
-  }
+  const r = await currentAuth(true);
+  signInOffered = !!r.sign_in;
+  signedInAs = r.email || "";
   if (!signInOffered) return;
   const button = document.getElementById("key-button");
   button.textContent = signedInAs ? "Signed in" : "Sign in";
@@ -4083,8 +4398,9 @@ function openSignIn() {
   document.getElementById("signin-send").hidden = out;
   document.getElementById("signin-out").hidden = !out;
   document.getElementById("signin-status").textContent = out
-    ? `You are signed in as ${signedInAs}. What you approve and send is recorded under that
-       address.` : "";
+    ? `You are signed in as ${signedInAs}${authState && authState.admin
+      ? ", as one of this site's admins. What you approve and send is recorded under that address."
+      : ". Your portfolios are kept under that address, on the Portfolio page."}` : "";
   signinDialog.showModal();
 }
 
@@ -4116,8 +4432,10 @@ document.getElementById("signin-out").onclick = async () => {
     await apiSend("POST", "/v1/auth/sign-out");
   } catch { /* the cookie is cleared either way on the next answer */ }
   signedInAs = "";
+  authState = null;
+  rememberPortfolioId("");
   signinDialog.close();
-  refreshSignIn();
+  await refreshSignIn();
   route();
 };
 

@@ -101,12 +101,18 @@ ADMIN_UNSET = (
     "to a key for whoever looks after it, or FOCI_ADMIN_EMAILS lists who may sign "
     "in.")
 
-# Who a request is signed in as, or "". Supplied by the app (signin.SignIn).
-Session = Callable[[Request], str]
+MEMBER_NOT_ADMIN = (
+    "You are signed in, but this needs one of the site's admins (FOCI_ADMIN_EMAILS) or "
+    "the admin key: it removes recorded work, changes how the site screens for "
+    "everyone, or emails a federal official.")
+
+# Who a request is signed in as, and whether that person is an admin; ("",
+# False) for nobody. Supplied by the app (signin.SignIn.session).
+Session = Callable[[Request], tuple[str, bool]]
 
 
-def _nobody(_request: Request) -> str:
-    return ""
+def _nobody(_request: Request) -> tuple[str, bool]:
+    return "", False
 
 
 def _presented(authorization: str, x_api_key: str) -> str:
@@ -120,8 +126,10 @@ def make_dependency(keymap: dict[str, str], public: bool = False,
                     session: Session = _nobody, sign_in: bool = False):
     """Build the FastAPI dependency that yields a tenant id.
 
-    `sign_in` says whether anyone may sign in, which keeps a closed site with
-    no keys from reporting itself as unconfigured.
+    On a closed site anyone signed in may read and use it, admin or not —
+    who may sign in at all is FOCI_SIGN_IN's business. `sign_in` says whether
+    anyone may, which keeps a closed site with no keys from reporting itself
+    as unconfigured.
     """
 
     async def require_tenant(
@@ -137,7 +145,7 @@ def make_dependency(keymap: dict[str, str], public: bool = False,
             return (resolve_tenant(keymap, presented) if presented else "") \
                 or DEFAULT_TENANT
 
-        if not presented and session(request):
+        if not presented and session(request)[0]:
             return DEFAULT_TENANT
         if not keymap and not sign_in:
             # Say how to fix it. The symptom otherwise is a web page that shows
@@ -168,12 +176,11 @@ def make_admin_dependency(keymap: dict[str, str], public: bool = False,
     """The dependency for routes that remove recorded work, change how the
     site screens for everyone, or email a federal official.
 
-    Outside public mode every caller already holds a key or is signed in, and
-    either will do, as before. In public mode one of them is required; with
-    neither configured these routes are closed (403), not opened.
+    Any key will do, as it always has, or a sign-in by an admin. Someone
+    signed in who is not an admin is told so (403) rather than asked to sign
+    in. With neither keys nor sign-in configured, a public site has these
+    routes closed (403) and a closed site is closed altogether (503).
     """
-    if not public:
-        return make_dependency(keymap, session=session, sign_in=sign_in)
 
     async def require_admin(
         request: Request,
@@ -181,31 +188,46 @@ def make_admin_dependency(keymap: dict[str, str], public: bool = False,
         x_api_key: str = Header(default=""),
     ) -> str:
         presented = _presented(authorization, x_api_key)
-        if not presented and session(request):
-            return DEFAULT_TENANT
-        if not keymap and not sign_in:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ADMIN_UNSET)
-        tenant = resolve_tenant(keymap, presented) if presented else ""
-        if not tenant:
+        if presented:
+            tenant = resolve_tenant(keymap, presented)
+            if tenant:
+                return tenant
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail=ADMIN_NEEDED if not presented else "That admin key is not "
-                       "one this site knows. Check it at the top right.",
+                detail="That admin key is not one this site knows. Check it at the top "
+                       "right." if public else "Unknown API key.",
                 headers={"WWW-Authenticate": "Bearer"})
-        return tenant
+        email, admin = session(request)
+        if admin:
+            return DEFAULT_TENANT
+        if email:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                detail=MEMBER_NOT_ADMIN)
+        if not keymap and not sign_in:
+            if public:
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                                    detail=ADMIN_UNSET)
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                                detail=CLOSED_DETAIL)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=ADMIN_NEEDED if public else
+            "Sign in, or supply a key in Authorization: Bearer <key> or X-API-Key."
+            if sign_in else "Supply a key in Authorization: Bearer <key> or X-API-Key.",
+            headers={"WWW-Authenticate": "Bearer"})
 
     return require_admin
 
 
 def make_admin_flag(keymap: dict[str, str], public: bool = False,
                     session: Session = _nobody):
-    """A dependency answering whether this request carries a known key or a
-    sign-in.
+    """A dependency answering whether this request carries a known key or an
+    admin's sign-in.
 
-    Always yes outside public mode, where a request without one never gets
-    this far. In public mode it decides what a visitor is shown of other
-    people's email addresses, and whether an address they add is trusted
-    without confirming.
+    It decides what is shown of other people's email addresses, and whether
+    an address added to an alert list is trusted without confirming. On a
+    closed site a key holder counts, as everyone there used to; someone
+    signed in counts only if they are an admin.
     """
 
     async def is_admin(
@@ -213,11 +235,12 @@ def make_admin_flag(keymap: dict[str, str], public: bool = False,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> bool:
-        if not public:
-            return True
         presented = _presented(authorization, x_api_key)
         if presented:
             return bool(resolve_tenant(keymap, presented))
-        return bool(session(request))
+        email, admin = session(request)
+        if email:
+            return admin
+        return not public
 
     return is_admin

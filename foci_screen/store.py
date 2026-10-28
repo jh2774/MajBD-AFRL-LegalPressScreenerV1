@@ -170,6 +170,31 @@ CREATE TABLE IF NOT EXISTS sessions (
     created_at   TEXT NOT NULL,
     expires_at   TEXT NOT NULL
 );
+-- Portfolios kept in someone's account, by the address they sign in with.
+-- The key is still the portfolio (portfolio.py); this is where a signed-in
+-- person's keys are kept, so they open on any browser. An alert list started
+-- from one is tied to it here, and follows its edits.
+CREATE TABLE IF NOT EXISTS saved_portfolios (
+    portfolio_id TEXT PRIMARY KEY,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    owner        TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    portfolio_key TEXT NOT NULL,
+    subscription_id TEXT,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+-- Every time someone emailed a portfolio: who, to whom, and what happened.
+CREATE TABLE IF NOT EXISTS portfolio_emails (
+    email_id     TEXT PRIMARY KEY,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    sender       TEXT NOT NULL,
+    portfolio_name TEXT NOT NULL,
+    recipients   TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    detail       TEXT,
+    sent_at      TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS adv_snapshots (
     crd          TEXT PRIMARY KEY,
     snapshot     TEXT NOT NULL,
@@ -441,6 +466,8 @@ INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_recipients_token ON alert_recipients(token);
 CREATE INDEX IF NOT EXISTS idx_notice_sends ON notice_sends(tenant_id, notice_id);
 CREATE INDEX IF NOT EXISTS idx_sign_in_links_email ON sign_in_links(email, created_at);
+CREATE INDEX IF NOT EXISTS idx_saved_portfolios_owner ON saved_portfolios(tenant_id, owner);
+CREATE INDEX IF NOT EXISTS idx_portfolio_emails_sender ON portfolio_emails(sender, sent_at);
 CREATE INDEX IF NOT EXISTS idx_findings_entity ON findings(entity_key);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_tenant ON findings(tenant_id, id);
@@ -1596,6 +1623,8 @@ class Store:
             c.execute("DELETE FROM alert_sent WHERE subscription_id=?", (subscription_id,))
             c.execute("DELETE FROM alert_recipients WHERE subscription_id=?",
                       (subscription_id,))
+            c.execute("UPDATE saved_portfolios SET subscription_id=NULL"
+                      " WHERE subscription_id=?", (subscription_id,))
         return True
 
     # ----------------------------------------------------- unsubscribing
@@ -1960,9 +1989,73 @@ class Store:
                       " VALUES (?,?,?,?)", (token_hash, email, now, expires_at))
 
     def sign_in_links_since(self, email: str, when: str) -> int:
-        row = self._one("SELECT COUNT(*) AS n FROM sign_in_links WHERE email=?"
-                        " AND created_at >= ?", (email, when))
+        """Links sent since `when` to `email`, or to anyone when it is ""."""
+        if not email:
+            row = self._one("SELECT COUNT(*) AS n FROM sign_in_links WHERE created_at >= ?",
+                            (when,))
+        else:
+            row = self._one("SELECT COUNT(*) AS n FROM sign_in_links WHERE email=?"
+                            " AND created_at >= ?", (email, when))
         return int(row["n"]) if row else 0
+
+    # ------------------------------------------------- portfolios in an account
+    def saved_portfolios(self, owner: str) -> list[dict]:
+        return self._query("SELECT * FROM saved_portfolios WHERE tenant_id=? AND owner=?"
+                           " ORDER BY updated_at DESC", (self.tenant_id, owner))
+
+    def saved_portfolio(self, portfolio_id: str, owner: str) -> dict | None:
+        """One of `owner`'s portfolios; None for anyone else's."""
+        return self._one("SELECT * FROM saved_portfolios WHERE tenant_id=? AND"
+                         " portfolio_id=? AND owner=?", (self.tenant_id, portfolio_id, owner))
+
+    def save_portfolio(self, owner: str, name: str, portfolio_key: str,
+                       portfolio_id: str = "") -> str:
+        """Keep a portfolio in `owner`'s account, or replace one already there.
+        "" when `portfolio_id` names a portfolio that is not theirs."""
+        now = _now()
+        if portfolio_id:
+            if not self.saved_portfolio(portfolio_id, owner):
+                return ""
+            with self._tx() as c:
+                c.execute("UPDATE saved_portfolios SET name=?, portfolio_key=?, updated_at=?"
+                          " WHERE tenant_id=? AND portfolio_id=? AND owner=?",
+                          (name, portfolio_key, now, self.tenant_id, portfolio_id, owner))
+            return portfolio_id
+        portfolio_id = uuid.uuid4().hex[:12]
+        with self._tx() as c:
+            c.execute("INSERT INTO saved_portfolios (portfolio_id, tenant_id, owner, name,"
+                      " portfolio_key, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                      (portfolio_id, self.tenant_id, owner, name, portfolio_key, now, now))
+        return portfolio_id
+
+    def link_portfolio_alerts(self, portfolio_id: str, owner: str,
+                              subscription_id: str) -> bool:
+        with self._tx() as c:
+            c.execute("UPDATE saved_portfolios SET subscription_id=? WHERE tenant_id=? AND"
+                      " portfolio_id=? AND owner=?",
+                      (subscription_id, self.tenant_id, portfolio_id, owner))
+            return c.rowcount() == 1
+
+    def delete_saved_portfolio(self, portfolio_id: str, owner: str) -> bool:
+        with self._tx() as c:
+            c.execute("DELETE FROM saved_portfolios WHERE tenant_id=? AND portfolio_id=?"
+                      " AND owner=?", (self.tenant_id, portfolio_id, owner))
+            return c.rowcount() == 1
+
+    def log_portfolio_email(self, sender: str, portfolio_name: str, recipients: list[str],
+                            status: str, detail: str = "") -> None:
+        with self._tx() as c:
+            c.execute("INSERT INTO portfolio_emails (email_id, tenant_id, sender,"
+                      " portfolio_name, recipients, status, detail, sent_at)"
+                      " VALUES (?,?,?,?,?,?,?,?)",
+                      (uuid.uuid4().hex[:12], self.tenant_id, sender, portfolio_name,
+                       json.dumps(recipients), status, detail[:1000], _now()))
+
+    def portfolio_emails_since(self, sender: str, when: str) -> int:
+        """Addresses `sender` has emailed portfolios to since `when`."""
+        rows = self._query("SELECT recipients FROM portfolio_emails WHERE sender=? AND"
+                           " sent_at >= ?", (sender, when))
+        return sum(len(json.loads(r["recipients"] or "[]")) for r in rows)
 
     def sign_in_link(self, token_hash: str) -> dict | None:
         return self._one("SELECT * FROM sign_in_links WHERE token_hash=?", (token_hash,))

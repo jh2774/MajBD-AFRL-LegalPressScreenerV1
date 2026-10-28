@@ -62,7 +62,8 @@ def sign_in(c, post) -> None:
 
 def test_without_a_list_there_is_no_sign_in(site):
     c, _ = site(FOCI_ADMIN_EMAILS="")
-    assert c.get("/v1/auth").json() == {"sign_in": False, "email": ""}
+    assert c.get("/v1/auth").json() == {"sign_in": False, "members": "", "email": "",
+                                        "admin": False}
     assert c.post("/v1/auth/sign-in", json={"email": ADMIN}).status_code == 404
     assert c.get("/health").json()["sign_in"] is False
 
