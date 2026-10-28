@@ -2633,6 +2633,17 @@ async function alertsCard(key, portfolioName) {
           (${esc(day(o.at))})`).join(", ")}.
         They are not emailed again, even if added back here; they can rejoin from that
         same link.</p>` : ""}
+      ${list && (list.bounced || []).length ? `<div class="error" style="font-size:12.5px;margin:6px 0">
+        <strong>Not being emailed:</strong>
+        ${list.bounced.map((b) => `<div style="margin-top:4px">${esc(b.description)}
+          ${b.kind === "complaint" ? "" : `<button class="ghost bounce-clear"
+            data-email="${esc(b.email)}" style="margin-left:6px">Mail again</button>`}</div>`).join("")}
+        <div class="muted" style="margin-top:4px">If an address was mistyped, correct it in
+          the box above. “Mail again” is for an address that has started working again.</div>
+      </div>` : ""}
+      ${list && mode === "send" && !d.bounce_reports ? `<p class="muted" style="font-size:12px">
+        This site is not told when an alert bounces, so a dead address goes on being sent to
+        unnoticed. DEPLOY.md, “Hearing about bounces”, has the steps.</p>` : ""}
       ${outOfDate ? `<p class="muted" style="font-size:12.5px">This portfolio has changed
         since the list was saved. Save again to watch the new companies.</p>` : ""}
       <div class="actions">
@@ -2696,6 +2707,18 @@ function wireAlerts(key, portfolioName) {
   const save = document.getElementById("alert-save");
   if (!save) return;
   if (document.getElementById("alert-run")) checkIfDue(portfolioName);
+  document.querySelectorAll(".bounce-clear").forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await apiSend("DELETE", `/v1/alerts/bounces/${encodeURIComponent(btn.dataset.email)}`);
+        viewPortfolio();
+      } catch (e) {
+        btn.disabled = false;
+        status.textContent = e.message || String(e);
+      }
+    };
+  });
   save.onclick = async () => {
     save.disabled = true;
     try {

@@ -42,6 +42,7 @@ from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
 from .connectors.formd import FormDConnector, FormDUnavailable, IssuerSnapshot
 from .connectors.vehicles import VehicleConnector
+from .notify import bounces
 from .notify.mailer import Mailer
 
 log = logging.getLogger("foci.alerts")
@@ -90,13 +91,23 @@ def personalizer(store, subscription: dict, base_url: str, build):
 
 
 def recipients(store, subscription: dict) -> list[str]:
-    """The list's addresses, less anyone who has unsubscribed.
+    """The list's addresses, less anyone who has unsubscribed, and less any
+    address the mail service reported as bouncing or complaining.
 
     Unsubscribing already takes the address off the list; this is the second
-    lock, for a list saved from a page opened before they did.
+    lock, for a list saved from a page opened before they did. A bounced
+    address stays on the list, so its owner can see it and correct it.
     """
     gone = store.opted_out(subscription["subscription_id"])
-    return [e for e in subscription["emails"] if e.lower() not in gone]
+    dead = store.suppressed(subscription["emails"])
+    return [e for e in subscription["emails"]
+            if e.lower() not in gone and e.lower() not in dead]
+
+
+def held_back(store, subscription: dict) -> str:
+    """Why addresses on the list were not sent to, for the alert log."""
+    rows = store.suppressed(subscription["emails"]).values()
+    return "; ".join(bounces.describe(r) for r in sorted(rows, key=lambda r: r["email"]))
 
 
 def split_keys(companies: list[str]) -> tuple[list[str], list[str]]:
@@ -479,19 +490,23 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
             summary["emails"].append({"subscription": s["name"], "status": "nothing new"})
             continue
         to = recipients(store, s)
+        skipped = held_back(store, s)
         if not to:
             summary["emails"].append({"subscription": s["name"],
-                                      "status": "nobody to send to"})
+                                      "status": "nobody to send to",
+                                      "detail": skipped})
             continue
         subject, text, html = compose(s, items)
         delivery = mailer.send(
             to, subject, text, html,
             personalize=personalizer(store, s, base_url,
                                      lambda url, s=s, items=items: compose(s, items, url)[1:]))
+        detail = " ".join(x for x in (
+            delivery.detail, f"Not sent to: {skipped}." if skipped else "") if x)
         store.log_alert_delivery(
             subscription_id=s["subscription_id"], recipients=delivery.recipients,
             subject=subject, body_text=text, item_count=len(items),
-            status=delivery.status, detail=delivery.detail)
+            status=delivery.status, detail=detail)
         # A failed send — nobody reached — is retried next run. Drafted and
         # sent are both "said". So is partial: sending again would give the
         # people it reached a second copy, and the address it missed is named
@@ -499,5 +514,5 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
         if delivery.status in ("sent", "drafted", "partial"):
             store.mark_alert_sent(s["subscription_id"], [i["item_id"] for i in items])
         summary["emails"].append({"subscription": s["name"], "status": delivery.status,
-                                  "items": len(items), "detail": delivery.detail})
+                                  "items": len(items), "detail": detail})
     return summary
