@@ -93,20 +93,20 @@ async function refreshAccount() {
   }
   const button = document.getElementById("account-button");
   button.textContent = account ? account.email : "Sign in";
-  button.title = account ? "Your account" : "Sign in or create an account";
+  button.title = account ? `Your account: ${account.email}` : "Sign in or create an account";
   // A signed-in account needs no key, and on a site with no keys the button
   // could only ever be refused; either way it would only confuse.
   document.getElementById("key-button").hidden =
     !!account || (!authStatus.keys && !authStatus.public);
 }
 
-/* With the admin key entered in this browser, a new account joins the key's
- * workspace — the data already on the site — as its owner. */
-async function postAccount(path, body) {
+/* `key`, when given, is the site's admin key: a new account made with it
+ * joins the key's workspace — the data already on the site — as its owner. */
+async function postAccount(path, body, key = "") {
   const res = await fetch(path, {
     method: "POST",
     headers: { ...CLIENT_HEADER, "Content-Type": "application/json",
-               ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+               ...(key ? { Authorization: `Bearer ${key}` } : {}) },
     body: JSON.stringify(body || {}),
   });
   if (!res.ok) {
@@ -139,20 +139,32 @@ function setAccountMode(mode) {
     creating ? "new-password" : "current-password";
   const sw = document.getElementById("account-switch");
   sw.textContent = creating || forgot ? "Back to sign in" : "Create an account";
-  // Offer it only where the site takes new accounts, or to the holder of the
-  // admin key; elsewhere, say who to ask.
-  sw.hidden = mode === "signin" && signup === "closed" && !apiKey;
+  // Always offered. Where the site takes no sign-ups, the form says how in:
+  // an invitation, or — for whoever looks after the site — the admin key.
+  sw.hidden = false;
+  const first = authStatus && authStatus.accounts === false;
+  document.getElementById("account-key-row").hidden = !creating || !authStatus || !authStatus.keys;
+  document.getElementById("account-key").value = apiKey;
+  document.getElementById("account-key-label").textContent =
+    signup === "closed" ? "Admin key" : "Admin key (optional)";
   document.getElementById("account-explain").textContent = forgot
     ? "Enter the address you sign in with. If it has an account, we will email it a "
       + "link to choose a new password."
-    : creating && apiKey
-    ? "With the admin key entered in this browser, the account joins this site's own "
-      + "workspace — what has been screened here — as its owner, and you can invite "
-      + "colleagues to it."
-    : creating && signup === "restricted"
-    ? "This site takes new accounts only for addresses its administrator has listed."
-    : signup === "closed" && !creating
-      ? "Accounts on this site are made by its administrator. Your account has its own "
+    : creating && signup === "closed"
+    ? (first ? "No one has an account here yet. The first is made with the site's admin "
+               + "key, and owns this site's workspace — everything screened here. Its "
+               + "owner then invites colleagues."
+             : "This site does not take sign-ups. Ask its owner to invite you — they do "
+               + "it under Organisation and people. If you look after the site, the admin "
+               + "key makes an owner of this site's workspace.")
+    : creating
+    ? (signup === "restricted"
+        ? "This site takes new accounts only for addresses its administrator has listed. "
+        : "")
+      + "A new account starts a workspace of its own. With the site's admin key, it "
+      + "joins this site's workspace as its owner instead."
+    : signup === "closed"
+      ? "Accounts on this site are made by invitation. Your account has its own "
         + "workspace: your portfolio, screens, notices, watchlists, screening settings "
         + "and alert lists."
       : "Your account has its own workspace: your portfolio, screens, notices, "
@@ -181,15 +193,15 @@ function openAccountDialog() {
 }
 
 /* A portfolio built before signing in is not lost by signing in: an account
- * that has none takes this browser's. */
+ * with none open adds this browser's to its portfolios (once), and opens it. */
 async function adoptBrowserPortfolio() {
   if (!account || account.portfolio_key) return;
   let local = "";
   try { local = localStorage.getItem(PORTFOLIO_STORAGE) || ""; } catch { /* blocked */ }
   if (!local) return;
   try {
-    await apiSend("PUT", "/v1/me/portfolio", { portfolio_key: local });
-    account.portfolio_key = local;
+    const r = await apiPost("/v1/me/portfolios", { portfolio_key: local });
+    account = r.account;
   } catch { /* a key the server no longer reads: leave it in the browser */ }
 }
 
@@ -244,7 +256,7 @@ function wireAccountDialog() {
         password: password.value,
         ...(accountMode === "signup"
           ? { organisation: document.getElementById("account-org").value.trim() } : {}),
-      });
+      }, accountMode === "signup" ? document.getElementById("account-key").value.trim() : "");
       password.value = "";
       await refreshAccount();
       await adoptBrowserPortfolio();
@@ -2956,12 +2968,19 @@ function savedPortfolioKey() {
   }
 }
 
-function rememberPortfolioKey(key) {
+/* Signed in, this saves to the open one of the account's portfolios — or,
+ * with none open, starts a new one — and an empty key closes it, leaving it in
+ * the list. Callers that redraw the list wait for it. */
+async function rememberPortfolioKey(key) {
   if (account) {
     account.portfolio_key = key || "";
-    apiSend("PUT", "/v1/me/portfolio", { portfolio_key: key || "" }).catch((e) => {
+    if (!key) account.portfolio_id = "";
+    try {
+      const r = await apiSend("PUT", "/v1/me/portfolio", { portfolio_key: key || "" });
+      if (r && r.account) account = r.account;
+    } catch (e) {
       console.warn("could not save the portfolio to the account", e);
-    });
+    }
     return;
   }
   try {
@@ -2975,7 +2994,7 @@ function rememberPortfolioKey(key) {
  * the list to the new key, so an edit made on another computer, which this
  * browser's memory of the list knows nothing about, still reaches it. */
 async function portfolioChanged(key) {
-  rememberPortfolioKey(key);
+  await rememberPortfolioKey(key);
   await syncAlertList(key);
 }
 
@@ -3076,18 +3095,18 @@ function portfolioTable(companies) {
     </tr>`).join("");
 
   return `
-    ${contractors.length ? `<table>
+    ${contractors.length ? `<div class="table-wrap"><table>
       <thead><tr><th>Contractor</th><th>Latest severity</th><th class="num">Awards</th>
         <th class="num">Obligated</th><th title="From the company's latest SEC Form D">Latest private raise</th>
         <th title="Investment funds named after the company, and the money their latest notices report. Looked up on the contractor's page.">Funds named after it</th>
         <th>Screened</th><th></th></tr></thead>
-      <tbody>${contractorRows}</tbody></table>` : ""}
+      <tbody>${contractorRows}</tbody></table></div>` : ""}
     ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
-      <table>
+      <div class="table-wrap"><table>
       <thead><tr><th>Firm</th><th>Latest Form ADV</th><th class="num">Private funds</th>
         <th class="num">Money in those funds</th>
         <th class="num" title="Owners of the firm that its Form ADV marks as companies based outside the United States">Owners outside the U.S.</th><th></th></tr></thead>
-      <tbody>${firmRows}</tbody></table>` : ""}`;
+      <tbody>${firmRows}</tbody></table></div>` : ""}`;
 }
 
 /* ------------------------------------------------------ investment firms */
@@ -3641,9 +3660,11 @@ async function viewAdviser(crd) {
 
 async function viewPortfolio() {
   const key = savedPortfolioKey();
+  const mine = await myPortfolios();
   if (!key) {
-    view.innerHTML = portfolioEmpty();
+    view.innerHTML = portfolioEmpty("", "", mine);
     wirePortfolio(null);
+    wireMyPortfolios();
     wireAdvisers();
     return;
   }
@@ -3654,8 +3675,9 @@ async function viewPortfolio() {
   } catch (e) {
     // A stored key that no longer loads must not trap the page: show the
     // reason and the form, with the key still in the box to be corrected.
-    view.innerHTML = portfolioEmpty(key, e.message || String(e));
+    view.innerHTML = portfolioEmpty(key, e.message || String(e), mine);
     wirePortfolio(null);
+    wireMyPortfolios();
     wireAdvisers();
     return;
   }
@@ -3666,7 +3688,9 @@ async function viewPortfolio() {
     <div class="page-head">
       <h1>${esc(d.name)}</h1>
       <div class="sub">${num(d.totals.companies)} compan${d.totals.companies === 1 ? "y" : "ies"}
-        · saved ${day(d.created_at)}</div>
+        · saved ${day(d.created_at)}${mine && mine.portfolios.length > 1
+          ? ` · <button type="button" class="linkish" id="pf-mine-jump">one of
+              ${num(mine.portfolios.length)} in your account</button>` : ""}</div>
     </div>
 
     <div class="grid cols-4">
@@ -3698,6 +3722,8 @@ async function viewPortfolio() {
 
     ${advisersCard()}
 
+    ${myPortfoliosCard(mine)}
+
     <div class="card">
       <h2>Your key</h2>
       <div class="muted" style="font-size:12px;margin-bottom:10px">
@@ -3710,14 +3736,101 @@ async function viewPortfolio() {
       <div class="actions">
         <button class="primary" id="pf-save">Save to a file</button>
         <button id="pf-copy">Copy</button>
-        <button class="ghost" id="pf-forget">Forget on this browser</button>
+        <button class="ghost" id="pf-forget"
+          title="${account ? "It stays in your account's portfolios" : ""}">${
+          account ? "Close this portfolio" : "Forget on this browser"}</button>
       </div>
     </div>`;
   wirePortfolio(d.name);
+  wireMyPortfolios();
   wireAlerts(key, d.name);
   wireEmail(key);
   wireRemove(key);
   wireAdvisers();
+}
+
+/* The account's portfolios — one per client, say — each opening on any
+ * computer its owner signs in from. Null when signed out, or if the list
+ * could not be read; the open portfolio still works without it. */
+async function myPortfolios() {
+  if (!account) return null;
+  try {
+    return await api("/v1/me/portfolios");
+  } catch {
+    return null;
+  }
+}
+
+function myPortfoliosCard(mine) {
+  if (!mine) return "";
+  const rows = mine.portfolios.map((p) => {
+    const open = p.portfolio_id === mine.open;
+    return `<tr>
+      <td>${open ? `<strong>${esc(p.name)}</strong> <span class="pill">open</span>` : esc(p.name)}</td>
+      <td class="num">${p.companies === null ? "—" : num(p.companies)}</td>
+      <td>${day(p.updated_at)}</td>
+      <td>${open ? "" : `<button class="linkish pf-mine-open"
+          data-id="${esc(p.portfolio_id)}">Open</button> · `}<button class="linkish pf-mine-remove"
+          data-id="${esc(p.portfolio_id)}" data-name="${esc(p.name)}">Remove</button></td>
+    </tr>`;
+  }).join("");
+  return `<div class="card" id="pf-mine">
+    <h2>Your portfolios</h2>
+    <p class="muted" style="font-size:12.5px">Saved to your account, so each opens on any
+      computer you sign in from. Keep one per client, or per programme; each has its own
+      alert list.</p>
+    ${rows ? `<div class="table-wrap"><table>
+      <thead><tr><th>Portfolio</th><th class="num">Companies</th><th>Changed</th><th></th></tr></thead>
+      <tbody>${rows}</tbody></table></div>` : '<p class="muted">None yet.</p>'}
+    ${mine.open ? `<div class="actions"><button id="pf-mine-new">Start another</button></div>` : ""}
+    <p class="muted" id="pf-mine-status" style="font-size:12.5px"></p>
+  </div>`;
+}
+
+function wireMyPortfolios() {
+  const jump = document.getElementById("pf-mine-jump");
+  if (jump) jump.onclick = () => document.getElementById("pf-mine").scrollIntoView({ behavior: "smooth" });
+  const status = document.getElementById("pf-mine-status");
+  const fail = (e) => { if (status) status.textContent = e.message || String(e); };
+  document.querySelectorAll(".pf-mine-open").forEach((b) => {
+    b.onclick = async () => {
+      b.disabled = true;
+      try {
+        const r = await apiPost(`/v1/me/portfolios/${encodeURIComponent(b.dataset.id)}/open`, {});
+        account = r.account;
+        // Each portfolio's alert list is found again by its key.
+        rememberAlertListId("");
+        viewPortfolio();
+        window.scrollTo(0, 0);
+      } catch (e) { b.disabled = false; fail(e); }
+    };
+  });
+  document.querySelectorAll(".pf-mine-remove").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm(`Take “${b.dataset.name}” out of your account? Save its key first if `
+                   + "you may want it again. Its alert list, if it has one, keeps going: "
+                   + "the people on it chose to be.")) return;
+      b.disabled = true;
+      try {
+        await apiSend("DELETE", `/v1/me/portfolios/${encodeURIComponent(b.dataset.id)}`);
+        if (account && account.portfolio_id === b.dataset.id) {
+          account.portfolio_id = "";
+          account.portfolio_key = "";
+          rememberAlertListId("");
+        }
+        viewPortfolio();
+      } catch (e) { b.disabled = false; fail(e); }
+    };
+  });
+  const fresh = document.getElementById("pf-mine-new");
+  if (fresh) {
+    fresh.onclick = async () => {
+      await rememberPortfolioKey("");
+      rememberAlertListId("");
+      viewPortfolio();
+      window.scrollTo(0, 0);
+    };
+  }
 }
 
 /* Emailing the portfolio: its companies, their latest severity, a link that
@@ -3810,23 +3923,35 @@ async function viewOpenPortfolio(key) {
         compan${d.totals.companies === 1 ? "y" : "ies"}, sent by email.</div>
     </div>
     <div class="card">
-      <p>${replacing ? (account
-          ? "Opening it replaces the portfolio saved to your account. Save that one's key first if you want it back."
-          : "Opening it replaces the portfolio open in this browser. Save that one's key first if you want it back.")
-        : account ? "Opening it saves it to your account." : "Open it to see the dashboard."}</p>
+      <p>${account
+        ? "Opening it adds it to your account's portfolios. Any you have already stay there."
+        : replacing
+          ? "Opening it replaces the portfolio open in this browser. Save that one's key first if you want it back."
+          : "Open it to see the dashboard."}</p>
       <div class="actions">
         <button class="primary" id="po-open">Open it</button>
         <a href="#/portfolio" class="ghost" style="align-self:center">Cancel</a>
       </div>
+      <p class="muted" id="po-status" style="font-size:12.5px"></p>
     </div>`;
-  document.getElementById("po-open").onclick = () => {
-    rememberPortfolioKey(key);
+  document.getElementById("po-open").onclick = async () => {
+    if (account) {
+      try {
+        const r = await apiPost("/v1/me/portfolios", { portfolio_key: key });
+        account = r.account;
+      } catch (e) {
+        document.getElementById("po-status").textContent = e.message || String(e);
+        return;
+      }
+    } else {
+      await rememberPortfolioKey(key);
+    }
     rememberAlertListId("");
     location.hash = "#/portfolio";
   };
 }
 
-function portfolioEmpty(key = "", error = "") {
+function portfolioEmpty(key = "", error = "", mine = null) {
   return `
     <div class="page-head">
       <h1>Portfolio</h1>
@@ -3835,6 +3960,8 @@ function portfolioEmpty(key = "", error = "") {
 
     ${error ? `<div class="error"><strong>That key did not open</strong>
       <div class="muted" style="margin-top:6px">${esc(error)}</div></div>` : ""}
+
+    ${mine && mine.portfolios.length ? myPortfoliosCard(mine) : ""}
 
     <div class="card">
       <h2>Open a saved portfolio</h2>
@@ -3882,10 +4009,10 @@ function downloadPortfolioKey(key, name) {
 function wirePortfolio(loadedName) {
   const open = document.getElementById("pf-open");
   if (open) {
-    open.onclick = () => {
+    open.onclick = async () => {
       const typed = document.getElementById("pf-key-input").value.trim();
       if (!typed) return;
-      rememberPortfolioKey(typed);
+      await rememberPortfolioKey(typed);
       rememberAlertListId("");
       viewPortfolio();
     };
@@ -3904,7 +4031,7 @@ function wirePortfolio(loadedName) {
           name: document.getElementById("pf-name").value.trim() || "Portfolio",
           companies,
         });
-        rememberPortfolioKey(d.key);
+        await rememberPortfolioKey(d.key);
         rememberAlertListId("");
         viewPortfolio();
       } catch (e) {
@@ -3935,8 +4062,9 @@ function wirePortfolio(loadedName) {
       }
       setTimeout(() => { button.textContent = "Copy"; }, 2500);
     };
-    document.getElementById("pf-forget").onclick = () => {
-      rememberPortfolioKey("");
+    document.getElementById("pf-forget").onclick = async () => {
+      await rememberPortfolioKey("");
+      rememberAlertListId("");
       viewPortfolio();
     };
   }

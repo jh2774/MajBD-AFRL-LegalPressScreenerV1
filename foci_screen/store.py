@@ -289,6 +289,8 @@ CREATE TABLE IF NOT EXISTS users (
     tenant_id    TEXT NOT NULL,
     role         TEXT NOT NULL DEFAULT 'owner',
     portfolio_key TEXT,
+    -- Which of the account's portfolios (account_portfolios) is the open one.
+    portfolio_id TEXT,
     created_at   TEXT NOT NULL,
     email_verified_at TEXT,
     last_login_at TEXT,
@@ -309,6 +311,17 @@ CREATE TABLE IF NOT EXISTS account_tokens (
     created_at   TEXT NOT NULL,
     expires_at   TEXT NOT NULL,
     used_at      TEXT
+);
+-- Every portfolio an account keeps. `users.portfolio_key` is the one open;
+-- this is the list it is chosen from, so a person can watch several — one per
+-- client, say — and each opens on any computer they sign in from.
+CREATE TABLE IF NOT EXISTS account_portfolios (
+    portfolio_id TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    portfolio_key TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
 );
 -- Signed-in sessions, by a hash of the cookie's token, never the token.
 CREATE TABLE IF NOT EXISTS user_sessions (
@@ -480,6 +493,7 @@ CREATE TABLE IF NOT EXISTS watchlists (
 
 INDEXES = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_recipients_token ON alert_recipients(token);
+CREATE INDEX IF NOT EXISTS idx_account_portfolios_user ON account_portfolios(user_id);
 CREATE INDEX IF NOT EXISTS idx_notice_sends ON notice_sends(tenant_id, notice_id);
 CREATE INDEX IF NOT EXISTS idx_portfolio_emails_sender ON portfolio_emails(sender, sent_at);
 CREATE INDEX IF NOT EXISTS idx_findings_entity ON findings(entity_key);
@@ -531,6 +545,7 @@ COLUMN_ADDITIONS = [
     ("contracts", "prime_award_id", "TEXT"),
     ("contracts", "prime_recipient_name", "TEXT"),
     ("alert_recipients", "restorable", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "portfolio_id", "TEXT"),
 ]
 
 
@@ -1684,6 +1699,7 @@ class Store:
         with self._tx() as c:
             c.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
             c.execute("DELETE FROM account_tokens WHERE user_id=?", (user_id,))
+            c.execute("DELETE FROM account_portfolios WHERE user_id=?", (user_id,))
             c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
 
     def mark_email_verified(self, user_id: str) -> None:
@@ -1771,10 +1787,70 @@ class Store:
                       (password_hash, user_id))
             c.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
 
-    def set_user_portfolio(self, user_id: str, portfolio_key: str) -> None:
+    # The account's portfolios. Each is a key, as the one in the browser is;
+    # `users.portfolio_key` is a copy of the open one's, which is what the
+    # rest of the site reads.
+    def account_portfolios(self, user_id: str) -> list[dict]:
+        return self._query("SELECT * FROM account_portfolios WHERE user_id=?"
+                           " ORDER BY updated_at DESC, portfolio_id", (user_id,))
+
+    def account_portfolio(self, user_id: str, portfolio_id: str) -> dict | None:
+        """One of this account's portfolios; None for anyone else's."""
+        return self._one("SELECT * FROM account_portfolios WHERE user_id=? AND"
+                         " portfolio_id=?", (user_id, portfolio_id))
+
+    def keep_account_portfolio(self, user_id: str, name: str, portfolio_key: str,
+                               portfolio_id: str = "", open_it: bool = True) -> str:
+        """Add a portfolio to the account, or give one already there its newer
+        key; with `open_it`, it becomes the open one. Returns its id, or ""
+        for an id that is not this account's."""
+        now = _now()
+        if portfolio_id and not self.account_portfolio(user_id, portfolio_id):
+            return ""
         with self._tx() as c:
-            c.execute("UPDATE users SET portfolio_key=? WHERE user_id=?",
-                      (portfolio_key or None, user_id))
+            if portfolio_id:
+                c.execute("UPDATE account_portfolios SET name=?, portfolio_key=?,"
+                          " updated_at=? WHERE user_id=? AND portfolio_id=?",
+                          (name, portfolio_key, now, user_id, portfolio_id))
+            else:
+                portfolio_id = uuid.uuid4().hex[:12]
+                c.execute("INSERT INTO account_portfolios (portfolio_id, user_id, name,"
+                          " portfolio_key, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                          (portfolio_id, user_id, name, portfolio_key, now, now))
+            if open_it:
+                c.execute("UPDATE users SET portfolio_key=?, portfolio_id=? WHERE user_id=?",
+                          (portfolio_key, portfolio_id, user_id))
+        return portfolio_id
+
+    def open_account_portfolio(self, user_id: str, portfolio_id: str) -> bool:
+        row = self.account_portfolio(user_id, portfolio_id)
+        if row is None:
+            return False
+        with self._tx() as c:
+            c.execute("UPDATE users SET portfolio_key=?, portfolio_id=? WHERE user_id=?",
+                      (row["portfolio_key"], portfolio_id, user_id))
+        return True
+
+    def delete_account_portfolio(self, user_id: str, portfolio_id: str) -> bool:
+        """Take one off the account; if it was open, nothing is open after."""
+        with self._tx() as c:
+            c.execute("DELETE FROM account_portfolios WHERE user_id=? AND portfolio_id=?",
+                      (user_id, portfolio_id))
+            if c.rowcount() != 1:
+                return False
+            c.execute("UPDATE users SET portfolio_key=NULL, portfolio_id=NULL"
+                      " WHERE user_id=? AND portfolio_id=?", (user_id, portfolio_id))
+        return True
+
+    def set_user_portfolio(self, user_id: str, portfolio_key: str) -> None:
+        """The open portfolio's key; empty closes it (it stays in the list)."""
+        with self._tx() as c:
+            if portfolio_key:
+                c.execute("UPDATE users SET portfolio_key=? WHERE user_id=?",
+                          (portfolio_key, user_id))
+            else:
+                c.execute("UPDATE users SET portfolio_key=NULL, portfolio_id=NULL"
+                          " WHERE user_id=?", (user_id,))
 
     def create_session(self, token_hash: str, user_id: str, days: int) -> None:
         expires = (datetime.now(timezone.utc) + timedelta(days=days)) \

@@ -446,6 +446,7 @@ def _account(user: dict) -> dict:
             "role": user.get("role") or "owner",
             "email_verified": bool(user.get("email_verified_at")),
             "portfolio_key": user.get("portfolio_key") or "",
+            "portfolio_id": user.get("portfolio_id") or "",
             "created_at": user["created_at"], "last_login_at": user.get("last_login_at")}
 
 
@@ -498,7 +499,17 @@ def auth_status(request: Request) -> dict:
     return {"signed_in": user is not None,
             "account": _account(user) if user else None,
             "signup": accounts.signup_mode(cfg.signup),
+            # Whether anyone has an account yet, so the sign-up form can say how
+            # the first is made.
+            "accounts": _accounts_exist(),
             "keys": bool(keymap), "public": cfg.public}
+
+
+def _accounts_exist() -> bool:
+    try:
+        return store_for(auth.DEFAULT_TENANT).count_users() > 0
+    except Exception:            # noqa: BLE001 - the page asks; the database answers elsewhere
+        return True
 
 
 @app.post("/v1/auth/signup", status_code=201, tags=["accounts"])
@@ -528,7 +539,9 @@ def signup(body: Credentials, request: Request, response: Response,
         raise HTTPException(
             403, "New accounts are not being taken here"
                  + ("" if accounts.signup_mode(cfg.signup) == "closed"
-                    else " for that address") + ". Ask whoever runs this site to add you.")
+                    else " for that address") + ". Ask the site's owner to invite you"
+                 + (" — or, if you look after the site, give its admin key in the form."
+                    if keymap else "."))
     store = store_for(auth.DEFAULT_TENANT)
     try:
         user = store.create_user(email=email,
@@ -747,17 +760,102 @@ def save_my_portfolio(body: AccountPortfolio, request: Request) -> dict:
     """
     user = _signed_in(request)
     key = body.portfolio_key.strip()
+    loaded = None
     if key:
         try:
-            portfolio_keys.decode(key)
+            loaded = portfolio_keys.decode(key)
         except portfolio_keys.PortfolioKeyError as exc:
             raise HTTPException(400, str(exc)) from exc
     store = store_for(auth.DEFAULT_TENANT)
     old = (user.get("portfolio_key") or "").strip()
-    store.set_user_portfolio(user["user_id"], key)
+    if loaded is not None:
+        # The open one in the account's list takes the newer key; with none
+        # open, this is a new portfolio, and joins the list.
+        open_id = user.get("portfolio_id") or ""
+        if open_id and not store.account_portfolio(user["user_id"], open_id):
+            open_id = ""
+        store.keep_account_portfolio(user["user_id"], loaded.name, key, open_id)
+    else:
+        store.set_user_portfolio(user["user_id"], "")
     if old and key and old != key:
         _follow_portfolio(store_for(user["tenant_id"]), old, key)
     return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+# ----------------------------------------------- an account's portfolios
+# Several, so one person can watch one portfolio per client and switch
+# between them on any computer. The open one is the account's portfolio as
+# the rest of the site knows it (PUT /v1/me/portfolio); each one's alert list
+# follows it, matched by its key.
+
+def _listed(row: dict) -> dict:
+    try:
+        companies = len(portfolio_keys.decode(row["portfolio_key"]).companies)
+    except portfolio_keys.PortfolioKeyError:
+        companies = None
+    return {"portfolio_id": row["portfolio_id"], "name": row["name"],
+            "portfolio_key": row["portfolio_key"], "companies": companies,
+            "updated_at": row["updated_at"]}
+
+
+@app.get("/v1/me/portfolios", tags=["accounts"])
+def my_portfolios(request: Request) -> dict:
+    """The account's portfolios, and which is open. An account that had a
+    portfolio before the list existed finds it there."""
+    user = _signed_in(request)
+    store = store_for(auth.DEFAULT_TENANT)
+    key = (user.get("portfolio_key") or "").strip()
+    if key and not (user.get("portfolio_id")
+                    and store.account_portfolio(user["user_id"], user["portfolio_id"])):
+        try:
+            name = portfolio_keys.decode(key).name
+        except portfolio_keys.PortfolioKeyError:
+            name = "Portfolio"
+        store.keep_account_portfolio(user["user_id"], name, key)
+        user = store.user_by_id(user["user_id"])
+    return {"open": user.get("portfolio_id") or "",
+            "portfolios": [_listed(r) for r in store.account_portfolios(user["user_id"])]}
+
+
+@app.post("/v1/me/portfolios", status_code=201, tags=["accounts"])
+def add_portfolio(body: AccountPortfolio, request: Request) -> dict:
+    """Add a portfolio to the account — one sent by email, say — and open it.
+    The one open before stays in the list. One already there is opened, not
+    listed twice."""
+    user = _signed_in(request)
+    key = body.portfolio_key.strip()
+    try:
+        loaded = portfolio_keys.decode(key)
+    except portfolio_keys.PortfolioKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    store = store_for(auth.DEFAULT_TENANT)
+    same = next((r for r in store.account_portfolios(user["user_id"])
+                 if r["portfolio_key"] == key), None)
+    if same:
+        store.open_account_portfolio(user["user_id"], same["portfolio_id"])
+    else:
+        store.keep_account_portfolio(user["user_id"], loaded.name, key)
+    return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+@app.post("/v1/me/portfolios/{portfolio_id}/open", tags=["accounts"])
+def open_portfolio(portfolio_id: str, request: Request) -> dict:
+    user = _signed_in(request)
+    store = store_for(auth.DEFAULT_TENANT)
+    if not store.open_account_portfolio(user["user_id"], portfolio_id):
+        raise HTTPException(404, "That portfolio is not in your account.")
+    return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+@app.delete("/v1/me/portfolios/{portfolio_id}", status_code=204, tags=["accounts"])
+def remove_portfolio(portfolio_id: str, request: Request) -> Response:
+    """Take a portfolio out of the account. Its alert list, if it has one, goes
+    on: the people on it chose to be, and may not be you."""
+    user = _signed_in(request)
+    if not store_for(auth.DEFAULT_TENANT).delete_account_portfolio(user["user_id"],
+                                                                   portfolio_id):
+        raise HTTPException(404, "That portfolio is not in your account.")
+    return Response(status_code=204)
 
 
 def _follow_portfolio(store: Store, old_key: str, new_key: str) -> int:

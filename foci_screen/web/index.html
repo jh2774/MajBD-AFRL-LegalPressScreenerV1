@@ -72,6 +72,11 @@
       <label class="field" for="account-password" style="margin-top:10px;display:block">Password</label>
       <input id="account-password" type="password" autocomplete="current-password" required>
     </div>
+    <div id="account-key-row" hidden>
+      <label class="field" for="account-key" style="margin-top:10px;display:block"
+             id="account-key-label">Admin key</label>
+      <input id="account-key" type="password" autocomplete="off" placeholder="sk_…">
+    </div>
     <p style="margin:8px 0 0;font-size:13px" id="account-forgot-row">
       <button type="button" class="linkish" id="account-forgot">Forgot password?</button></p>
     <p class="muted" id="account-hint" style="font-size:12.5px" hidden>At least 10
@@ -96,9 +101,10 @@
       link again</button> <span id="account-resend-status"></span></div>
     <p style="font-size:13.5px"><a href="#/organisation" id="account-org-link">Organisation
       and people →</a></p>
-    <p class="muted" style="font-size:13px">Your portfolio is saved to this account, so it
-      is there on any computer you sign in from. Screens, notices, watchlists, screening
-      settings and alert lists are your workspace's own.</p>
+    <p class="muted" style="font-size:13px">Your portfolios are saved to this account, so
+      they are there on any computer you sign in from; switch between them on the
+      Portfolio page. Screens, notices, watchlists, screening settings and alert lists
+      are your workspace's own.</p>
     <details style="margin-top:8px">
       <summary class="muted" style="cursor:pointer">Change password</summary>
       <input id="account-current" type="password" placeholder="Current password"

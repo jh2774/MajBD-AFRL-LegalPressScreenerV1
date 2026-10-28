@@ -152,6 +152,25 @@ button.linkish {
 }
 
 .topnav { display: flex; align-items: center; gap: 14px; }
+/* The signed-in address is the account button's label; a long one is cut
+   short, never allowed to push the header wider. The full one is its title. */
+#account-button {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* On a phone the links wrap onto as many rows as they need, and the header
+   scrolls away with the page rather than covering a third of it. */
+@media (max-width: 720px) {
+  .topbar { position: static; gap: 10px; padding: 10px 16px; }
+  .searchbar { flex-basis: 100%; min-width: 0; }
+  .topnav { flex-wrap: wrap; gap: 2px 12px; min-width: 0; }
+  .topnav a { padding: 4px 0; }
+  #account-button { max-width: 100%; padding-left: 0; }
+  main { padding: 20px 16px 48px; }
+}
 
 .badge {
   display: inline-block;

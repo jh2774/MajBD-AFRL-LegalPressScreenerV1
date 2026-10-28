@@ -213,10 +213,12 @@ screened on contractscreener.com so far, is called `default`.
 
 **Make the account that owns the site's workspace** (about two minutes):
 
-1. On contractscreener.com, click **Admin key** at the top right and enter the admin key.
-2. Click **Sign in**, then **Create an account**. The box says the account will join this
-   site's own workspace. Enter your address, a password of at least 10 characters, and the
-   organisation's name (for example `Concord`). **Create account**.
+1. On contractscreener.com, click **Sign in** at the top right, then **Create an account**
+   at the bottom of the box.
+2. Enter your address, a password of at least 10 characters, the organisation's name (for
+   example `Concord`), and the admin key in the **Admin key** box — the part *after*
+   `default:`. (If you entered the key under **Admin key** at the top right earlier, the box
+   is filled in already.) **Create account**.
 3. You are signed in, as the owner of the `default` workspace. Everything the admin key could
    do, you can now do under your own name.
 4. **Invite colleagues** from **Organisation and people** (in the account box, or
@@ -230,13 +232,18 @@ screened on contractscreener.com so far, is called `default`.
 * `open` — anyone may.
 
 An account made this way gets a **new, empty workspace of its own**, not the site's. For
-colleagues, use invitations instead.
+colleagues, use invitations instead. **Create an account** is always in the sign-in box; while
+sign-ups are closed it says to ask for an invitation, and asks whoever looks after the site for
+the admin key.
 
 **What an account gives you**
 
-* **Your portfolio follows you.** It is kept on the account and opens on any computer you sign
-  in from. An alert list on it follows it: add a company on your laptop and the list watches it
-  too, without its history being sent as news.
+* **Your portfolios follow you.** They are kept on the account and open on any computer you
+  sign in from. Keep as many as you like — one per client, say: **Your portfolios** on the
+  Portfolio page lists them, and **Open**s, **Remove**s or **Start another**. A portfolio
+  someone emails you is added to the list when you open its link. Each one's alert list follows
+  it: add a company on your laptop and that list watches it too, without its history being
+  sent as news. **Close this portfolio** puts it away without deleting it.
 * **Email a portfolio** from the Portfolio page, to yourself or up to 10 colleagues: the
   companies, the latest severity of each, a link that opens it on the site, and its key. To
   anyone else it says it came from you, and replies go to you. Up to 25 addresses a day.

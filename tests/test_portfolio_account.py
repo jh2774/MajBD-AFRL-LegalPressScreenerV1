@@ -1,7 +1,8 @@
 """What an account does for a portfolio and its email, on top of signing in
-(test_accounts.py): an alert list follows the account's portfolio wherever it
-is edited, the portfolio can be emailed, and the person holding the admin key
-can make the account that owns the site's own workspace.
+(test_accounts.py): an account keeps several portfolios and switches between
+them, an alert list follows the account's portfolio wherever it is edited, the
+portfolio can be emailed, and the person holding the admin key can make the
+account that owns the site's own workspace.
 
 No test talks to a mail service: `requests.post` is replaced with a recorder.
 """
@@ -22,6 +23,8 @@ PASSWORD = "correct horse battery"
 ME = "analyst@concord.example"
 ONE = pf.encode(pf.from_entity_keys("Watch", ["UEI1"]))
 TWO = pf.encode(pf.from_entity_keys("Watch", ["UEI1", "UEI2"]))
+CLIENT = pf.encode(pf.from_entity_keys("Client B", ["UEI3"]))
+CLIENT2 = pf.encode(pf.from_entity_keys("Client B", ["UEI3", "UEI4"]))
 ENV = ("DATABASE_URL", "REDIS_URL", "GMAIL_ENABLED", "FOCI_EMAIL_REDIRECT_TO", "BREVO_API_KEY",
        "MAIL_PROVIDER", "SMTP_HOST", "ALERTS_SEND", "ALERTS_REPLY_TO", "NOTICES_SEND",
        "FOCI_PUBLIC_URL", "VERCEL_PROJECT_PRODUCTION_URL")
@@ -52,6 +55,151 @@ def signup(c, email=ME, **headers):
 
 def keep(c, key):
     return c.put("/v1/me/portfolio", headers=WEB, json={"portfolio_key": key})
+
+
+def mine(c):
+    return c.get("/v1/me/portfolios").json()
+
+
+def add(c, key):
+    return c.post("/v1/me/portfolios", headers=WEB, json={"portfolio_key": key})
+
+
+# ------------------------------------------------------- creating an account
+
+def test_the_page_is_told_whether_anyone_has_an_account(site, monkeypatch):
+    """So the form can say the first account is made with the admin key."""
+    Post(monkeypatch)
+    c, _ = site(FOCI_SIGNUP="")
+    assert c.get("/v1/auth/status").json()["accounts"] is False
+    signup(c, Authorization="Bearer admin-key")
+    assert c.get("/v1/auth/status").json()["accounts"] is True
+
+
+def test_closed_sign_ups_say_how_to_get_in(site, monkeypatch):
+    Post(monkeypatch)
+    c, _ = site(FOCI_SIGNUP="")
+    detail = signup(c).json()["detail"]
+    assert "invite" in detail and "admin key" in detail
+
+
+# ------------------------------------------------- several portfolios
+
+def test_an_account_keeps_several_portfolios(site, monkeypatch):
+    Post(monkeypatch)
+    c, app_module = site()
+    signup(c)
+    keep(c, ONE)
+    first = mine(c)
+    assert [p["name"] for p in first["portfolios"]] == ["Watch"]
+    assert first["open"] == first["portfolios"][0]["portfolio_id"]
+    watch = first["open"]
+
+    account = add(c, CLIENT).json()["account"]
+    assert account["portfolio_key"] == CLIENT
+    listed = mine(c)
+    assert len(listed["portfolios"]) == 2 and listed["open"] != watch
+    sizes = {p["name"]: p["companies"] for p in listed["portfolios"]}
+    assert sizes == {"Watch": 1, "Client B": 1}
+
+    # Another computer finds both, and switches back to the first.
+    laptop = TestClient(app_module.app)
+    laptop.cookies.update(dict(c.cookies))
+    r = laptop.post(f"/v1/me/portfolios/{watch}/open", headers=WEB)
+    assert r.json()["account"]["portfolio_key"] == ONE
+    assert r.json()["account"]["portfolio_id"] == watch
+    # An edit changes the open one, and only it.
+    keep(laptop, TWO)
+    keys = {p["name"]: p["portfolio_key"] for p in mine(c)["portfolios"]}
+    assert keys == {"Watch": TWO, "Client B": CLIENT}
+
+
+def test_closing_a_portfolio_keeps_it_and_the_next_is_another(site, monkeypatch):
+    Post(monkeypatch)
+    c, _ = site()
+    signup(c)
+    keep(c, ONE)
+    account = keep(c, "").json()["account"]
+    assert (account["portfolio_key"], account["portfolio_id"]) == ("", "")
+    assert len(mine(c)["portfolios"]) == 1, "closed, not deleted"
+    keep(c, CLIENT)
+    assert sorted(p["name"] for p in mine(c)["portfolios"]) == ["Client B", "Watch"]
+
+
+def test_adding_one_already_there_opens_it(site, monkeypatch):
+    """The same emailed link opened twice is one portfolio, not two."""
+    Post(monkeypatch)
+    c, _ = site()
+    signup(c)
+    add(c, ONE)
+    add(c, CLIENT)
+    assert add(c, ONE).json()["account"]["portfolio_key"] == ONE
+    assert len(mine(c)["portfolios"]) == 2
+    assert add(c, "not a key").status_code == 400
+
+
+def test_removing_a_portfolio(site, monkeypatch):
+    Post(monkeypatch)
+    c, _ = site()
+    signup(c)
+    add(c, ONE)
+    watch = mine(c)["open"]
+    add(c, CLIENT)
+    client = mine(c)["open"]
+    assert c.delete(f"/v1/me/portfolios/{watch}", headers=WEB).status_code == 204
+    assert [p["name"] for p in mine(c)["portfolios"]] == ["Client B"]
+    assert c.get("/v1/me").json()["account"]["portfolio_key"] == CLIENT, \
+        "the open one stays open"
+    assert c.delete(f"/v1/me/portfolios/{client}", headers=WEB).status_code == 204
+    account = c.get("/v1/me").json()["account"]
+    assert (account["portfolio_key"], account["portfolio_id"]) == ("", "")
+    assert c.delete(f"/v1/me/portfolios/{client}", headers=WEB).status_code == 404
+
+
+def test_portfolios_are_their_accounts_own(site, monkeypatch):
+    Post(monkeypatch)
+    c, app_module = site()
+    signup(c)
+    add(c, ONE)
+    watch = mine(c)["open"]
+    other = TestClient(app_module.app)
+    signup(other, "other@concord.example")
+    assert mine(other)["portfolios"] == []
+    assert other.post(f"/v1/me/portfolios/{watch}/open", headers=WEB).status_code == 404
+    assert other.delete(f"/v1/me/portfolios/{watch}", headers=WEB).status_code == 404
+    assert len(mine(c)["portfolios"]) == 1
+    assert c.delete(f"/v1/me/portfolios/{watch}").status_code == 403, \
+        "not from the site's own pages"
+    assert TestClient(app_module.app).get("/v1/me/portfolios").status_code == 401
+
+
+def test_a_portfolio_saved_before_the_list_is_in_it(site, monkeypatch):
+    """Accounts made before several portfolios existed had one, on the account."""
+    Post(monkeypatch)
+    c, app_module = site()
+    signup(c)
+    store = app_module.store_for("default")
+    user = store.user_by_email(ME)
+    store.set_user_portfolio(user["user_id"], ONE)
+    listed = mine(c)
+    assert [p["portfolio_key"] for p in listed["portfolios"]] == [ONE]
+    assert listed["open"] == listed["portfolios"][0]["portfolio_id"]
+    assert len(mine(c)["portfolios"]) == 1, "adopted once"
+
+
+def test_each_portfolios_alert_list_stays_with_it(site, monkeypatch):
+    """Editing one portfolio moves its own list, never another's."""
+    Post(monkeypatch)
+    c, app_module = site()
+    signup(c)
+    store = app_module.store_for(c.get("/v1/me").json()["account"]["workspace"])
+    add(c, ONE)
+    sid = c.post("/v1/alerts/subscriptions", headers=WEB, json={
+        "name": "Watch", "emails": [ME], "portfolio_key": ONE}).json()["subscription"][
+        "subscription_id"]
+    add(c, CLIENT)
+    keep(c, CLIENT2)
+    assert store.alert_subscription(sid)["portfolio_key"] == ONE
 
 
 # ----------------------------------------------- the site's own workspace

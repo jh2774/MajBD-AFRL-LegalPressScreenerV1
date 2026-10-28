@@ -588,15 +588,25 @@ screened. The password is asked for, never passed as an argument (or read from
 `FOCI_NEW_PASSWORD` in a script).
 
 **Or from the browser, with the admin key** — the way on a host with no command line, such as
-Vercel. Enter the key with "Admin key", then **Create an account**: an account made by someone
-holding a key belongs to that key's workspace, as an owner, whatever `FOCI_SIGNUP` says. The
-key already does everything in that workspace; this gives it a name. The owner then invites
-colleagues from the Organisation page.
+Vercel. **Sign in** → **Create an account**, and give the key in the form's **Admin key** box
+(filled in already if the key was entered with "Admin key"): an account made with a key belongs
+to that key's workspace, as an owner, whatever `FOCI_SIGNUP` says. The key already does
+everything in that workspace; this gives it a name. The owner then invites colleagues from the
+Organisation page. **Create an account** is always offered; with sign-ups closed, the form says
+to ask for an invitation, and `/v1/auth/status` reports `accounts: false` until the first
+exists, so the form can say that the first is made with the key.
 
-**What an account does with a portfolio.** The portfolio is kept on the account, so it opens
-on any computer. An alert list on it follows it: when the account's portfolio changes, the
-server moves every list on the old key to the new one and baselines the added companies, so an
-edit made on another computer still reaches the list. A signed-in person can also email the
+**What an account does with portfolios.** An account keeps several (`account_portfolios`),
+each opening on any computer; one is open at a time, and `users.portfolio_key` is a copy of the
+open one's key, which is what the rest of the site reads. `GET /v1/me/portfolios` lists them
+(adopting a portfolio saved before the list existed), `POST /v1/me/portfolios` adds one and opens
+it (one already listed is opened, not added twice), `POST /v1/me/portfolios/{id}/open` switches,
+and `DELETE /v1/me/portfolios/{id}` takes one out — its alert list keeps going, since the people
+on it chose to be. `PUT /v1/me/portfolio` saves an edit to the open one, starts a new one when
+none is open, and with an empty key closes it without deleting it. An alert list follows its
+portfolio: when the open portfolio changes, the server moves every list on the old key to the
+new one and baselines the added companies, so an edit made on another computer still reaches the
+list. A signed-in person can also email the
 portfolio — its companies, their latest severity, a link that opens it (`#/portfolio/open/…`)
 and its key (`foci_screen/portfolio_mail.py`) — to themselves, or to up to 10 colleagues, who
 see who sent it and whose replies go to them; 25 addresses a day per person. Approvals and
