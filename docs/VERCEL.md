@@ -200,48 +200,52 @@ a sign-in saved on disk, which Vercel does not keep.)
 
 Every send is listed on the notice: where it went, when, and who sent it.
 
-## 8. Signing in (recommended)
+## 8. Accounts and signing in (recommended)
 
 The admin key works, but it is one shared secret: pasted into each browser, impossible to take
 back from one person without changing it for everyone, and recorded on every approval as
-`api-key:default`, which names nobody. Signing in fixes that. Nobody else needs to sign in;
-visitors use the site as before.
+`api-key:default`, which names nobody. Accounts fix that: each person signs in with their
+email address and a password. Visitors still need nothing.
 
-1. In Vercel, add `FOCI_ADMIN_EMAILS` = the addresses that may sign in, separated by commas,
-   for example `julian@…, max@…`. Redeploy.
-2. On the site, the button at the top right now says **Sign in**. Enter your address; a link
-   arrives by email (it works once, for 20 minutes). Open it and press **Sign in**.
+Every account belongs to one **organisation**, and the organisation owns a **workspace** — its
+screens, notices, watchlists, settings and alert lists. The site's own workspace, everything
+screened on contractscreener.com so far, is called `default`.
 
-A signed-in browser can do everything the admin key can for 30 days, or until **Sign out**,
-and what you approve and send is recorded under your address. Removing an address from
-`FOCI_ADMIN_EMAILS` signs that person out everywhere at the next request. The admin key keeps
-working alongside it, as a way in if email is down.
+**Make the account that owns the site's workspace** (about two minutes):
 
-### Accounts for everyone else (optional)
+1. On contractscreener.com, click **Admin key** at the top right and enter the admin key.
+2. Click **Sign in**, then **Create an account**. The box says the account will join this
+   site's own workspace. Enter your address, a password of at least 10 characters, and the
+   organisation's name (for example `Concord`). **Create account**.
+3. You are signed in, as the owner of the `default` workspace. Everything the admin key could
+   do, you can now do under your own name.
+4. **Invite colleagues** from **Organisation and people** (in the account box, or
+   `#/organisation`). Each gets an email with a link to choose a password, and joins the same
+   workspace. An owner can invite another owner.
 
-To let colleagues keep their portfolios too, add `FOCI_SIGN_IN` in Vercel and redeploy:
+**Who else may create an account** is `FOCI_SIGNUP` in Vercel, closed by default:
 
-* `FOCI_SIGN_IN` = `concordgroup.com` (one or more email domains, separated by commas) lets
-  anyone with an address there sign in; or
-* `FOCI_SIGN_IN` = `anyone` lets anyone with an email address sign in.
+* unset — nobody creates one from the site; people join by invitation;
+* `@concordgroup.com` (addresses or domains, separated by commas) — those may;
+* `open` — anyone may.
 
-Signing in this way gives **no admin powers**. It gives an account:
+An account made this way gets a **new, empty workspace of its own**, not the site's. For
+colleagues, use invitations instead.
 
-* **Portfolios kept for you.** Build or open a portfolio while signed in and it is kept under
-  your address. It opens on any browser where you sign in, and a change made on one shows on
-  the others. **Your portfolios** on the Portfolio page lists them; a portfolio opened from a
-  key has **Keep this portfolio in my account**.
-* **Alert lists that follow.** An alert list started from a kept portfolio follows its edits
-  from then on, wherever they are made: a company added on your laptop is watched without
-  anyone re-saving the list. Your own address on a list is not asked to confirm; signing in
-  already proved it is yours.
-* **Email a portfolio**, to yourself or up to 10 colleagues at a time: the companies, the
-  latest severity of each, a link that opens it on the site, and its key. To anyone else it
-  says it came from you, and replies go to you. Up to 25 addresses a day per person.
+**What an account gives you**
 
-The key still works as before, for anyone not signed in: it is the portfolio, and the account
-is where your keys are kept. Sign-in links to anyone but the admins are limited to 30 a day
-across the site, within Resend's free allowance.
+* **Your portfolio follows you.** It is kept on the account and opens on any computer you sign
+  in from. An alert list on it follows it: add a company on your laptop and the list watches it
+  too, without its history being sent as news.
+* **Email a portfolio** from the Portfolio page, to yourself or up to 10 colleagues: the
+  companies, the latest severity of each, a link that opens it on the site, and its key. To
+  anyone else it says it came from you, and replies go to you. Up to 25 addresses a day.
+* **Your name on decisions.** Notices you approve, reject and send are recorded under your
+  address.
+* **Forgot password?** emails a reset link; confirmation, reset and invitation emails go to
+  the person themselves, never through `FOCI_EMAIL_REDIRECT_TO`.
+
+The admin key keeps working alongside accounts, for the daily workflows and as a way in.
 
 ## Who can do what
 
@@ -252,10 +256,7 @@ contractor, portfolio and alert list — and use it.
 pick a contractor's SEC record, look up its funds, mark findings, create, run, pause and resume
 watchlists and set their own policies, read notices, and start or add to an alert list.
 
-**Signed in to an account** (section 8), as well: keep portfolios, open them on any browser,
-and email them.
-
-**Signed in as an admin, or with the admin key**, only:
+**Signed in to the site's workspace** (section 8), **or with the admin key**, only:
 
 * deleting a screen or an alert list;
 * changing the screening rules or the site-wide screening policy;
@@ -264,6 +265,9 @@ and email them.
   each time it is opened;
 * seeing alert-list addresses, and where notices were sent, in full; taking an address off a
   list; "Mail again" for a bounced address.
+
+An account in a workspace of its own (one made through `FOCI_SIGNUP`) can do all of this in its
+own workspace, and nothing in the site's.
 
 **Email addresses are protected.** Visitors see the addresses on a list masked
 (`j•••@agency.gov`). An address a visitor adds is sent one email asking it to confirm, and

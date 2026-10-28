@@ -12,7 +12,6 @@ reviewer, and never implied by anything else.
 from __future__ import annotations
 
 import hashlib
-import html as html_lib
 import json
 import logging
 import os
@@ -23,13 +22,13 @@ from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
+from .. import accounts, consent, fund_managers, portfolio_mail, syscheck
 from .. import alerts as alerts_engine
-from .. import consent, fund_managers, portfolio_mail, syscheck
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from .. import vehicles as vehicles_engine
@@ -53,50 +52,92 @@ from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_availa
 from . import auth
 from .schemas import (
     MAX_ALERT_RECIPIENTS,
+    AccountPortfolio,
     AlertSubscriptionRequest,
+    Credentials,
+    EmailOnly,
     IdentityDecision,
+    InviteRequest,
     ManagerRequest,
     NoticeDecision,
     NoticeSend,
+    OrganisationRename,
+    PasswordChange,
     PortfolioEdit,
     PortfolioEmailRequest,
     PortfolioKey,
     PortfolioRequest,
     RuleSetting,
-    SavedPortfolioRequest,
     ScreenRequest,
     SignalDisposition,
-    SignInRequest,
+    TokenPassword,
     VehicleRequest,
     WatchlistRequest,
 )
-from .signin import ASKED as SIGNIN_ASKED
-from .signin import COOKIE as SESSION_COOKIE
-from .signin import SignIn
-from .signin import link_email as signin_mail
-from .signin import secure as signin_secure
 
 log = logging.getLogger("foci.api")
 
 cfg = get_config()
 keymap = auth.parse_keys(cfg.api_keys)
-# Signing in by email (signin.py), for whoever FOCI_ADMIN_EMAILS lists: what a
-# key does, with the person's name on it.
-signin = SignIn(lambda: store_for(auth.DEFAULT_TENANT), cfg)
-require_tenant = auth.make_dependency(keymap, public=cfg.public, session=signin.session,
-                                      sign_in=signin.configured)
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def session_user(request: Request) -> dict | None:
+    """The signed-in account behind this request's cookie, or None."""
+    token = request.cookies.get(accounts.COOKIE, "")
+    if not token:
+        return None
+    return store_for(auth.DEFAULT_TENANT).session_user(accounts.token_hash(token))
+
+
+def _session_tenant(request: Request) -> str:
+    """The signed-in account's tenant, for the auth dependencies; "" if none.
+
+    A change made on the strength of a cookie must come from this site's own
+    pages. A browser attaches the cookie whichever site starts the request;
+    only this site's pages send the client header (accounts.CLIENT_HEADER).
+    """
+    user = session_user(request)
+    if user is None:
+        return ""
+    if request.method not in _SAFE_METHODS \
+            and request.headers.get(accounts.CLIENT_HEADER) != "web":
+        raise HTTPException(403, "This change did not come from the site's own pages.")
+    request.state.user = user
+    return user["tenant_id"]
+
+
+def _accounts_possible() -> bool:
+    """Whether anyone could be signed in: an account exists or may be made."""
+    return bool(cfg.signup.strip()) or store_for(auth.DEFAULT_TENANT).count_users() > 0
+
+
+def _accounts_possible_quietly() -> bool:
+    """The same, for warnings: a database that cannot be reached is reported
+    by its own warning, and must not stop the others being worked out."""
+    try:
+        return _accounts_possible()
+    except Exception:            # noqa: BLE001 - reported elsewhere
+        return bool(cfg.signup.strip())
+
+
+require_tenant = auth.make_dependency(keymap, public=cfg.public, session=_session_tenant,
+                                      accounts_possible=_accounts_possible)
 # Removing recorded work, changing how the site screens for everyone, and
 # approving a notice to a federal official. The same as require_tenant unless
-# the site is public, where these alone need a key or a sign-in.
+# the site is public, where these alone need a key — or a signed-in account,
+# which is admin of its own workspace.
 require_admin = auth.make_admin_dependency(keymap, public=cfg.public,
-                                           session=signin.session,
-                                           sign_in=signin.configured)
-is_admin = auth.make_admin_flag(keymap, public=cfg.public, session=signin.session)
+                                           session=_session_tenant,
+                                           accounts_possible=_accounts_possible)
+is_admin = auth.make_admin_flag(keymap, public=cfg.public, session=_session_tenant)
 
 
 def signed_in(request: Request) -> str:
-    """Who the request is signed in as, or "" — for recording who did what."""
-    return signin.email_for(request)
+    """Who the request is signed in as, or "" — to record who decided or sent."""
+    user = session_user(request)
+    return user["email"] if user else ""
 queue = JobQueue(cfg)
 
 app = FastAPI(
@@ -172,11 +213,12 @@ def deployment_warnings() -> list[str]:
     host = cfg.managed_host
     on_sqlite = not cfg.dsn.startswith("postgres")
 
-    if not keymap and not cfg.public and not signin.configured:
+    if not keymap and not cfg.public and not _accounts_possible_quietly():
         warnings.append(
-            "FOCI_API_KEYS is not set: every authenticated route returns 503 and "
-            "the web interface will show nothing. To open the site to anyone with "
-            "its address instead, set FOCI_PUBLIC=true.")
+            "FOCI_API_KEYS is not set and there are no accounts: every authenticated "
+            "route returns 503 and the web interface will show nothing. Create an "
+            "account with `foci-screen add-user`, set FOCI_SIGNUP to let people sign "
+            "up, or set FOCI_PUBLIC=true to open the site to anyone with its address.")
     if storage_is_ephemeral():
         warnings.append(
             f"This database will not survive a restart. It is SQLite on {host}'s "
@@ -222,11 +264,6 @@ def deployment_warnings() -> list[str]:
         warnings.append("Email alerts: " + mail["explanation"])
     if cfg.alerts_paused:
         warnings.append(ALERTS_PAUSED_NOTE)
-    if signin.configured and not Mailer(cfg).configured:
-        warnings.append(
-            "Sign-in is set up (FOCI_ADMIN_EMAILS) but no mail service is connected, so "
-            "no sign-in link can be sent. Connect one (RESEND_API_KEY and ALERTS_FROM), "
-            "or use the admin key.")
     # The same for notices: Gmail switched on but never signed in means every
     # approval silently stops short of Gmail.
     if cfg.gmail_enabled and not Path(cfg.gmail_token).is_file():
@@ -314,7 +351,7 @@ for _warning in deployment_warnings():
     # logging may not be configured yet under some servers, so print as well.
     log.error(_warning)
     print(f"\n*** {_warning}\n", flush=True)
-if not keymap and not cfg.public and not signin.configured:
+if not keymap and not cfg.public and not _accounts_possible_quietly():
     # The long form says how to set it; the health warning stays short enough
     # to read in a banner.
     print(f"*** {auth.STARTUP_WARNING}\n", flush=True)
@@ -350,8 +387,6 @@ def health() -> dict:
             # What an approved notice turns into: render_only, draft, send or
             # redirected.
             "notices": {"mode": notice_sending.state(cfg)["mode"]},
-            # Whether anyone may sign in by email; nobody's address.
-            "sign_in": signin.configured,
             "warnings": deployment_warnings()}
 
 
@@ -374,6 +409,527 @@ def system_check(request: Request, store: Store = Depends(admin_store)) -> dict:
     return syscheck.run(cfg, store, _probe_client(), _base_url(request),
                         Mailer(cfg).status(), environ=os.environ,
                         queue_backend=queue.backend, version=VERSION)
+
+
+# --------------------------------------------------------------- accounts
+
+def _secure_cookie(request: Request) -> bool:
+    """Mark the cookie Secure whenever the site is reached over HTTPS — directly,
+    behind a proxy that says so, or as configured. Plain HTTP is left working
+    for a laptop on localhost."""
+    return (request.url.scheme == "https"
+            or request.headers.get("x-forwarded-proto", "").startswith("https")
+            or cfg.public_url.startswith("https://"))
+
+
+def _require_client_header(request: Request) -> None:
+    # Signing in or out from another site's page would let it choose whose
+    # account this browser uses.
+    if request.headers.get(accounts.CLIENT_HEADER) != "web":
+        raise HTTPException(403, "This request did not come from the site's own pages.")
+
+
+def _start_session(request: Request, response: Response, user: dict) -> None:
+    token, hashed = accounts.new_session_token()
+    store_for(auth.DEFAULT_TENANT).create_session(hashed, user["user_id"],
+                                                  accounts.SESSION_DAYS)
+    response.set_cookie(accounts.COOKIE, token, max_age=accounts.SESSION_DAYS * 86400,
+                        httponly=True, samesite="lax", secure=_secure_cookie(request),
+                        path="/")
+
+
+def _account(user: dict) -> dict:
+    """What the page is told about the signed-in account. Never the hash."""
+    org = store_for(auth.DEFAULT_TENANT).organisation(user["tenant_id"]) or {}
+    return {"email": user["email"], "workspace": user["tenant_id"],
+            "organisation": org.get("name") or user["tenant_id"],
+            "role": user.get("role") or "owner",
+            "email_verified": bool(user.get("email_verified_at")),
+            "portfolio_key": user.get("portfolio_key") or "",
+            "created_at": user["created_at"], "last_login_at": user.get("last_login_at")}
+
+
+def _send_account_email(request: Request, to: str, subject: str, text: str,
+                        link: str) -> dict:
+    """Send one account email: to the person, never redirected.
+
+    With no mail service connected nothing can leave, and the link is written
+    to the server log instead — the only way to finish setting up a site that
+    has not connected one yet. Once a service is connected, links never reach
+    the log.
+    """
+    mailer = Mailer(cfg)
+    delivery = mailer.send([to], subject, text, redirectable=False)
+    if delivery.status != "sent":
+        if not mailer.transport:
+            log.warning("No mail service is connected, so this email was not sent. "
+                        "To: %s. Subject: %s. Link: %s", to, subject, link)
+        else:
+            log.warning("account email to %s not sent: %s", to, delivery.detail)
+    return {"sent": delivery.status == "sent", "status": delivery.status,
+            "detail": "" if delivery.status == "sent" else (
+                "This site has no mail service connected, so no email was sent."
+                if not mailer.transport else
+                "The email could not be sent. Try again in a few minutes.")}
+
+
+def _link(request: Request, path: str) -> str:
+    return f"{_base_url(request)}{path}"
+
+
+def _send_verification(request: Request, user: dict) -> dict:
+    token, hashed = accounts.new_session_token()
+    store = store_for(auth.DEFAULT_TENANT)
+    store.create_account_token(hashed, purpose="verify", email=user["email"],
+                               user_id=user["user_id"], hours=accounts.VERIFY_HOURS)
+    link = _link(request, f"/account/verify/{token}")
+    org = (store.organisation(user["tenant_id"]) or {}).get("name", "")
+    subject, text = accounts.verify_email(link, org)
+    return _send_account_email(request, user["email"], subject, text, link)
+
+
+@app.get("/v1/auth/status", tags=["accounts"])
+def auth_status(request: Request) -> dict:
+    """Whether this browser is signed in, and whether accounts can be made.
+
+    No key needed: the sign-in page asks before anyone has signed in.
+    """
+    user = session_user(request)
+    return {"signed_in": user is not None,
+            "account": _account(user) if user else None,
+            "signup": accounts.signup_mode(cfg.signup),
+            "keys": bool(keymap), "public": cfg.public}
+
+
+@app.post("/v1/auth/signup", status_code=201, tags=["accounts"])
+def signup(body: Credentials, request: Request, response: Response,
+           authorization: str = Header(default=""),
+           x_api_key: str = Header(default="")) -> dict:
+    """Create an account with its own empty workspace, and sign it in.
+
+    Made by someone holding an API key, the account belongs to that key's
+    workspace instead, as an owner, whatever FOCI_SIGNUP says. The key already
+    does everything there; this gives it a name. It is how the people who look
+    after a site with no command line — Vercel's — sign in to the data already
+    on it ("default"), as `foci-screen add-user --workspace` does elsewhere.
+    """
+    _require_client_header(request)
+    try:
+        email = accounts.normalise_email(body.email)
+        accounts.check_password(body.password)
+    except accounts.AccountError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    presented = x_api_key.strip() or (authorization[7:].strip()
+                                      if authorization.lower().startswith("bearer ") else "")
+    key_tenant = auth.resolve_tenant(keymap, presented) if presented else ""
+    if presented and not key_tenant:
+        raise HTTPException(401, "That API key is not one this site knows.")
+    if not key_tenant and not accounts.signup_allowed(cfg.signup, email):
+        raise HTTPException(
+            403, "New accounts are not being taken here"
+                 + ("" if accounts.signup_mode(cfg.signup) == "closed"
+                    else " for that address") + ". Ask whoever runs this site to add you.")
+    store = store_for(auth.DEFAULT_TENANT)
+    try:
+        user = store.create_user(email=email,
+                                 password_hash=accounts.hash_password(body.password),
+                                 tenant_id=key_tenant or accounts.new_tenant_id(),
+                                 role="owner", organisation=body.organisation)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    store.record_login(user["user_id"], True, max_failures=accounts.MAX_FAILURES,
+                       lock_minutes=accounts.LOCK_MINUTES)
+    _start_session(request, response, user)
+    email_result = _send_verification(request, user)
+    return {"account": _account(store.user_by_id(user["user_id"])),
+            "verification_email": email_result}
+
+
+# ------------------------------------------------- links sent by email
+
+@app.get("/account/verify/{token}", include_in_schema=False)
+def verify_address(token: str) -> HTMLResponse:
+    """Confirm an address from the link in its email.
+
+    Acting on the GET is deliberate here, unlike unsubscribing: what is being
+    proved is that the link reached this mailbox, and a mail scanner opening it
+    proves the same thing.
+    """
+    store = store_for(auth.DEFAULT_TENANT)
+    hashed = accounts.token_hash(token)
+    row = store.account_token(hashed, "verify")
+    if row is None or not row.get("user_id") or not store.use_account_token(hashed):
+        return _link_page("Link not valid",
+                          "<p>This confirmation link has expired or has already been "
+                          "used. Sign in and choose “Send the link again” to get a new "
+                          "one.</p><p><a href=\"/\">Go to FOCI-Screener</a></p>", 404)
+    store.mark_email_verified(row["user_id"])
+    return _link_page("Address confirmed",
+                      "<p>Thank you — your email address is confirmed.</p>"
+                      "<p><a href=\"/\">Continue to FOCI-Screener</a></p>")
+
+
+@app.post("/v1/me/verify", tags=["accounts"])
+def resend_verification(request: Request) -> dict:
+    """Send the confirmation link again."""
+    user = _signed_in(request)
+    if user.get("email_verified_at"):
+        return {"already": True}
+    store = store_for(auth.DEFAULT_TENANT)
+    if accounts.too_soon(store.last_account_token(user["email"], "verify")):
+        raise HTTPException(429, "A link was sent a moment ago. Give it a couple of "
+                                 "minutes to arrive, and check the spam folder.")
+    return {"email": _send_verification(request, user)}
+
+
+FORGOT_REPLY = ("If that address has an account here, an email with a link to choose a "
+                "new password is on its way. The link works once, for an hour.")
+
+
+@app.post("/v1/auth/forgot", tags=["accounts"])
+def forgot_password(body: EmailOnly, request: Request) -> dict:
+    """Email a reset link. The reply is the same whether or not the address
+    has an account, so the form cannot be used to find out who does."""
+    _require_client_header(request)
+    reply = {"detail": FORGOT_REPLY,
+             "mail_connected": bool(Mailer(cfg).transport) and not Mailer(cfg).switched_off}
+    try:
+        email = accounts.normalise_email(body.email)
+    except accounts.AccountError:
+        return reply
+    store = store_for(auth.DEFAULT_TENANT)
+    user = store.user_by_email(email)
+    if user is None or accounts.too_soon(store.last_account_token(email, "reset")):
+        return reply
+    token, hashed = accounts.new_session_token()
+    store.create_account_token(hashed, purpose="reset", email=email,
+                               user_id=user["user_id"], hours=accounts.RESET_HOURS)
+    link = _link(request, f"/#/reset/{token}")
+    subject, text = accounts.reset_email(link)
+    _send_account_email(request, email, subject, text, link)
+    return reply
+
+
+@app.post("/v1/auth/reset", tags=["accounts"])
+def reset_password(body: TokenPassword, request: Request, response: Response) -> dict:
+    """Choose a new password from a reset link, and sign in with it."""
+    _require_client_header(request)
+    store = store_for(auth.DEFAULT_TENANT)
+    hashed = accounts.token_hash(body.token)
+    row = store.account_token(hashed, "reset")
+    if row is None:
+        raise HTTPException(410, "This reset link has expired or has already been used. "
+                                 "Ask for a new one from “Forgot password?”.")
+    try:
+        accounts.check_password(body.password)
+    except accounts.AccountError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    user = store.user_by_id(row["user_id"] or "")
+    if user is None or not store.use_account_token(hashed):
+        raise HTTPException(410, "This reset link is no longer valid.")
+    store.set_password(user["user_id"], accounts.hash_password(body.password))
+    # The link reached the mailbox, which is what confirming proves.
+    store.mark_email_verified(user["user_id"])
+    store.record_login(user["user_id"], True, max_failures=accounts.MAX_FAILURES,
+                       lock_minutes=accounts.LOCK_MINUTES)
+    _start_session(request, response, user)
+    return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+def _live_invite(token: str) -> tuple[str, dict]:
+    store = store_for(auth.DEFAULT_TENANT)
+    hashed = accounts.token_hash(token)
+    row = store.account_token(hashed, "invite")
+    if row is None:
+        raise HTTPException(410, "This invitation has expired, has been withdrawn, or "
+                                 "has already been used. Ask for a new one.")
+    return hashed, row
+
+
+@app.get("/v1/auth/invite/{token}", tags=["accounts"])
+def read_invite(token: str) -> dict:
+    """What an invitation link is for, so its page can say so before anyone
+    commits to anything."""
+    _, row = _live_invite(token)
+    store = store_for(auth.DEFAULT_TENANT)
+    org = store.organisation(row["tenant_id"] or "") or {}
+    return {"email": row["email"], "organisation": org.get("name", ""),
+            "invited_by": row.get("invited_by") or "", "role": row.get("role") or "member",
+            "has_account": store.user_by_email(row["email"]) is not None}
+
+
+@app.post("/v1/auth/join", tags=["accounts"])
+def join_organisation(body: TokenPassword, request: Request, response: Response) -> dict:
+    """Accept an invitation: create the account in that organisation, signed in."""
+    _require_client_header(request)
+    hashed, row = _live_invite(body.token)
+    store = store_for(auth.DEFAULT_TENANT)
+    if store.user_by_email(row["email"]):
+        raise HTTPException(409, "That address already has an account, and an account "
+                                 "belongs to one organisation. Sign in instead.")
+    try:
+        accounts.check_password(body.password)
+    except accounts.AccountError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    if not store.use_account_token(hashed):
+        raise HTTPException(410, "This invitation has just been used.")
+    user = store.create_user(email=row["email"],
+                             password_hash=accounts.hash_password(body.password),
+                             tenant_id=row["tenant_id"], role=row.get("role") or "member",
+                             verified=True)
+    store.record_login(user["user_id"], True, max_failures=accounts.MAX_FAILURES,
+                       lock_minutes=accounts.LOCK_MINUTES)
+    _start_session(request, response, user)
+    return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+WRONG_LOGIN = "That email address and password do not match an account."
+
+
+@app.post("/v1/auth/login", tags=["accounts"])
+def login(body: Credentials, request: Request, response: Response) -> dict:
+    _require_client_header(request)
+    store = store_for(auth.DEFAULT_TENANT)
+    user = store.user_by_email((body.email or "").strip().lower())
+    if user is None:
+        accounts.burn_time(body.password)       # as slow as a wrong password
+        raise HTTPException(401, WRONG_LOGIN)
+    locked = str(user.get("locked_until") or "")
+    if locked and locked > datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"):
+        raise HTTPException(
+            429, f"Too many wrong passwords. This account is locked for "
+                 f"{accounts.LOCK_MINUTES} minutes from the last attempt.")
+    ok = accounts.verify_password(body.password, user["password_hash"])
+    store.record_login(user["user_id"], ok, max_failures=accounts.MAX_FAILURES,
+                       lock_minutes=accounts.LOCK_MINUTES)
+    if not ok:
+        raise HTTPException(401, WRONG_LOGIN)
+    if accounts.needs_rehash(user["password_hash"]):
+        store.set_password(user["user_id"], accounts.hash_password(body.password))
+    _start_session(request, response, user)
+    return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+@app.post("/v1/auth/logout", status_code=204, tags=["accounts"])
+def logout(request: Request) -> Response:
+    _require_client_header(request)
+    token = request.cookies.get(accounts.COOKIE, "")
+    if token:
+        store_for(auth.DEFAULT_TENANT).end_session(accounts.token_hash(token))
+    response = Response(status_code=204)
+    response.delete_cookie(accounts.COOKIE, path="/")
+    return response
+
+
+def _signed_in(request: Request) -> dict:
+    user = session_user(request)
+    if user is None:
+        raise HTTPException(401, "Sign in first.")
+    if request.method not in _SAFE_METHODS:
+        _require_client_header(request)
+    return user
+
+
+@app.get("/v1/me", tags=["accounts"])
+def me(request: Request) -> dict:
+    """The signed-in account: its address, workspace and saved portfolio."""
+    return {"account": _account(_signed_in(request))}
+
+
+@app.put("/v1/me/portfolio", tags=["accounts"])
+def save_my_portfolio(body: AccountPortfolio, request: Request) -> dict:
+    """Keep the portfolio key on the account, so it follows the person to
+    another browser. An empty key clears it.
+
+    An alert list that was following the old key follows the new one, so a
+    company added from any computer is watched — the browser that started the
+    list may never hear of the change.
+    """
+    user = _signed_in(request)
+    key = body.portfolio_key.strip()
+    if key:
+        try:
+            portfolio_keys.decode(key)
+        except portfolio_keys.PortfolioKeyError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    store = store_for(auth.DEFAULT_TENANT)
+    old = (user.get("portfolio_key") or "").strip()
+    store.set_user_portfolio(user["user_id"], key)
+    if old and key and old != key:
+        _follow_portfolio(store_for(user["tenant_id"]), old, key)
+    return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+def _follow_portfolio(store: Store, old_key: str, new_key: str) -> int:
+    """Move every alert list on `old_key` to `new_key`: its companies become the
+    portfolio's, and those just added are baselined, so their history is not
+    sent as news. Returns how many lists moved."""
+    loaded = portfolio_keys.decode(new_key)
+    companies = [c.key for c in loaded.companies]
+    moved = 0
+    for sub in store.alert_subscriptions():
+        if (sub.get("portfolio_key") or "").strip() != old_key:
+            continue
+        store.save_alert_subscription(
+            subscription_id=sub["subscription_id"], name=loaded.name, emails=sub["emails"],
+            companies=companies, portfolio_key=new_key, active=sub["active"])
+        alerts_engine.baseline(store, sub["subscription_id"],
+                               [c for c in companies if c not in set(sub["companies"])])
+        moved += 1
+    return moved
+
+
+# Addresses one person may email portfolios to in a day: plenty for sharing,
+# not enough to make the site a way to send mail.
+PORTFOLIO_EMAILS_PER_DAY = 25
+
+
+@app.post("/v1/portfolio/email", tags=["accounts"])
+def email_portfolio(body: PortfolioEmailRequest, request: Request) -> dict:
+    """Email a portfolio — its companies, their latest severity, a link that
+    opens it, and its key — to yourself, or to colleagues.
+
+    Only for someone signed in, who is named in the email to anyone else and
+    gets their replies. Copies to others go through the pilot redirect, as
+    alerts do; a copy to yourself does not.
+    """
+    user = _signed_in(request)
+    who = user["email"]
+    try:
+        portfolio_keys.decode(body.key)
+    except portfolio_keys.PortfolioKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    since = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+        microsecond=0, tzinfo=None).isoformat() + "Z"
+    log_store = store_for(auth.DEFAULT_TENANT)
+    if log_store.portfolio_emails_since(who, since) + len(body.to) > PORTFOLIO_EMAILS_PER_DAY:
+        raise HTTPException(429, f"That would pass {PORTFOLIO_EMAILS_PER_DAY} addresses in a "
+                                 f"day, the most one person can email portfolios to. Try "
+                                 f"again tomorrow.")
+    view = load_portfolio(PortfolioKey(key=body.key), store_for(user["tenant_id"]))
+    base = _base_url(request)
+    mailer = Mailer(cfg)
+    outcomes = []
+    if who in body.to:
+        subject, text, html = portfolio_mail.compose(view, body.key, base, note=body.note)
+        outcomes.append(mailer.send([who], subject, text, html, redirectable=False))
+    others = [a for a in body.to if a != who]
+    if others:
+        subject, text, html = portfolio_mail.compose(view, body.key, base, sent_by=who,
+                                                     note=body.note)
+        outcomes.append(mailer.send(others, subject, text, html, reply_to=who))
+    statuses = {d.status for d in outcomes}
+    status = statuses.pop() if len(statuses) == 1 else "partial"
+    detail = " ".join(d.detail for d in outcomes if d.detail)
+    log_store.log_portfolio_email(who, view["name"], body.to, status, detail)
+    return {"status": status, "recipients": [a for d in outcomes for a in d.recipients],
+            "detail": detail}
+
+
+@app.post("/v1/me/password", status_code=204, tags=["accounts"])
+def change_password(body: PasswordChange, request: Request) -> Response:
+    """Change the password. Every session ends, this one included: a password
+    is changed because someone else may know it."""
+    user = _signed_in(request)
+    if not accounts.verify_password(body.current_password, user["password_hash"]):
+        raise HTTPException(403, "The current password is not right.")
+    try:
+        accounts.check_password(body.new_password)
+    except accounts.AccountError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    store_for(auth.DEFAULT_TENANT).set_password(
+        user["user_id"], accounts.hash_password(body.new_password))
+    response = Response(status_code=204)
+    response.delete_cookie(accounts.COOKIE, path="/")
+    return response
+
+
+# ------------------------------------------------------------ organisation
+
+def _owner(request: Request) -> dict:
+    user = _signed_in(request)
+    if (user.get("role") or "owner") != "owner":
+        raise HTTPException(403, "Only an owner of the organisation can do that.")
+    return user
+
+
+@app.get("/v1/org", tags=["accounts"])
+def my_organisation(request: Request) -> dict:
+    """The signed-in account's organisation: its people and open invitations."""
+    user = _signed_in(request)
+    store = store_for(auth.DEFAULT_TENANT)
+    org = store.organisation(user["tenant_id"]) or {"name": user["tenant_id"]}
+    owner = (user.get("role") or "owner") == "owner"
+    return {"name": org["name"], "you": user["user_id"], "owner": owner,
+            "members": [{**m, "email_verified": bool(m.pop("email_verified_at"))}
+                        for m in store.organisation_members(user["tenant_id"])],
+            "invites": [{"email": i["email"], "role": i["role"],
+                         "invited_by": i["invited_by"], "expires_at": i["expires_at"]}
+                        for i in store.pending_invites(user["tenant_id"])] if owner else []}
+
+
+@app.put("/v1/org", tags=["accounts"])
+def rename_organisation(body: OrganisationRename, request: Request) -> dict:
+    user = _owner(request)
+    store_for(auth.DEFAULT_TENANT).rename_organisation(user["tenant_id"], body.name)
+    return my_organisation(request)
+
+
+@app.post("/v1/org/invites", status_code=201, tags=["accounts"])
+def invite_member(body: InviteRequest, request: Request) -> dict:
+    """Invite someone by email. An address that already has an account cannot
+    be invited: every account belongs to exactly one organisation.
+
+    When the email cannot be sent, the link comes back in the reply so the
+    owner can pass it on themselves.
+    """
+    user = _owner(request)
+    try:
+        email = accounts.normalise_email(body.email)
+    except accounts.AccountError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    store = store_for(auth.DEFAULT_TENANT)
+    if store.user_by_email(email):
+        raise HTTPException(409, "That address already has an account. An account "
+                                 "belongs to one organisation, so it cannot be invited.")
+    last = store.last_account_token(email, "invite")
+    if last and last.get("tenant_id") == user["tenant_id"] and accounts.too_soon(last):
+        raise HTTPException(429, "An invitation went to that address a moment ago.")
+    store.revoke_invites(user["tenant_id"], email)      # one live invitation at a time
+    token, hashed = accounts.new_session_token()
+    store.create_account_token(hashed, purpose="invite", email=email,
+                               tenant_id=user["tenant_id"], role=body.role,
+                               invited_by=user["email"], hours=accounts.INVITE_HOURS)
+    link = _link(request, f"/#/join/{token}")
+    org = (store.organisation(user["tenant_id"]) or {}).get("name", "")
+    subject, text = accounts.invite_email(link, org, user["email"])
+    result = _send_account_email(request, email, subject, text, link)
+    return {"email": email, "role": body.role, "delivery": result,
+            "link": "" if result["sent"] else link}
+
+
+@app.delete("/v1/org/invites/{email}", status_code=204, tags=["accounts"])
+def withdraw_invite(email: str, request: Request) -> Response:
+    user = _owner(request)
+    if not store_for(auth.DEFAULT_TENANT).revoke_invites(user["tenant_id"],
+                                                         email.strip().lower()):
+        raise HTTPException(404, "No open invitation for that address.")
+    return Response(status_code=204)
+
+
+@app.delete("/v1/org/members/{user_id}", status_code=204, tags=["accounts"])
+def remove_member(user_id: str, request: Request) -> Response:
+    """Remove someone from the organisation, which deletes their account (an
+    account has no existence outside its organisation). Their work stays."""
+    user = _owner(request)
+    store = store_for(auth.DEFAULT_TENANT)
+    target = store.user_by_id(user_id)
+    if target is None or target["tenant_id"] != user["tenant_id"]:
+        raise HTTPException(404, "No such member.")
+    if target["user_id"] == user["user_id"]:
+        raise HTTPException(409, "You cannot remove yourself.")
+    store.remove_user(user_id)
+    return Response(status_code=204)
 
 
 @app.get("/v1/config", tags=["meta"])
@@ -1036,12 +1592,12 @@ def find_fund_managers(entity_key: str, body: ManagerRequest,
 
 # ------------------------------------------------------------ email alerts
 
-def _shown_list(store: Store, sub: dict, admin: bool, who: str = "") -> dict:
+def _shown_list(store: Store, sub: dict, admin: bool) -> dict:
     """A list as the page shows it: each address and whether it has agreed.
 
     On a public site a visitor sees addresses masked — a list holds people at
     other organisations, and the page is open to anyone. Holding the admin
-    key shows them in full; someone signed in sees their own.
+    key, or being signed in to the workspace, shows them in full.
     """
     recipients = consent.statuses(store, sub)
     # Who took themselves off, so the list's owner can see why an address
@@ -1055,11 +1611,8 @@ def _shown_list(store: Store, sub: dict, admin: bool, who: str = "") -> dict:
                for r in sorted(store.suppressed(sub["emails"]).values(),
                                key=lambda r: r["email"])]
     if not admin:
-        def mask(address: str) -> str:
-            return address if who and address.lower() == who else consent.mask(address)
-
-        recipients = [{**r, "email": mask(r["email"])} for r in recipients]
-        opted_out = [{**o, "email": mask(o["email"])} for o in opted_out]
+        recipients = [{**r, "email": consent.mask(r["email"])} for r in recipients]
+        opted_out = [{**o, "email": consent.mask(o["email"])} for o in opted_out]
         bounced = [{**b, "email": consent.mask(b["email"]),
                     "reason": consent.mask_text(b["reason"]),
                     "description": consent.mask_text(b["description"])} for b in bounced]
@@ -1078,14 +1631,13 @@ def _shown_delivery(d: dict, admin: bool) -> dict:
 
 @app.get("/v1/alerts", tags=["alerts"])
 def get_alerts(store: Store = Depends(tenant_store),
-               admin: bool = Depends(is_admin),
-               who: str = Depends(signed_in)) -> dict:
+               admin: bool = Depends(is_admin)) -> dict:
     """Subscriptions, what sending will do, and what was sent recently."""
     sending = Mailer(cfg).status()
     if not admin:
         sending = {**sending, "explanation": consent.mask_text(sending["explanation"])}
     return {"sending": sending, "public": cfg.public, "can_edit_addresses": admin,
-            "subscriptions": [_shown_list(store, s, admin, who)
+            "subscriptions": [_shown_list(store, s, admin)
                               for s in store.alert_subscriptions()],
             "deliveries": [_shown_delivery(d, admin)
                            for d in store.alert_deliveries(limit=30)],
@@ -1168,8 +1720,7 @@ async def resend_report(request: Request) -> Response:
 @app.post("/v1/alerts/subscriptions", tags=["alerts"])
 def save_subscription(body: AlertSubscriptionRequest, request: Request,
                       store: Store = Depends(tenant_store),
-                      admin: bool = Depends(is_admin),
-                      who: str = Depends(signed_in)) -> dict:
+                      admin: bool = Depends(is_admin)) -> dict:
     """Create or update who is emailed about a portfolio.
 
     Whatever is already known about the portfolio's companies is marked as
@@ -1179,11 +1730,7 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
     An address added here by a visitor to a public site is sent a request to
     confirm and nothing else until it does (`consent`). Such a visitor adds
     to a list; taking an address off is for the address itself, through the
-    link in every email, or for someone holding the admin key. Someone signed
-    in is not asked to confirm their own address.
-
-    With `portfolio_id`, the list is tied to that portfolio in the signed-in
-    person's account, and follows its edits from then on, from any browser.
+    link in every email, or for someone holding the admin key or signed in.
     """
     try:
         loaded = portfolio_keys.decode(body.portfolio_key)
@@ -1221,16 +1768,14 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
         active=body.active if admin or not existing else existing["active"])
     sub = store.alert_subscription(sub_id)
     asked = consent.add(store, Mailer(cfg), sub, [e for e in emails if e not in had],
-                        _base_url(request), trusted=admin, own=who)
-    if body.portfolio_id and who:
-        store_for(auth.DEFAULT_TENANT).link_portfolio_alerts(body.portfolio_id, who, sub_id)
+                        _base_url(request), trusted=admin)
     if not admin:
         asked = {k: [consent.mask(a) if isinstance(a, str)
                      else {**a, "email": consent.mask(a["email"])} for a in v]
                  for k, v in asked.items()}
     baselined = alerts_engine.baseline(store, sub_id,
                                        [c for c in companies if c not in before])
-    return {"subscription": _shown_list(store, sub, admin, who), "baselined": baselined,
+    return {"subscription": _shown_list(store, sub, admin), "baselined": baselined,
             "declined": shown, "consent": asked}
 
 
@@ -2370,202 +2915,6 @@ def reject_notice(notice_id: str, body: NoticeDecision,
     _decision_error(store.decide_notice(
         notice_id, "rejected", decided_by=_decider(body, tenant, who), note=body.note))
     return {"notice_id": notice_id, "status": "rejected"}
-
-
-# --------------------------------------------------------------- signing in
-# signin.py says why. The link in the email opens a page with a button, as
-# every link this site emails does; pressing it starts the session.
-
-@app.get("/v1/auth", tags=["meta"])
-def who_am_i(request: Request) -> dict:
-    """Whether anyone may sign in here, who besides the admins may, and who
-    this browser is signed in as."""
-    email, admin = signin.session(request)
-    return {"sign_in": signin.configured, "members": signin.members,
-            "email": email, "admin": admin}
-
-
-# -------------------------------------------------------- your portfolios
-# Kept by the address you sign in with, so they open on any browser. The key
-# is still the portfolio: each one here is a key, and editing it keeps the
-# newer key. An alert list started from one follows its edits.
-
-def signed_in_person(request: Request) -> str:
-    email = signin.email_for(request)
-    if email:
-        return email
-    if not signin.configured:
-        raise HTTPException(404, "Signing in is not set up on this site.")
-    raise HTTPException(401, "Sign in to keep portfolios in your account and email them.")
-
-
-def _account() -> Store:
-    # Accounts belong to the default tenant, as signing in does.
-    return store_for(auth.DEFAULT_TENANT)
-
-
-def _shown_saved(row: dict) -> dict:
-    try:
-        companies = len(portfolio_keys.decode(row["portfolio_key"]).companies)
-    except portfolio_keys.PortfolioKeyError:
-        companies = None
-    return {k: row[k] for k in ("portfolio_id", "name", "portfolio_key", "subscription_id",
-                                "created_at", "updated_at")} | {"companies": companies}
-
-
-def _follow_portfolio(store: Store, subscription_id: str, key: str) -> None:
-    """Bring an alert list into line with its portfolio's newer key, so a
-    company added from any browser is watched — and its history is not sent
-    as news."""
-    sub = store.alert_subscription(subscription_id)
-    if not sub:
-        return
-    loaded = portfolio_keys.decode(key)
-    companies = [c.key for c in loaded.companies]
-    store.save_alert_subscription(subscription_id=subscription_id, name=loaded.name,
-                                  emails=sub["emails"], companies=companies,
-                                  portfolio_key=key, active=sub["active"])
-    alerts_engine.baseline(store, subscription_id,
-                           [c for c in companies if c not in set(sub["companies"])])
-
-
-@app.get("/v1/me/portfolios", tags=["portfolio"])
-def my_portfolios(who: str = Depends(signed_in_person)) -> dict:
-    return {"email": who,
-            "portfolios": [_shown_saved(r) for r in _account().saved_portfolios(who)]}
-
-
-@app.post("/v1/me/portfolios", tags=["portfolio"])
-def keep_portfolio(body: SavedPortfolioRequest,
-                   who: str = Depends(signed_in_person)) -> dict:
-    """Keep a portfolio in your account, or keep the newer key of one there."""
-    try:
-        loaded = portfolio_keys.decode(body.key)
-    except portfolio_keys.PortfolioKeyError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    store = _account()
-    portfolio_id = store.save_portfolio(who, (body.name or loaded.name).strip()[:120]
-                                        or "Portfolio", body.key.strip(), body.portfolio_id)
-    if not portfolio_id:
-        raise HTTPException(404, "That portfolio is not in your account.")
-    row = store.saved_portfolio(portfolio_id, who)
-    if row.get("subscription_id"):
-        _follow_portfolio(store, row["subscription_id"], row["portfolio_key"])
-    return {"portfolio": _shown_saved(row)}
-
-
-@app.delete("/v1/me/portfolios/{portfolio_id}", status_code=204, tags=["portfolio"])
-def forget_portfolio(portfolio_id: str, who: str = Depends(signed_in_person)) -> Response:
-    """Take a portfolio out of your account. Its alert list, if it has one, goes
-    on: the people on it chose to be, and may not be you."""
-    if not _account().delete_saved_portfolio(portfolio_id, who):
-        raise HTTPException(404, "That portfolio is not in your account.")
-    return Response(status_code=204)
-
-
-# Addresses one person may email portfolios to in a day: plenty for sharing,
-# not enough to make the site a way to send mail.
-PORTFOLIO_EMAILS_PER_DAY = 25
-
-
-@app.post("/v1/portfolio/email", tags=["portfolio"])
-def email_portfolio(body: PortfolioEmailRequest, request: Request,
-                    store: Store = Depends(tenant_store),
-                    who: str = Depends(signed_in_person)) -> dict:
-    """Email a portfolio — the companies, their latest severity, a link that
-    opens it, and its key — to yourself, or to colleagues.
-
-    Only for someone signed in, who is named in the email to anyone else and
-    gets their replies. Copies to others go through the pilot redirect, as
-    alerts do; a copy to yourself does not.
-    """
-    try:
-        portfolio_keys.decode(body.key)
-    except portfolio_keys.PortfolioKeyError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    since = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
-        microsecond=0, tzinfo=None).isoformat() + "Z"
-    account = _account()
-    if account.portfolio_emails_since(who, since) + len(body.to) > PORTFOLIO_EMAILS_PER_DAY:
-        raise HTTPException(429, f"That would pass {PORTFOLIO_EMAILS_PER_DAY} addresses in a "
-                                 f"day, the most one person can email portfolios to. Try "
-                                 f"again tomorrow.")
-    view = load_portfolio(PortfolioKey(key=body.key), store)
-    base = _base_url(request)
-    mailer = Mailer(cfg)
-    outcomes = []
-    if who in body.to:
-        subject, text, html = portfolio_mail.compose(view, body.key, base, note=body.note)
-        outcomes.append(mailer.send([who], subject, text, html, asked_for=True))
-    others = [a for a in body.to if a != who]
-    if others:
-        subject, text, html = portfolio_mail.compose(view, body.key, base, sent_by=who,
-                                                     note=body.note)
-        outcomes.append(mailer.send(others, subject, text, html, reply_to=who))
-    statuses = {d.status for d in outcomes}
-    status = statuses.pop() if len(statuses) == 1 else "partial"
-    detail = " ".join(d.detail for d in outcomes if d.detail)
-    account.log_portfolio_email(who, view["name"], body.to, status, detail)
-    return {"status": status, "recipients": [a for d in outcomes for a in d.recipients],
-            "detail": detail}
-
-
-@app.post("/v1/auth/sign-in", tags=["meta"])
-def ask_for_sign_in(body: SignInRequest, request: Request) -> dict:
-    """Email a sign-in link, if the address may sign in. The answer is the same
-    whether it may or not."""
-    if not signin.configured:
-        raise HTTPException(404, "Signing in is not set up on this site.")
-    mailer = Mailer(cfg)
-    if not mailer.configured:
-        raise HTTPException(503, "Signing in needs the site's mail service, which is not "
-                                 "connected. Use the admin key.")
-    secret = signin.link_for(body.email)
-    if secret:
-        base = _base_url(request)
-        subject, text, html = signin_mail(f"{base}/auth/sign-in/{secret}", base)
-        delivery = mailer.send([body.email.strip().lower()], subject, text, html,
-                               asked_for=True)
-        if delivery.status != "sent":
-            log.warning("sign-in link not sent: %s", delivery.detail)
-    return {"status": "asked", "detail": SIGNIN_ASKED}
-
-
-@app.get("/auth/sign-in/{secret}", include_in_schema=False)
-def sign_in_page(secret: str) -> HTMLResponse:
-    if not signin.link_usable(secret):
-        return _link_page("Link no longer works",
-                          "<p>This sign-in link has been used, has expired, or is not one "
-                          "this site sent. Ask for a new one from the site.</p>", 404)
-    return _link_page(
-        "Sign in to FOCI-Screener",
-        f'<form method="post" action="/auth/sign-in/{html_lib.escape(secret)}">'
-        f'<button type="submit">Sign in</button></form>'
-        f'<p class="muted" style="margin-top:16px">This browser stays signed in for '
-        f"30 days, or until you sign out.</p>")
-
-
-@app.post("/auth/sign-in/{secret}", include_in_schema=False)
-def sign_in(secret: str, request: Request) -> Response:
-    email = signin.use_link(secret)
-    if not email:
-        return _link_page("Link no longer works",
-                          "<p>This sign-in link has been used, has expired, or is not one "
-                          "this site sent. Ask for a new one from the site.</p>", 404)
-    value, lifetime = signin.start_session(email)
-    log.info("signed in: %s", consent.mask(email))
-    response = Response(status_code=303, headers={"Location": "/#/"})
-    response.set_cookie(SESSION_COOKIE, value, max_age=lifetime, httponly=True,
-                        secure=signin_secure(request), samesite="lax", path="/")
-    return response
-
-
-@app.post("/v1/auth/sign-out", tags=["meta"])
-def sign_out(request: Request) -> Response:
-    signin.end_session(request)
-    response = Response(status_code=204)
-    response.delete_cookie(SESSION_COOKIE, path="/")
-    return response
 
 
 # ---------------------------------------------------------------------- web

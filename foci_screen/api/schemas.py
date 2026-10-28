@@ -85,9 +85,6 @@ class AlertSubscriptionRequest(BaseModel):
     emails: list[str] = Field(default_factory=list, max_length=MAX_ALERT_RECIPIENTS)
     portfolio_key: str = Field(..., min_length=1, max_length=64_000)
     active: bool = True
-    # The portfolio in the signed-in person's account this list is for. The
-    # list then follows the portfolio's edits, from whatever browser.
-    portfolio_id: str = Field("", max_length=40)
 
     @model_validator(mode="after")
     def clean_emails(self) -> AlertSubscriptionRequest:
@@ -187,18 +184,6 @@ class NoticeDecision(NoticeSend):
     decided_by: str = ""
 
 
-class SignInRequest(BaseModel):
-    email: str = Field(..., max_length=254)
-
-
-class SavedPortfolioRequest(BaseModel):
-    """Keep a portfolio key in your account — a new one, or the newer key of
-    one already kept (`portfolio_id`)."""
-    key: str = Field(..., min_length=1, max_length=64_000)
-    name: str = Field("", max_length=120)
-    portfolio_id: str = Field("", max_length=40)
-
-
 MAX_PORTFOLIO_RECIPIENTS = 10
 
 
@@ -265,3 +250,41 @@ class SignalDisposition(BaseModel):
     note: str = ""
     decided_by: str = ""
     run_id: str = ""
+
+
+class Credentials(BaseModel):
+    """Email and password, for signing up or in. Checked in accounts.py."""
+    email: str = Field(..., max_length=254)
+    password: str = Field(..., max_length=1024)
+    # Signing up only: what to call the new organisation. Defaults to the
+    # address's domain.
+    organisation: str = Field("", max_length=120)
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(..., max_length=1024)
+    new_password: str = Field(..., max_length=1024)
+
+
+class AccountPortfolio(BaseModel):
+    """The portfolio key kept on the account; empty clears it."""
+    portfolio_key: str = Field("", max_length=64_000)
+
+
+class EmailOnly(BaseModel):
+    email: str = Field(..., max_length=254)
+
+
+class TokenPassword(BaseModel):
+    """A link's token, and the password chosen on the page it opened."""
+    token: str = Field(..., min_length=10, max_length=200)
+    password: str = Field(..., max_length=1024)
+
+
+class InviteRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+    role: Literal["member", "owner"] = "member"
+
+
+class OrganisationRename(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)

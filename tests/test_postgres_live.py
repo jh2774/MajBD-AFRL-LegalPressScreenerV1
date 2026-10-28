@@ -257,9 +257,9 @@ def test_a_lock_is_shared_between_two_connections(pg):
     two.close()
 
 
-def test_consent_unsubscribing_bounces_sends_and_sign_in_behave_the_same_here(pg):
-    """The tables added for the open site, Resend, bounces, notice sends and
-    signing in, through the same calls the app makes."""
+def test_consent_unsubscribing_bounces_and_sends_behave_the_same_here(pg):
+    """The tables added for the open site, Resend, bounces and notice sends,
+    through the same calls the app makes. (Accounts: test_accounts.py's own.)"""
     store = Store(pg, tenant_id="default")
     try:
         sid = store.save_alert_subscription(name="W", emails=["a@agency.gov"],
@@ -289,37 +289,17 @@ def test_consent_unsubscribing_bounces_sends_and_sign_in_behave_the_same_here(pg
                               via="resend", status="sent")
         assert [r["role"] for r in store.notice_sends(["n1"])["n1"]] == ["officer", "copy"]
 
-        store.create_sign_in_link("h1", "me@concord.example", "2999-01-01T00:00:00Z")
-        assert store.sign_in_links_since("me@concord.example", "2000-01-01T00:00:00Z") == 1
-        assert store.use_sign_in_link("h1") == "me@concord.example"
-        assert store.use_sign_in_link("h1") == "", "once only"
-        store.create_session("s1", "me@concord.example", "2999-01-01T00:00:00Z")
-        assert store.session_email("s1") == "me@concord.example"
-        store.end_session("s1")
-        assert store.session_email("s1") == ""
-
         assert store.delete_alert_subscription(sid)
         assert store.optout_by_token(token) is None
     finally:
         store.close()
 
 
-def test_kept_portfolios_and_emailed_ones_behave_the_same_here(pg):
+def test_emailed_portfolios_are_counted_the_same_here(pg):
     store = Store(pg, tenant_id="default")
     try:
-        pid = store.save_portfolio("a@x.example", "W", "KEY1")
-        assert store.save_portfolio("a@x.example", "W2", "KEY2", pid) == pid
-        assert store.save_portfolio("b@x.example", "W", "KEY3", pid) == "", "not theirs"
-        assert store.link_portfolio_alerts(pid, "a@x.example", "sub1")
-        [row] = store.saved_portfolios("a@x.example")
-        assert (row["name"], row["portfolio_key"], row["subscription_id"]) == \
-            ("W2", "KEY2", "sub1")
-        assert store.saved_portfolios("b@x.example") == []
-        store.log_portfolio_email("a@x.example", "W2", ["c@x.example", "d@x.example"],
-                                  "sent")
+        store.log_portfolio_email("a@x.example", "W", ["c@x.example", "d@x.example"], "sent")
         assert store.portfolio_emails_since("a@x.example", "2000-01-01T00:00:00Z") == 2
-        assert store.sign_in_links_since("", "2000-01-01T00:00:00Z") == 0
-        assert store.delete_saved_portfolio(pid, "a@x.example")
-        assert not store.delete_saved_portfolio(pid, "a@x.example")
+        assert store.portfolio_emails_since("b@x.example", "2000-01-01T00:00:00Z") == 0
     finally:
         store.close()

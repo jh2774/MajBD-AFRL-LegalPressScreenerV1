@@ -183,16 +183,18 @@ class Mailer:
     def send(self, to: list[str], subject: str, text: str,
              html: str | None = None,
              personalize: Personalize | None = None,
-             asked_for: bool = False, reply_to: str = "") -> Delivery:
+             redirectable: bool = True, reply_to: str = "") -> Delivery:
         """Send one message per recipient.
 
         `personalize(address)`, when given, returns that address's own
         (text, html, headers) in place of the shared ones — for an unsubscribe
         link that only works for the person it was sent to.
 
-        `asked_for` is for a message its recipient has just asked for, such as
-        a sign-in link. The redirect and ALERTS_SEND=false exist to keep mail
-        from reaching other people too early; neither applies to that.
+        `redirectable=False` is for mail a person asked for about their own
+        account — a password reset, an invitation they are expecting. The
+        pilot redirect exists to keep alerts about named companies from
+        reaching people before someone has read them; sending a reset link to
+        the pilot's inbox instead would only stop the person signing in.
 
         `reply_to`, for a message a person sends through the site, sends replies
         to them rather than to ALERTS_REPLY_TO.
@@ -202,11 +204,11 @@ class Mailer:
         if not recipients:
             return Delivery("failed", [], "No recipients.")
 
-        if self.redirect and not asked_for:
+        if self.redirect and redirectable:
             subject = f"[for {', '.join(recipients)}] {subject}"
             recipients = [self.redirect]
 
-        if self.switched_off and not asked_for:
+        if self.switched_off:
             return Delivery("drafted", recipients,
                             "Sending is switched off (ALERTS_SEND=false).")
         if not self.transport and not self.insisted:

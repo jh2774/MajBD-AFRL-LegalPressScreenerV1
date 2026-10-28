@@ -1,250 +1,263 @@
-"""Accounts: portfolios kept by the address you sign in with, and emailed.
+"""Email-and-password accounts, each with a workspace of its own.
 
-FOCI_SIGN_IN lets people other than the admins sign in. Signing in that way
-gives no admin powers: it keeps your portfolios on the server, so they open on
-any browser and survive the end of a session; ties an alert list to the
-portfolio it is for, so the list follows edits made anywhere; trusts your own
-address on an alert list; and lets you email a portfolio.
-
-No test talks to a mail service: `requests.post` is replaced with a recorder.
+An account owns a tenant, so its screens, notices, watchlists, screening
+settings and alert lists are its own without any change to how those are
+stored. Its portfolio is kept on the account. Keys keep working beside it.
 """
 from __future__ import annotations
 
 import importlib
-import re
-from urllib.parse import quote
 
 import pytest
 from fastapi.testclient import TestClient
-from test_mailer import Post
 
+from foci_screen import accounts, cli
 from foci_screen import portfolio as pf
+from foci_screen.store import Store
 
-ADMIN = "julian@concord.example"
-MEMBER = "analyst@concord.example"
-SITE_HEADER = {"X-FOCI-Session": "1"}
-ENV = ("DATABASE_URL", "REDIS_URL", "GMAIL_ENABLED", "FOCI_EMAIL_REDIRECT_TO", "BREVO_API_KEY",
-       "RESEND_API_KEY", "MAIL_PROVIDER", "SMTP_HOST", "ALERTS_FROM", "ALERTS_SEND",
-       "ALERTS_REPLY_TO", "NOTICES_SEND", "FOCI_PUBLIC", "FOCI_ADMIN_EMAILS", "FOCI_SIGN_IN",
-       "FOCI_PUBLIC_URL", "VERCEL_PROJECT_PRODUCTION_URL")
+WEB = {"X-Foci-Client": "web"}
+PASSWORD = "correct horse battery"
 
-ONE = pf.encode(pf.from_entity_keys("Watch", ["UEI1"]))
-TWO = pf.encode(pf.from_entity_keys("Watch", ["UEI1", "UEI2"]))
 
+# ------------------------------------------------------------------ hashing
+
+def test_a_password_verifies_and_a_wrong_one_does_not():
+    stored = accounts.hash_password(PASSWORD)
+    assert stored.startswith("scrypt$") and PASSWORD not in stored
+    assert accounts.verify_password(PASSWORD, stored)
+    assert not accounts.verify_password(PASSWORD + "!", stored)
+    assert not accounts.verify_password(PASSWORD, "garbage")
+
+
+def test_each_hash_is_salted():
+    assert accounts.hash_password(PASSWORD) != accounts.hash_password(PASSWORD)
+
+
+def test_weaker_parameters_are_marked_for_rehash():
+    assert not accounts.needs_rehash(accounts.hash_password(PASSWORD))
+    assert accounts.needs_rehash("scrypt$1024$8$1$c2FsdA==$ZGlnZXN0")
+
+
+@pytest.mark.parametrize("setting,email,allowed", [
+    ("", "a@agency.gov", False),
+    ("open", "a@agency.gov", True),
+    ("a@agency.gov, b@navy.mil", "a@agency.gov", True),
+    ("a@agency.gov", "c@agency.gov", False),
+    ("@agency.gov", "c@agency.gov", True),
+    ("@agency.gov", "c@notagency.gov", False),
+])
+def test_who_may_sign_up(setting, email, allowed):
+    assert accounts.signup_allowed(setting, email) is allowed
+
+
+# ---------------------------------------------------------------------- API
 
 @pytest.fixture()
-def site(tmp_path, monkeypatch):
-    monkeypatch.setenv("FOCI_DB", str(tmp_path / "a.db"))
-    monkeypatch.setenv("FOCI_CACHE", str(tmp_path / "cache"))
-    monkeypatch.setenv("FOCI_OUT", str(tmp_path / "out"))
-    for name in ENV:
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("FOCI_API_KEYS", "")
-
+def make_client(tmp_path, monkeypatch):
     def make(**env):
-        env = {"FOCI_PUBLIC": "true", "FOCI_ADMIN_EMAILS": ADMIN, "FOCI_SIGN_IN": "anyone",
-               "RESEND_API_KEY": "re_not_real", "ALERTS_FROM": "alerts@contractscreener.com",
-               **env}
-        for k, v in env.items():
+        base = {"FOCI_API_KEYS": "acme:secret-key", "FOCI_DB": str(tmp_path / "api.db"),
+                "FOCI_CACHE": str(tmp_path / "cache"), "FOCI_OUT": str(tmp_path / "out"),
+                "FOCI_SIGNUP": "open", "FOCI_PUBLIC": ""}
+        for k, v in {**base, **env}.items():
             monkeypatch.setenv(k, v)
+        for var in ("DATABASE_URL", "REDIS_URL", "FOCI_PUBLIC_URL"):
+            monkeypatch.delenv(var, raising=False)
         from foci_screen.api import app as app_module
         importlib.reload(app_module)
         return TestClient(app_module.app), app_module
-
     return make
 
 
-def sign_in(c, post, email=MEMBER):
-    c.post("/v1/auth/sign-in", json={"email": email})
-    path = re.search(r"http://testserver(/auth/sign-in/[\w-]+)",
-                     post.calls[-1]["body"]["text"]).group(1)
-    assert c.post(path, follow_redirects=False).status_code == 303
+def signup(c, email="analyst@agency.gov", password=PASSWORD):
+    return c.post("/v1/auth/signup", headers=WEB, json={"email": email, "password": password})
 
 
-def keep(c, key=ONE, **body):
-    return c.post("/v1/me/portfolios", headers=SITE_HEADER, json={"key": key, **body})
+def test_signing_up_signs_in_and_makes_an_empty_workspace(make_client):
+    c, _ = make_client()
+    r = signup(c)
+    assert r.status_code == 201
+    account = r.json()["account"]
+    assert account["email"] == "analyst@agency.gov"
+    assert account["workspace"].startswith("u-") and "password_hash" not in account
+    assert "httponly" in r.headers["set-cookie"].lower()
+
+    status = c.get("/v1/auth/status").json()
+    assert status["signed_in"] and status["account"]["email"] == "analyst@agency.gov"
+    assert c.get("/v1/notices").json()["notices"] == []
 
 
-# ------------------------------------------------------------ who may sign in
+def test_each_account_sees_only_its_own_workspace(make_client):
+    c, app_module = make_client()
+    mine = signup(c).json()["account"]["workspace"]
+    app_module.store_for(mine).create_notice(
+        run_id="r1", entity_key="UEI1", entity_name="MINE LLC", severity="high",
+        recipient="ko@mail.mil", officer_confidence="high", subject="s", body_text="b")
+    app_module.store_for("acme").create_notice(
+        run_id="r1", entity_key="UEI2", entity_name="KEY TENANT LLC", severity="high",
+        recipient="ko@mail.mil", officer_confidence="high", subject="s", body_text="b")
 
-def test_a_member_is_signed_in_but_not_an_admin(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, _ = site()
-    sign_in(c, post)
-    assert c.get("/v1/auth").json() == {"sign_in": True, "members": "anyone",
-                                        "email": MEMBER, "admin": False}
-    r = c.put("/v1/policy", json={}, headers=SITE_HEADER)
-    assert r.status_code == 403 and "admins" in r.json()["detail"]
-    assert c.get("/v1/alerts").json()["can_edit_addresses"] is False
-
-
-def test_sign_in_can_be_limited_to_domains(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, _ = site(FOCI_SIGN_IN="concord.example, @navy.mil")
-    for address in ("a@concord.example", "b@navy.mil", "c@elsewhere.com"):
-        c.post("/v1/auth/sign-in", json={"email": address})
-    assert [x["body"]["to"][0] for x in post.calls] == ["a@concord.example", "b@navy.mil"]
-    assert c.get("/v1/auth").json()["members"] == "@concord.example, @navy.mil"
-
-
-def test_by_default_only_admins_sign_in(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, _ = site(FOCI_SIGN_IN="")
-    c.post("/v1/auth/sign-in", json={"email": MEMBER})
-    c.post("/v1/auth/sign-in", json={"email": ADMIN})
-    assert [x["body"]["to"][0] for x in post.calls] == [ADMIN]
-
-
-def test_links_to_members_are_rationed_across_the_site(site, monkeypatch):
-    from foci_screen.api import signin
-    post = Post(monkeypatch)
-    monkeypatch.setattr(signin, "MEMBER_LINKS_PER_DAY", 2)
-    c, _ = site()
-    for n in range(4):
-        c.post("/v1/auth/sign-in", json={"email": f"person{n}@example.com"})
-    c.post("/v1/auth/sign-in", json={"email": ADMIN})
-    assert [x["body"]["to"][0] for x in post.calls] == \
-        ["person0@example.com", "person1@example.com", ADMIN], "admins are never held back"
-
-
-def test_on_a_closed_site_a_member_may_use_it_but_not_run_it(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, _ = site(FOCI_PUBLIC="")
-    sign_in(c, post)
-    assert c.get("/v1/overview").status_code == 200
-    assert c.delete("/v1/screens/x?confirm=true", headers=SITE_HEADER).status_code == 403
-
-
-# ------------------------------------------------------------ kept portfolios
-
-def test_portfolios_are_kept_by_address_and_survive_the_session(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, _ = site()
-    assert keep(c).status_code == 401, "not signed in"
-    sign_in(c, post)
-    pid = keep(c).json()["portfolio"]["portfolio_id"]
-    assert keep(c, TWO, portfolio_id=pid).json()["portfolio"]["companies"] == 2
-
-    # A new instance of the site — as on Vercel, and as on another day.
-    cookies = dict(c.cookies)
-    later, _ = site()
-    later.cookies.update(cookies)
-    [p] = later.get("/v1/me/portfolios").json()["portfolios"]
-    assert (p["portfolio_id"], p["portfolio_key"], p["companies"]) == (pid, TWO, 2)
-
-
-def test_one_persons_portfolios_are_not_anothers(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, app_module = site()
-    sign_in(c, post)
-    pid = keep(c).json()["portfolio"]["portfolio_id"]
+    assert [n["entity_name"] for n in c.get("/v1/notices").json()["notices"]] == ["MINE LLC"]
 
     other = TestClient(app_module.app)
-    sign_in(other, post, "someone@example.com")
-    assert other.get("/v1/me/portfolios").json()["portfolios"] == []
-    assert keep(other, TWO, portfolio_id=pid).status_code == 404
-    assert other.delete(f"/v1/me/portfolios/{pid}", headers=SITE_HEADER).status_code == 404
-    assert c.delete(f"/v1/me/portfolios/{pid}", headers=SITE_HEADER).status_code == 204
+    signup(other, "colleague@agency.gov")
+    assert other.get("/v1/notices").json()["notices"] == []
+
+    # A key still selects its own tenant.
+    keyed = TestClient(app_module.app).get("/v1/notices", headers={"X-API-Key": "secret-key"})
+    assert [n["entity_name"] for n in keyed.json()["notices"]] == ["KEY TENANT LLC"]
 
 
-def test_an_alert_list_follows_its_portfolio(site, monkeypatch):
-    """Edited on any browser, the list watches the companies the portfolio
-    now holds — and the added company's history is not sent as news."""
-    post = Post(monkeypatch)
-    c, app_module = site()
-    sign_in(c, post)
-    store = app_module.store_for("default")
-    pid = keep(c).json()["portfolio"]["portfolio_id"]
-    sub = c.post("/v1/alerts/subscriptions", headers=SITE_HEADER, json={
-        "name": "Watch", "emails": [MEMBER], "portfolio_key": ONE,
-        "portfolio_id": pid}).json()["subscription"]
-    sid = sub["subscription_id"]
-    assert store.saved_portfolio(pid, MEMBER)["subscription_id"] == sid
+def test_a_change_made_with_the_cookie_must_come_from_the_site(make_client):
+    """Another site's page can make the browser send the cookie, but cannot
+    add the client header without a CORS preflight this server refuses."""
+    c, app_module = make_client()
+    workspace = signup(c).json()["account"]["workspace"]
+    notice_id = app_module.store_for(workspace).create_notice(
+        run_id="r1", entity_key="UEI1", entity_name="X", severity="high",
+        recipient="ko@mail.mil", officer_confidence="high", subject="s", body_text="b")
 
-    store.start_run("DoD", {}, run_id="r1")
-    old = store.create_notice(run_id="r1", entity_key="UEI2", entity_name="B", severity="high",
-                              recipient="", officer_confidence="", subject="s", body_text="b")
-    keep(c, TWO, portfolio_id=pid)
-    assert store.alert_subscription(sid)["companies"] == ["UEI1", "UEI2"]
-    assert f"notice:{old}" in store.alert_already_sent(sid)
-    assert [p["subscription_id"] for p in c.get("/v1/me/portfolios").json()["portfolios"]] \
-        == [sid]
+    forged = c.post(f"/v1/notices/{notice_id}/reject", json={"note": "x"})
+    assert forged.status_code == 403
+    assert app_module.store_for(workspace).get_notice(notice_id)["status"] == "pending"
 
-
-def test_your_own_address_is_not_asked_to_confirm(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, app_module = site()
-    sign_in(c, post)
-    r = c.post("/v1/alerts/subscriptions", headers=SITE_HEADER, json={
-        "name": "Watch", "emails": [f"{MEMBER}, colleague@example.com"],
-        "portfolio_key": ONE}).json()
-    sid = r["subscription"]["subscription_id"]
-    statuses = {k: v["status"] for k, v in
-                app_module.store_for("default").alert_recipients(sid).items()}
-    assert statuses == {MEMBER: "confirmed", "colleague@example.com": "pending"}
-    assert post.calls[-1]["body"]["to"] == ["colleague@example.com"]
-    [listed] = c.get("/v1/alerts").json()["subscriptions"]
-    assert listed["emails"] == [MEMBER, "c•••@example.com"], "your own, in full"
-
-
-def test_adding_a_company_keeps_the_portfolios_name(site):
-    """An edit that does not name the portfolio used to rename it "Portfolio"."""
-    c, _ = site()
-    added = c.post("/v1/portfolio/edit", json={"key": ONE, "add": ["UEI9"]}).json()
-    assert added["name"] == "Watch"
-    assert pf.decode(added["key"]).name == "Watch"
-    fresh = c.post("/v1/portfolio/edit", json={"add": ["UEI9"]}).json()
-    assert fresh["name"] == "Portfolio"
-
-
-# ------------------------------------------------------------ emailing one
-
-def test_emailing_a_portfolio_to_yourself(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, _ = site(FOCI_EMAIL_REDIRECT_TO="pilot@concord.example")
-    sign_in(c, post)
-    r = c.post("/v1/portfolio/email", headers=SITE_HEADER,
-               json={"key": ONE, "to": [MEMBER], "note": "for Monday"}).json()
-    assert r["status"] == "sent" and r["recipients"] == [MEMBER]
-    body = post.calls[-1]["body"]
-    assert body["to"] == [MEMBER], "your own copy is not redirected"
-    assert body["subject"] == "Your portfolio: Watch"
-    assert f"http://testserver/#/portfolio/open/{quote(ONE, safe='')}" in body["text"]
-    assert ONE in body["text"] and "for Monday" in body["text"]
-    assert "UEI1 — not screened on this site yet" in body["text"]
-
-
-def test_emailing_a_portfolio_to_colleagues(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, _ = site()
-    sign_in(c, post)
-    r = c.post("/v1/portfolio/email", headers=SITE_HEADER,
-               json={"key": ONE, "to": ["a@example.com, b@example.com"]}).json()
-    assert r["status"] == "sent"
-    sent = post.calls[-2:]
-    assert [x["body"]["to"] for x in sent] == [["a@example.com"], ["b@example.com"]]
-    assert sent[0]["body"]["subject"] == f"{MEMBER} shared a portfolio: Watch"
-    assert sent[0]["body"]["reply_to"] == MEMBER, "replies reach the person who sent it"
-
-
-def test_emailing_needs_a_sign_in_and_is_rationed(site, monkeypatch):
-    post = Post(monkeypatch)
-    c, app_module = site()
-    assert c.post("/v1/portfolio/email", headers=SITE_HEADER,
-                  json={"key": ONE, "to": [MEMBER]}).status_code == 401
-    sign_in(c, post)
-    monkeypatch.setattr(app_module, "PORTFOLIO_EMAILS_PER_DAY", 3)
-    ok = c.post("/v1/portfolio/email", headers=SITE_HEADER,
-                json={"key": ONE, "to": ["a@example.com, b@example.com"]})
+    ok = c.post(f"/v1/notices/{notice_id}/reject", headers=WEB, json={"note": "fp"})
     assert ok.status_code == 200
-    over = c.post("/v1/portfolio/email", headers=SITE_HEADER,
-                  json={"key": ONE, "to": ["c@example.com, d@example.com"]})
-    assert over.status_code == 429
-    assert c.post("/v1/portfolio/email", headers=SITE_HEADER,
-                  json={"key": ONE, "to": [f"x{n}@example.com" for n in range(11)]}
-                  ).status_code == 422
+    assert c.post("/v1/auth/login", json={"email": "a@b.co", "password": "x"}
+                  ).status_code == 403
 
 
-def test_without_sign_in_there_are_no_accounts(site):
-    c, _ = site(FOCI_ADMIN_EMAILS="", FOCI_SIGN_IN="")
-    assert c.get("/v1/me/portfolios").status_code == 404
+def test_sign_up_is_closed_unless_the_site_says_otherwise(make_client):
+    c, _ = make_client(FOCI_SIGNUP="")
+    assert signup(c).status_code == 403
+    assert c.get("/v1/auth/status").json()["signup"] == "closed"
+
+    c, _ = make_client(FOCI_SIGNUP="@agency.gov")
+    assert signup(c, "someone@elsewhere.example").status_code == 403
+    assert signup(c, "someone@agency.gov").status_code == 201
+
+
+def test_bad_sign_ups_are_refused_with_a_reason(make_client):
+    c, _ = make_client()
+    assert "10 characters" in signup(c, password="short").json()["detail"]
+    assert "valid email" in signup(c, email="not-an-email").json()["detail"]
+    signup(c)
+    assert signup(c).status_code == 409
+
+
+def test_signing_in_and_out(make_client):
+    c, app_module = make_client()
+    signup(c)
+    c.post("/v1/auth/logout", headers=WEB)
+    assert c.get("/v1/auth/status").json()["signed_in"] is False
+
+    fresh = TestClient(app_module.app)
+    r = fresh.post("/v1/auth/login", headers=WEB,
+                   json={"email": "Analyst@Agency.gov ", "password": PASSWORD})
+    assert r.status_code == 200
+    assert fresh.get("/v1/me").json()["account"]["email"] == "analyst@agency.gov"
+
+
+def test_a_wrong_address_and_a_wrong_password_read_the_same(make_client):
+    c, _ = make_client()
+    signup(c)
+    wrong_pw = c.post("/v1/auth/login", headers=WEB,
+                      json={"email": "analyst@agency.gov", "password": "nope-nope-nope"})
+    no_user = c.post("/v1/auth/login", headers=WEB,
+                     json={"email": "nobody@agency.gov", "password": "nope-nope-nope"})
+    assert wrong_pw.status_code == no_user.status_code == 401
+    assert wrong_pw.json() == no_user.json()
+
+
+def test_ten_wrong_passwords_lock_the_account(make_client):
+    c, _ = make_client()
+    signup(c)
+    c.post("/v1/auth/logout", headers=WEB)
+    for _ in range(accounts.MAX_FAILURES):
+        c.post("/v1/auth/login", headers=WEB,
+               json={"email": "analyst@agency.gov", "password": "wrong-wrong-wrong"})
+    locked = c.post("/v1/auth/login", headers=WEB,
+                    json={"email": "analyst@agency.gov", "password": PASSWORD})
+    assert locked.status_code == 429
+
+
+def test_the_portfolio_is_kept_on_the_account(make_client):
+    c, app_module = make_client()
+    signup(c)
+    key = pf.encode(pf.from_entity_keys("Watch", ["UEI123"]))
+    assert c.put("/v1/me/portfolio", headers=WEB, json={"portfolio_key": key}
+                 ).status_code == 200
+    assert c.put("/v1/me/portfolio", headers=WEB, json={"portfolio_key": "junk"}
+                 ).status_code == 400
+
+    elsewhere = TestClient(app_module.app)
+    elsewhere.post("/v1/auth/login", headers=WEB,
+                   json={"email": "analyst@agency.gov", "password": PASSWORD})
+    assert elsewhere.get("/v1/me").json()["account"]["portfolio_key"] == key
+
+
+def test_changing_the_password_ends_every_session(make_client):
+    c, app_module = make_client()
+    signup(c)
+    other = TestClient(app_module.app)
+    other.post("/v1/auth/login", headers=WEB,
+               json={"email": "analyst@agency.gov", "password": PASSWORD})
+
+    assert c.post("/v1/me/password", headers=WEB, json={
+        "current_password": "wrong", "new_password": "a whole new phrase"}
+    ).status_code == 403
+    assert c.post("/v1/me/password", headers=WEB, json={
+        "current_password": PASSWORD, "new_password": "a whole new phrase"}
+    ).status_code == 204
+
+    assert other.get("/v1/auth/status").json()["signed_in"] is False
+    assert other.post("/v1/auth/login", headers=WEB, json={
+        "email": "analyst@agency.gov", "password": "a whole new phrase"}).status_code == 200
+
+
+def test_a_site_with_accounts_but_no_keys_asks_for_sign_in_not_configuration(make_client):
+    c, _ = make_client(FOCI_API_KEYS="")
+    r = c.get("/v1/notices")
+    assert r.status_code == 401 and "Sign in" in r.json()["detail"]
+
+    closed, _ = make_client(FOCI_API_KEYS="", FOCI_SIGNUP="")
+    assert closed.get("/v1/notices").status_code == 503
+
+
+def test_on_a_public_site_an_account_is_admin_of_its_own_workspace(make_client):
+    c, app_module = make_client(FOCI_PUBLIC="true")
+    workspace = signup(c).json()["account"]["workspace"]
+    notice_id = app_module.store_for(workspace).create_notice(
+        run_id="r1", entity_key="UEI1", entity_name="X", severity="high",
+        recipient="ko@mail.mil", officer_confidence="high", subject="s", body_text="b")
+    # Rejecting is admin-only on a public site.
+    assert c.post(f"/v1/notices/{notice_id}/reject", headers=WEB,
+                  json={"note": "fp"}).status_code == 200
+
+    anonymous = TestClient(app_module.app)
+    assert anonymous.post(f"/v1/notices/{notice_id}/reject", headers=WEB,
+                          json={"note": "x"}).status_code in (401, 404)
+
+
+# ---------------------------------------------------------------------- CLI
+
+def test_add_user_can_attach_an_account_to_existing_data(tmp_path, monkeypatch, capsys):
+    db = str(tmp_path / "cli.db")
+
+    class Cfg:
+        dsn = db
+        user_agent = "test/1.0 (ops@agency.gov)"
+
+    monkeypatch.setattr(cli, "get_config", lambda: Cfg())
+    monkeypatch.setenv("FOCI_NEW_PASSWORD", PASSWORD)
+    assert cli.main(["add-user", "Lead@Agency.gov", "--workspace", "default"]) == 0
+    assert "default" in capsys.readouterr().out
+
+    s = Store(db)
+    user = s.user_by_email("lead@agency.gov")
+    assert user["tenant_id"] == "default"
+    assert accounts.verify_password(PASSWORD, user["password_hash"])
+    s.close()
+    assert cli.main(["add-user", "lead@agency.gov"]) == 1        # already exists
+
+    monkeypatch.setenv("FOCI_NEW_PASSWORD", "short")
+    assert cli.main(["add-user", "new@agency.gov"]) == 2

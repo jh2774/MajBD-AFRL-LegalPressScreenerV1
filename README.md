@@ -500,13 +500,12 @@ every night on a deploy that was screening nothing.
 | `GET /v1/notices` | The review queue |
 | `POST /v1/notices/{id}/approve` | The human gate. Records the decision, then sends the notice as `send_to` says: `officer` (the default), `copy` (to `copy_to`), `both` or `none` |
 | `POST /v1/notices/{id}/deliver` | Send an approved notice later — to the officer once at most, a copy to `copy_to` as often as asked |
-| `POST /v1/auth/sign-in` | Email a sign-in link to an admin, or anyone `FOCI_SIGN_IN` lets in (`GET /v1/auth` says who is signed in) |
-| `GET / POST /v1/me/portfolios` | The signed-in person's kept portfolios; keep one, or its newer key (`DELETE …/{id}` forgets it) |
+| `PUT /v1/me/portfolio` | Keep the portfolio on the signed-in account; an alert list on the old key follows to the new one |
 | `POST /v1/portfolio/email` | Email a portfolio to yourself or colleagues (signed in) |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |
 
-**Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset, every
-authenticated route returns 503. A tool that drafts email to federal officials must not be
+**Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset and no
+sign-in accounts (see [Signing in](#signing-in)), every authenticated route returns 503. A tool that drafts email to federal officials must not be
 reachable because someone deployed it before setting a variable.
 
 **Public mode is the deliberate exception.** `FOCI_PUBLIC=true` opens the site to anyone with
@@ -517,22 +516,6 @@ approve or reject a notice, and open the system check; with no key configured th
 address off, and each address they add must confirm before it receives anything
 (`foci_screen/consent.py`). [docs/VERCEL.md](docs/VERCEL.md), "Who can do what", has the
 detail.
-
-**Signing in** (`foci_screen/api/signin.py`) does what a key does, for the addresses in
-`FOCI_ADMIN_EMAILS`, and records the person by name on approvals and sends — a shared key
-records only `api-key:default`. A one-use link is emailed; the session is an HttpOnly,
-SameSite=Lax cookie stored only as a hash, and counts on a change only with the header the
-site's own pages send. It also lets a closed site (no `FOCI_PUBLIC`) be used without handing
-out keys.
-
-**Accounts.** `FOCI_SIGN_IN` (`anyone`, or email domains) lets people other than the admins
-sign in, with no admin powers: their portfolio keys are kept under their address
-(`saved_portfolios`), so a portfolio opens on any browser and outlives the session; an alert
-list started from a kept portfolio follows its edits on the server; their own address is
-trusted on an alert list; and they can email a portfolio — companies, latest severity, a link
-that opens it, and its key (`foci_screen/portfolio_mail.py`) — to themselves or colleagues,
-rationed per person. The key is still the portfolio; the account is where a person's keys
-live.
 
 **Sending notices.** Approved notices go to the contracting officer, a chosen address, or both
 (`foci_screen/notify/notices.py`): through Gmail when `GMAIL_ENABLED`, otherwise through the
@@ -545,6 +528,97 @@ tenants screening the same prime fetch its 10-K once between them.
 
 > The CLI writes as tenant `default`. A key that should see CLI-produced data must map to that
 > tenant (`FOCI_API_KEYS=default:...`), or the web UI will correctly show you an empty database.
+
+### Signing in
+
+People sign in with an email address and password ("Sign in", top right). **Every account
+belongs to exactly one organisation, and the organisation owns the workspace**: its screens,
+notices and their decisions, watchlists, screening settings, rule settings and alert lists.
+Everyone in an organisation shares them; nothing is shared between organisations. Each person's
+portfolio is saved to their account and follows them to any computer. A portfolio built before
+signing in is carried over to an account that has none.
+
+Creating an account creates its organisation, named on the form (or after the address's
+domain), with that person as its **owner**. Owners invite colleagues from the **Organisation**
+page (`#/organisation`), remove them, and rename the organisation; **members** can do
+everything else. An address that already has an account cannot be invited — it belongs to
+its organisation.
+
+**Emails an account is sent**, through the same mail service as alerts (Brevo, Resend or
+SMTP), and always to the person themselves — `FOCI_EMAIL_REDIRECT_TO` does not apply to them:
+
+| Email | Link | Lasts |
+|---|---|---|
+| Confirm your address, on sign-up | `/account/verify/<token>` | 3 days |
+| Reset your password, from "Forgot password?" | `/#/reset/<token>` | 1 hour |
+| An invitation to join an organisation | `/#/join/<token>` | 7 days |
+
+Each link works once, and only a hash of its token is stored. The reset and invitation tokens
+sit after the `#`, which a browser never sends to a server, so they stay out of access logs,
+and a mail scanner that opens the link cannot use it up. "Forgot password?" gives the same
+answer whether or not the address has an account, and an address is sent at most one email of
+a kind every two minutes. Resetting a password confirms the address and signs the account out
+everywhere.
+
+**With no mail service connected** nothing can be emailed. The confirmation and reset links
+are then written to the server log, the one place an operator can fetch them from, and an
+owner who invites someone is shown the invitation link to pass on. Once a mail service is
+connected, links never reach the log.
+
+| Setting | Effect |
+|---|---|
+| `FOCI_SIGNUP` unset (default) | Nobody can create an account from the site. Accounts are made with `foci-screen add-user` |
+| `FOCI_SIGNUP=you@agency.gov,@navy.mil` | Only those addresses, or anyone at those domains, can create one |
+| `FOCI_SIGNUP=open` | Anyone who finds the site can |
+
+Closed by default for the reason the keys live in the environment: a self-service sign-up page
+is the most attacked surface a tool like this has, and an open one lets a stranger run screens
+and set up alert emails on your deployment.
+
+**The first account.** Either list your own address in `FOCI_SIGNUP` and sign up, or, with
+the site's `DATABASE_URL` set locally:
+
+```bash
+foci-screen add-user you@agency.gov --organisation "Concord"   # a new organisation
+foci-screen add-user you@agency.gov --workspace default        # the data already screened
+```
+
+`--workspace default` gives the account what the command line and a `default:` key have
+screened. The password is asked for, never passed as an argument (or read from
+`FOCI_NEW_PASSWORD` in a script).
+
+**Or from the browser, with the admin key** — the way on a host with no command line, such as
+Vercel. Enter the key with "Admin key", then **Create an account**: an account made by someone
+holding a key belongs to that key's workspace, as an owner, whatever `FOCI_SIGNUP` says. The
+key already does everything in that workspace; this gives it a name. The owner then invites
+colleagues from the Organisation page.
+
+**What an account does with a portfolio.** The portfolio is kept on the account, so it opens
+on any computer. An alert list on it follows it: when the account's portfolio changes, the
+server moves every list on the old key to the new one and baselines the added companies, so an
+edit made on another computer still reaches the list. A signed-in person can also email the
+portfolio — its companies, their latest severity, a link that opens it (`#/portfolio/open/…`)
+and its key (`foci_screen/portfolio_mail.py`) — to themselves, or to up to 10 colleagues, who
+see who sent it and whose replies go to them; 25 addresses a day per person. Approvals and
+notice sends are recorded under the signed-in person's address.
+
+**How it is kept safe.**
+* Passwords are hashed with scrypt and a salt per account.
+* The session is a random token in an HttpOnly, SameSite=Lax cookie, Secure over HTTPS. Only
+  a hash of the token is stored, so a copy of the database holds no working session.
+* A change made with the cookie must carry a header only the site's own pages send, which
+  closes cross-site request forgery.
+* Ten wrong passwords lock an account for fifteen minutes. A wrong address and a wrong
+  password take the same time and give the same answer, so the form does not reveal who has
+  an account.
+* Changing the password ends every session the account has.
+
+Sessions last 30 days.
+
+Keys keep working beside accounts: the daily scheduled check, the command line and scripts
+use them as before, and a key still selects its own tenant. On a public site
+(`FOCI_PUBLIC`), anyone signed out uses the shared workspace, and a signed-in account is
+admin of its own.
 
 ## The web application
 

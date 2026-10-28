@@ -21,9 +21,10 @@ or changes the site for everyone, and for the one action that emails a federal
 official — see `make_admin_dependency`. Alert emails need no key because each
 address has to confirm before it receives one (`consent`).
 
-**Signing in** (`signin.py`, when FOCI_ADMIN_EMAILS lists anyone) does what a
-key does, as the default tenant, and names the person. Each dependency takes
-`session`, which answers who a request is signed in as.
+**Signed-in accounts** (`accounts.py`) come first in every dependency here: a
+live session cookie selects the account's own tenant, and its holder is the
+admin of that workspace. Keys work exactly as before for anything without a
+session — the scheduled check, the command line, scripts.
 """
 from __future__ import annotations
 
@@ -31,6 +32,10 @@ import secrets
 from collections.abc import Callable
 
 from fastapi import Header, HTTPException, Request, status
+
+# Request -> the signed-in account's tenant, or "". Supplied by the app, which
+# owns the database; None where accounts are not wired in (tests of keys alone).
+SessionLookup = Callable[[Request], str] | None
 
 CLOSED_DETAIL = (
     "FOCI_API_KEYS is not set, so the API is closed and no data can be read. "
@@ -90,29 +95,15 @@ def resolve_tenant(keymap: dict[str, str], presented: str) -> str:
 
 
 ADMIN_NEEDED = (
-    "This needs the site's admin key or a sign-in: it removes recorded work, "
-    "changes how the site screens for everyone, or emails a federal official. "
-    "Use the button at the top right.")
+    "This needs the site's admin key: it removes recorded work, changes how the "
+    "site screens for everyone, or emails a federal official. Enter the key with "
+    "\"Admin key\" at the top right.")
 
 ADMIN_UNSET = (
     "This needs an admin key, and this site has none. It is open to anyone with "
     "its address (FOCI_PUBLIC), so removing recorded work, changing how the site "
     "screens and approving notices are switched off until FOCI_API_KEYS is set "
-    "to a key for whoever looks after it, or FOCI_ADMIN_EMAILS lists who may sign "
-    "in.")
-
-MEMBER_NOT_ADMIN = (
-    "You are signed in, but this needs one of the site's admins (FOCI_ADMIN_EMAILS) or "
-    "the admin key: it removes recorded work, changes how the site screens for "
-    "everyone, or emails a federal official.")
-
-# Who a request is signed in as, and whether that person is an admin; ("",
-# False) for nobody. Supplied by the app (signin.SignIn.session).
-Session = Callable[[Request], tuple[str, bool]]
-
-
-def _nobody(_request: Request) -> tuple[str, bool]:
-    return "", False
+    "to a key for whoever looks after it.")
 
 
 def _presented(authorization: str, x_api_key: str) -> str:
@@ -122,21 +113,23 @@ def _presented(authorization: str, x_api_key: str) -> str:
     return presented
 
 
-def make_dependency(keymap: dict[str, str], public: bool = False,
-                    session: Session = _nobody, sign_in: bool = False):
-    """Build the FastAPI dependency that yields a tenant id.
+SIGN_IN_DETAIL = "Sign in, or supply a key in Authorization: Bearer <key> or X-API-Key."
 
-    On a closed site anyone signed in may read and use it, admin or not —
-    who may sign in at all is FOCI_SIGN_IN's business. `sign_in` says whether
-    anyone may, which keeps a closed site with no keys from reporting itself
-    as unconfigured.
-    """
+
+def make_dependency(keymap: dict[str, str], public: bool = False,
+                    session: SessionLookup = None,
+                    accounts_possible: Callable[[], bool] | None = None):
+    """Build the FastAPI dependency that yields a tenant id."""
 
     async def require_tenant(
         request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> str:
+        if session is not None:
+            tenant = session(request)
+            if tenant:
+                return tenant
         presented = _presented(authorization, x_api_key)
         if public:
             # No key needed. A known one still selects its tenant; an unknown
@@ -145,9 +138,8 @@ def make_dependency(keymap: dict[str, str], public: bool = False,
             return (resolve_tenant(keymap, presented) if presented else "") \
                 or DEFAULT_TENANT
 
-        if not presented and session(request)[0]:
-            return DEFAULT_TENANT
-        if not keymap and not sign_in:
+        signing_in = accounts_possible is not None and accounts_possible()
+        if not keymap and not signing_in:
             # Say how to fix it. The symptom otherwise is a web page that shows
             # nothing, which looks like missing data rather than missing config.
             raise HTTPException(
@@ -157,9 +149,8 @@ def make_dependency(keymap: dict[str, str], public: bool = False,
         if not presented:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Sign in, or supply a key in Authorization: Bearer <key> or "
-                       "X-API-Key." if sign_in else
-                       "Supply a key in Authorization: Bearer <key> or X-API-Key.",
+                detail=SIGN_IN_DETAIL if signing_in else
+                "Supply a key in Authorization: Bearer <key> or X-API-Key.",
                 headers={"WWW-Authenticate": "Bearer"})
 
         tenant = resolve_tenant(keymap, presented)
@@ -172,62 +163,53 @@ def make_dependency(keymap: dict[str, str], public: bool = False,
 
 
 def make_admin_dependency(keymap: dict[str, str], public: bool = False,
-                          session: Session = _nobody, sign_in: bool = False):
+                          session: SessionLookup = None,
+                          accounts_possible: Callable[[], bool] | None = None):
     """The dependency for routes that remove recorded work, change how the
     site screens for everyone, or email a federal official.
 
-    Any key will do, as it always has, or a sign-in by an admin. Someone
-    signed in who is not an admin is told so (403) rather than asked to sign
-    in. With neither keys nor sign-in configured, a public site has these
-    routes closed (403) and a closed site is closed altogether (503).
+    Outside public mode every caller already holds a key, and any key will
+    do, as before. In public mode a key from FOCI_API_KEYS is required; with
+    none configured these routes are closed (403), not opened. A signed-in
+    account is admin of its own workspace either way: nobody else's work is
+    in it.
     """
+    if not public:
+        return make_dependency(keymap, session=session,
+                               accounts_possible=accounts_possible)
 
     async def require_admin(
         request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> str:
-        presented = _presented(authorization, x_api_key)
-        if presented:
-            tenant = resolve_tenant(keymap, presented)
+        if session is not None:
+            tenant = session(request)
             if tenant:
                 return tenant
+        if not keymap:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ADMIN_UNSET)
+        presented = _presented(authorization, x_api_key)
+        tenant = resolve_tenant(keymap, presented) if presented else ""
+        if not tenant:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="That admin key is not one this site knows. Check it at the top "
-                       "right." if public else "Unknown API key.",
+                detail=ADMIN_NEEDED if not presented else "That admin key is not "
+                       "one this site knows. Check it under \"Admin key\".",
                 headers={"WWW-Authenticate": "Bearer"})
-        email, admin = session(request)
-        if admin:
-            return DEFAULT_TENANT
-        if email:
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                detail=MEMBER_NOT_ADMIN)
-        if not keymap and not sign_in:
-            if public:
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
-                                    detail=ADMIN_UNSET)
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                                detail=CLOSED_DETAIL)
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ADMIN_NEEDED if public else
-            "Sign in, or supply a key in Authorization: Bearer <key> or X-API-Key."
-            if sign_in else "Supply a key in Authorization: Bearer <key> or X-API-Key.",
-            headers={"WWW-Authenticate": "Bearer"})
+        return tenant
 
     return require_admin
 
 
 def make_admin_flag(keymap: dict[str, str], public: bool = False,
-                    session: Session = _nobody):
-    """A dependency answering whether this request carries a known key or an
-    admin's sign-in.
+                    session: SessionLookup = None):
+    """A dependency answering whether this request carries a known key.
 
-    It decides what is shown of other people's email addresses, and whether
-    an address added to an alert list is trusted without confirming. On a
-    closed site a key holder counts, as everyone there used to; someone
-    signed in counts only if they are an admin.
+    Always yes outside public mode, where a request without one never gets
+    this far. In public mode it decides what a visitor is shown of other
+    people's email addresses, and whether an address they add is trusted
+    without confirming.
     """
 
     async def is_admin(
@@ -235,12 +217,11 @@ def make_admin_flag(keymap: dict[str, str], public: bool = False,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> bool:
+        if not public:
+            return True
+        if session is not None and session(request):
+            return True
         presented = _presented(authorization, x_api_key)
-        if presented:
-            return bool(resolve_tenant(keymap, presented))
-        email, admin = session(request)
-        if email:
-            return admin
-        return not public
+        return bool(presented and resolve_tenant(keymap, presented))
 
     return is_admin

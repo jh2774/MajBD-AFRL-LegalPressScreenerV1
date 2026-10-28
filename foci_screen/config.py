@@ -224,14 +224,12 @@ class Config:
     # that remove work or change the site for everyone (see api.auth). Off
     # unless set, so a deployment is never opened by accident.
     public: bool = field(default_factory=lambda: _flag("FOCI_PUBLIC", False))
-    # Who may sign in by email, comma separated. Signing in does what the admin
-    # key does, and records the person by name (api/signin.py). Empty: no
-    # sign-in, and the key alone.
-    admin_emails: str = field(default_factory=lambda: _env("FOCI_ADMIN_EMAILS"))
-    # Who else may sign in, to keep portfolios in an account and email them:
-    # "anyone", or email domains ("concordgroup.com, navy.mil"). Empty: only
-    # the admins above. Signing in this way gives no admin powers.
-    sign_in: str = field(default_factory=lambda: _env("FOCI_SIGN_IN"))
+    # Who may create an account on the sign-in page (see accounts.py): "open"
+    # for anyone, or a comma-separated list of addresses and "@domain"s. Empty,
+    # the default, means nobody: accounts are then made with
+    # `foci-screen add-user`, so a fresh deployment never takes sign-ups from
+    # whoever finds it first.
+    signup: str = field(default_factory=lambda: _env("FOCI_SIGNUP"))
     cors_origins: str = field(default_factory=lambda: _env("FOCI_CORS_ORIGINS"))
 
     # --- HTTP behaviour ---
@@ -299,21 +297,6 @@ class Config:
     @property
     def api_key_list(self) -> list[str]:
         return [k.strip() for k in self.api_keys.split(",") if k.strip()]
-
-    @property
-    def admin_email_list(self) -> list[str]:
-        return list(dict.fromkeys(
-            e.strip().lower() for e in self.admin_emails.replace(";", ",").split(",")
-            if "@" in e))
-
-    @property
-    def sign_in_rule(self) -> tuple[bool, list[str]]:
-        """(anyone may sign in, the email domains that may) from FOCI_SIGN_IN."""
-        raw = self.sign_in.strip().lower()
-        if raw in ("anyone", "everyone", "all", "*"):
-            return True, []
-        domains = [d.strip().lstrip("@") for d in raw.replace(";", ",").split(",")]
-        return False, [d for d in domains if "." in d]
 
     @property
     def cors_origin_list(self) -> list[str]:
