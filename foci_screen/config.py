@@ -224,6 +224,12 @@ class Config:
     # that remove work or change the site for everyone (see api.auth). Off
     # unless set, so a deployment is never opened by accident.
     public: bool = field(default_factory=lambda: _flag("FOCI_PUBLIC", False))
+    # Who may create an account on the sign-in page (see accounts.py): "open"
+    # for anyone, or a comma-separated list of addresses and "@domain"s. Empty,
+    # the default, means nobody: accounts are then made with
+    # `foci-screen add-user`, so a fresh deployment never takes sign-ups from
+    # whoever finds it first.
+    signup: str = field(default_factory=lambda: _env("FOCI_SIGNUP"))
     cors_origins: str = field(default_factory=lambda: _env("FOCI_CORS_ORIGINS"))
 
     # --- HTTP behaviour ---

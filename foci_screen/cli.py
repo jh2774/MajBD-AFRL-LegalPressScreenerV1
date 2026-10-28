@@ -276,6 +276,44 @@ def cmd_mail_suppressions(args, cfg) -> int:
         store.close()
 
 
+def cmd_add_user(args, cfg) -> int:
+    """Create a sign-in account. The way in when FOCI_SIGNUP is closed."""
+    import getpass
+    import os
+
+    from . import accounts
+
+    try:
+        email = accounts.normalise_email(args.email)
+    except accounts.AccountError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    # From the environment for scripts; otherwise asked for, never an
+    # argument, where the shell would keep it in its history.
+    password = os.environ.get("FOCI_NEW_PASSWORD") or getpass.getpass(
+        f"Password for {email}: ")
+    try:
+        accounts.check_password(password)
+    except accounts.AccountError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    tenant = args.workspace or accounts.new_tenant_id()
+    store = Store(cfg.dsn)
+    try:
+        store.create_user(email=email, password_hash=accounts.hash_password(password),
+                          tenant_id=tenant, role="owner", organisation=args.organisation,
+                          verified=True)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        store.close()
+    print(f"Created {email}, with workspace \"{tenant}\""
+          + (" — the data already screened under that name is theirs to see."
+             if args.workspace else " (new and empty)."))
+    return 0
+
+
 def cmd_copy_db(args, cfg) -> int:
     """Copy every table from one database to another — for moving hosts."""
     import os
@@ -401,6 +439,17 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--complaint", action="store_true",
                    help="allow --clear to lift a spam complaint (only if they asked)")
     m.set_defaults(func=cmd_mail_suppressions)
+
+    u = sub.add_parser("add-user", help="create a sign-in account (email and password)")
+    u.add_argument("email")
+    u.add_argument("--workspace", metavar="TENANT",
+                   help='attach the account to existing data, e.g. "default" for what '
+                        "the command line and API keys have screened (default: a new, "
+                        "empty workspace)")
+    u.add_argument("--organisation", metavar="NAME", default="",
+                   help="name of the organisation, when it is a new one (default: the "
+                        "address's domain)")
+    u.set_defaults(func=cmd_add_user)
 
     c = sub.add_parser(
         "copy-db", help="copy every table to another database, for moving hosts",

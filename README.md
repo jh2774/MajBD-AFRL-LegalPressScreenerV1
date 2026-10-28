@@ -462,8 +462,8 @@ every night on a deploy that was screening nothing.
 | `POST /v1/notices/{id}/deliver` | Try again for an approved notice that has not reached Gmail |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |
 
-**Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset, every
-authenticated route returns 503. A tool that drafts email to federal officials must not be
+**Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset and no
+sign-in accounts (see [Signing in](#signing-in)), every authenticated route returns 503. A tool that drafts email to federal officials must not be
 reachable because someone deployed it before setting a variable.
 
 **Public mode is the deliberate exception.** `FOCI_PUBLIC=true` opens the site to anyone with
@@ -481,6 +481,82 @@ tenants screening the same prime fetch its 10-K once between them.
 
 > The CLI writes as tenant `default`. A key that should see CLI-produced data must map to that
 > tenant (`FOCI_API_KEYS=default:...`), or the web UI will correctly show you an empty database.
+
+### Signing in
+
+People sign in with an email address and password ("Sign in", top right). **Every account
+belongs to exactly one organisation, and the organisation owns the workspace**: its screens,
+notices and their decisions, watchlists, screening settings, rule settings and alert lists.
+Everyone in an organisation shares them; nothing is shared between organisations. Each person's
+portfolio is saved to their account and follows them to any computer. A portfolio built before
+signing in is carried over to an account that has none.
+
+Creating an account creates its organisation, named on the form (or after the address's
+domain), with that person as its **owner**. Owners invite colleagues from the **Organisation**
+page (`#/organisation`), remove them, and rename the organisation; **members** can do
+everything else. An address that already has an account cannot be invited — it belongs to
+its organisation.
+
+**Emails an account is sent**, through the same mail service as alerts (Brevo, Resend or
+SMTP), and always to the person themselves — `FOCI_EMAIL_REDIRECT_TO` does not apply to them:
+
+| Email | Link | Lasts |
+|---|---|---|
+| Confirm your address, on sign-up | `/account/verify/<token>` | 3 days |
+| Reset your password, from "Forgot password?" | `/#/reset/<token>` | 1 hour |
+| An invitation to join an organisation | `/#/join/<token>` | 7 days |
+
+Each link works once, and only a hash of its token is stored. The reset and invitation tokens
+sit after the `#`, which a browser never sends to a server, so they stay out of access logs,
+and a mail scanner that opens the link cannot use it up. "Forgot password?" gives the same
+answer whether or not the address has an account, and an address is sent at most one email of
+a kind every two minutes. Resetting a password confirms the address and signs the account out
+everywhere.
+
+**With no mail service connected** nothing can be emailed. The confirmation and reset links
+are then written to the server log, the one place an operator can fetch them from, and an
+owner who invites someone is shown the invitation link to pass on. Once a mail service is
+connected, links never reach the log.
+
+| Setting | Effect |
+|---|---|
+| `FOCI_SIGNUP` unset (default) | Nobody can create an account from the site. Accounts are made with `foci-screen add-user` |
+| `FOCI_SIGNUP=you@agency.gov,@navy.mil` | Only those addresses, or anyone at those domains, can create one |
+| `FOCI_SIGNUP=open` | Anyone who finds the site can |
+
+Closed by default for the reason the keys live in the environment: a self-service sign-up page
+is the most attacked surface a tool like this has, and an open one lets a stranger run screens
+and set up alert emails on your deployment.
+
+**The first account.** Either list your own address in `FOCI_SIGNUP` and sign up, or, with
+the site's `DATABASE_URL` set locally:
+
+```bash
+foci-screen add-user you@agency.gov --organisation "Concord"   # a new organisation
+foci-screen add-user you@agency.gov --workspace default        # the data already screened
+```
+
+`--workspace default` gives the account what the command line and a `default:` key have
+screened. The password is asked for, never passed as an argument (or read from
+`FOCI_NEW_PASSWORD` in a script).
+
+**How it is kept safe.**
+* Passwords are hashed with scrypt and a salt per account.
+* The session is a random token in an HttpOnly, SameSite=Lax cookie, Secure over HTTPS. Only
+  a hash of the token is stored, so a copy of the database holds no working session.
+* A change made with the cookie must carry a header only the site's own pages send, which
+  closes cross-site request forgery.
+* Ten wrong passwords lock an account for fifteen minutes. A wrong address and a wrong
+  password take the same time and give the same answer, so the form does not reveal who has
+  an account.
+* Changing the password ends every session the account has.
+
+Sessions last 30 days.
+
+Keys keep working beside accounts: the daily scheduled check, the command line and scripts
+use them as before, and a key still selects its own tenant. On a public site
+(`FOCI_PUBLIC`), anyone signed out uses the shared workspace, and a signed-in account is
+admin of its own.
 
 ## The web application
 

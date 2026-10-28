@@ -59,6 +59,425 @@ function showError(err) {
     <div class="muted" style="margin-top:6px">${esc(err.message || err)}</div></div>`;
 }
 
+/* ---------------------------------------------------------------- accounts */
+
+/* The signed-in account, or null. Set before the first page is drawn, so a
+ * page never shows the browser's portfolio and then swaps in the account's. */
+let account = null;
+let authStatus = null;
+
+function notSignedIn() {
+  // Someone holding a key has a wrong key; anyone else needs to sign in.
+  if (!account && !apiKey) {
+    return { title: "Sign in", signIn: true, status: 401,
+             message: "Sign in to see your workspace — use \"Sign in\" at the top right." };
+  }
+  return { title: "Not authorised", status: 401,
+           message: "The API key is missing or wrong. Set it from the top right." };
+}
+
+async function refreshAccount() {
+  try {
+    const res = await fetch("/v1/auth/status", { headers: CLIENT_HEADER });
+    if (!res.ok) return;
+    authStatus = await res.json();
+  } catch {
+    return;
+  }
+  account = authStatus.signed_in ? authStatus.account : null;
+  // A sign-in form left open by a page that asked before signing in finished
+  // would otherwise sit over the signed-in page.
+  const dialog = document.getElementById("account-dialog");
+  if (account && dialog.open && !document.getElementById("account-form").hidden) {
+    dialog.close();
+  }
+  const button = document.getElementById("account-button");
+  button.textContent = account ? account.email : "Sign in";
+  button.title = account ? "Your account" : "Sign in or create an account";
+  // A signed-in account needs no key, and on a site with no keys the button
+  // could only ever be refused; either way it would only confuse.
+  document.getElementById("key-button").hidden =
+    !!account || (!authStatus.keys && !authStatus.public);
+}
+
+async function postAccount(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { ...CLIENT_HEADER, "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try { detail = (await res.json()).detail || detail; } catch { /* not JSON */ }
+    if (Array.isArray(detail)) detail = "Check the email address and password.";
+    throw { message: detail };
+  }
+  return res.status === 204 ? null : res.json();
+}
+
+let accountMode = "signin";
+
+function setAccountMode(mode) {
+  accountMode = mode;
+  const creating = mode === "signup";
+  const forgot = mode === "forgot";
+  const signup = authStatus ? authStatus.signup : "closed";
+  document.getElementById("account-title").textContent =
+    creating ? "Create an account" : forgot ? "Reset your password" : "Sign in";
+  document.getElementById("account-submit").textContent =
+    creating ? "Create account" : forgot ? "Email me a link" : "Sign in";
+  document.getElementById("account-hint").hidden = !creating;
+  document.getElementById("account-org-row").hidden = !creating;
+  document.getElementById("account-password-row").hidden = forgot;
+  document.getElementById("account-forgot-row").hidden = mode !== "signin";
+  document.getElementById("account-note").hidden = true;
+  document.getElementById("account-submit").hidden = false;
+  document.getElementById("account-password").autocomplete =
+    creating ? "new-password" : "current-password";
+  const sw = document.getElementById("account-switch");
+  sw.textContent = creating || forgot ? "Back to sign in" : "Create an account";
+  // Offer it only where the site takes new accounts; elsewhere, say who to ask.
+  sw.hidden = mode === "signin" && signup === "closed";
+  document.getElementById("account-explain").textContent = forgot
+    ? "Enter the address you sign in with. If it has an account, we will email it a "
+      + "link to choose a new password."
+    : creating && signup === "restricted"
+    ? "This site takes new accounts only for addresses its administrator has listed."
+    : signup === "closed" && !creating
+      ? "Accounts on this site are made by its administrator. Your account has its own "
+        + "workspace: your portfolio, screens, notices, watchlists, screening settings "
+        + "and alert lists."
+      : "Your account has its own workspace: your portfolio, screens, notices, "
+        + "watchlists, screening settings and alert lists.";
+  document.getElementById("account-error").hidden = true;
+}
+
+function openAccountDialog() {
+  const dialog = document.getElementById("account-dialog");
+  if (dialog.open) return;
+  const signedIn = !!account;
+  document.getElementById("account-form").hidden = signedIn;
+  document.getElementById("account-panel").hidden = !signedIn;
+  if (signedIn) {
+    document.getElementById("account-who").textContent = account.email;
+    document.getElementById("account-org-name").textContent = account.organisation;
+    document.getElementById("account-role").textContent = `(${account.role})`;
+    document.getElementById("account-unverified").hidden = account.email_verified;
+    document.getElementById("account-resend-status").textContent = "";
+    document.getElementById("account-password-error").hidden = true;
+  } else {
+    setAccountMode("signin");
+  }
+  dialog.showModal();
+  if (!signedIn) document.getElementById("account-email").focus();
+}
+
+/* A portfolio built before signing in is not lost by signing in: an account
+ * that has none takes this browser's. */
+async function adoptBrowserPortfolio() {
+  if (!account || account.portfolio_key) return;
+  let local = "";
+  try { local = localStorage.getItem(PORTFOLIO_STORAGE) || ""; } catch { /* blocked */ }
+  if (!local) return;
+  try {
+    await apiSend("PUT", "/v1/me/portfolio", { portfolio_key: local });
+    account.portfolio_key = local;
+  } catch { /* a key the server no longer reads: leave it in the browser */ }
+}
+
+function wireAccountDialog() {
+  const dialog = document.getElementById("account-dialog");
+  const error = document.getElementById("account-error");
+  document.getElementById("account-button").onclick = openAccountDialog;
+  document.getElementById("account-cancel").onclick = () => dialog.close();
+  document.getElementById("account-close").onclick = () => dialog.close();
+  document.getElementById("account-switch").onclick = () =>
+    setAccountMode(accountMode === "signin" ? "signup" : "signin");
+  document.getElementById("account-forgot").onclick = () => setAccountMode("forgot");
+  document.getElementById("account-org-link").onclick = () => dialog.close();
+  document.getElementById("account-resend").onclick = async () => {
+    const status = document.getElementById("account-resend-status");
+    try {
+      const r = await postAccount("/v1/me/verify", {});
+      status.textContent = r.already ? "Already confirmed."
+        : r.email && r.email.sent ? "Sent — check your inbox."
+        : (r.email && r.email.detail) || "Not sent.";
+    } catch (err) {
+      status.textContent = err.message || String(err);
+    }
+  };
+
+  document.getElementById("account-form").onsubmit = async (e) => {
+    e.preventDefault();
+    const submit = document.getElementById("account-submit");
+    const password = document.getElementById("account-password");
+    submit.disabled = true;
+    error.hidden = true;
+    const email = document.getElementById("account-email").value.trim();
+    if (accountMode === "forgot") {
+      try {
+        const r = await postAccount("/v1/auth/forgot", { email });
+        const note = document.getElementById("account-note");
+        note.textContent = r.detail + (r.mail_connected ? "" : " This site has no mail "
+          + "service connected yet, so the link goes to its administrator instead.");
+        note.hidden = false;
+        submit.hidden = true;
+      } catch (err) {
+        error.textContent = err.message || String(err);
+        error.hidden = false;
+      } finally {
+        submit.disabled = false;
+      }
+      return;
+    }
+    try {
+      await postAccount(accountMode === "signup" ? "/v1/auth/signup" : "/v1/auth/login", {
+        email,
+        password: password.value,
+        ...(accountMode === "signup"
+          ? { organisation: document.getElementById("account-org").value.trim() } : {}),
+      });
+      password.value = "";
+      await refreshAccount();
+      await adoptBrowserPortfolio();
+      dialog.close();
+      route();
+      refreshHealth();
+    } catch (err) {
+      error.textContent = err.message || String(err);
+      error.hidden = false;
+    } finally {
+      submit.disabled = false;
+    }
+  };
+
+  document.getElementById("account-signout").onclick = async () => {
+    try { await postAccount("/v1/auth/logout", {}); } catch { /* signed out anyway */ }
+    account = null;
+    dialog.close();
+    await refreshAccount();
+    route();
+  };
+
+  document.getElementById("account-change").onclick = async () => {
+    const box = document.getElementById("account-password-error");
+    box.hidden = true;
+    try {
+      await postAccount("/v1/me/password", {
+        current_password: document.getElementById("account-current").value,
+        new_password: document.getElementById("account-new").value,
+      });
+      // Every session ends with a password change, this one too.
+      account = null;
+      dialog.close();
+      await refreshAccount();
+      openAccountDialog();
+      const note = document.getElementById("account-error");
+      note.textContent = "Password changed. Sign in again with the new one.";
+      note.hidden = false;
+    } catch (err) {
+      box.textContent = err.message || String(err);
+      box.hidden = false;
+    }
+  };
+}
+
+/* The pages a link in an account email opens. Their token is after the "#",
+ * so it is never sent to the server until the form is submitted. */
+function passwordForm(id, label) {
+  return `<label class="field" for="${id}">${esc(label)}</label>
+    <input id="${id}" type="password" autocomplete="new-password" class="text-input"
+           style="width:100%;max-width:360px;display:block;margin-top:6px">
+    <p class="muted" style="font-size:12.5px">At least 10 characters.</p>`;
+}
+
+/* An emailed link can be opened in the tab that asked for it, with the
+ * sign-in dialog still showing; it would cover the form. */
+function closeAccountDialog() {
+  const dialog = document.getElementById("account-dialog");
+  if (dialog.open) dialog.close();
+}
+
+async function viewResetPassword(token) {
+  closeAccountDialog();
+  view.innerHTML = `<div class="page-head"><h1>Choose a new password</h1></div>
+    <div class="card" style="max-width:520px">
+      ${passwordForm("reset-password", "New password")}
+      <div id="reset-error" class="error" hidden></div>
+      <div class="actions"><button class="primary" id="reset-go">Save and sign in</button></div>
+      <p class="muted" style="font-size:12.5px">This signs the account out everywhere else.</p>
+    </div>`;
+  const go = document.getElementById("reset-go");
+  go.onclick = async () => {
+    const box = document.getElementById("reset-error");
+    go.disabled = true;
+    box.hidden = true;
+    try {
+      await postAccount("/v1/auth/reset", {
+        token, password: document.getElementById("reset-password").value });
+      await refreshAccount();
+      location.hash = "#/";
+    } catch (err) {
+      box.textContent = err.message || String(err);
+      box.hidden = false;
+      go.disabled = false;
+    }
+  };
+}
+
+async function viewJoin(token) {
+  closeAccountDialog();
+  setBusy("Opening the invitation…");
+  let invite;
+  try {
+    const res = await fetch(`/v1/auth/invite/${encodeURIComponent(token)}`,
+                            { headers: CLIENT_HEADER });
+    invite = await res.json();
+    if (!res.ok) throw { title: "Invitation not valid", message: invite.detail };
+  } catch (e) {
+    showError(e.title ? e : { title: "Invitation not valid", message: String(e) });
+    return;
+  }
+  if (invite.has_account) {
+    showError({ title: "You already have an account",
+                message: `${invite.email} already has an account, and an account belongs to `
+                         + "one organisation. Sign in with it instead." });
+    return;
+  }
+  view.innerHTML = `<div class="page-head"><h1>Join ${esc(invite.organisation)}</h1>
+      <div class="sub">${esc(invite.invited_by)} invited
+        <span class="mono">${esc(invite.email)}</span> as ${esc(invite.role)}.</div></div>
+    <div class="card" style="max-width:520px">
+      <p class="muted">You will share ${esc(invite.organisation)}'s workspace: its
+      portfolio, screens, notices, watchlists and settings. Choose a password to sign in
+      with.</p>
+      ${passwordForm("join-password", "Password")}
+      <div id="join-error" class="error" hidden></div>
+      <div class="actions"><button class="primary" id="join-go">Join and sign in</button></div>
+    </div>`;
+  const go = document.getElementById("join-go");
+  go.onclick = async () => {
+    const box = document.getElementById("join-error");
+    go.disabled = true;
+    box.hidden = true;
+    try {
+      await postAccount("/v1/auth/join", {
+        token, password: document.getElementById("join-password").value });
+      await refreshAccount();
+      location.hash = "#/";
+    } catch (err) {
+      box.textContent = err.message || String(err);
+      box.hidden = false;
+      go.disabled = false;
+    }
+  };
+}
+
+async function viewOrganisation(notice) {
+  if (!account) {
+    showError({ title: "Sign in", message: "Sign in to see your organisation.", signIn: true });
+    openAccountDialog();
+    return;
+  }
+  setBusy("Loading your organisation…");
+  const org = await api("/v1/org");
+  const members = org.members.map((m) => `<tr>
+      <td class="mono">${esc(m.email)}${m.user_id === org.you ? " <span class=\"muted\">(you)</span>" : ""}</td>
+      <td>${esc(m.role)}</td>
+      <td>${m.email_verified ? "confirmed" : "<span class=\"muted\">not confirmed</span>"}</td>
+      <td class="muted">${m.last_login_at ? esc(day(m.last_login_at)) : "never"}</td>
+      <td>${org.owner && m.user_id !== org.you
+        ? `<button class="ghost remove-member" data-id="${esc(m.user_id)}"
+             data-email="${esc(m.email)}">Remove</button>` : ""}</td></tr>`).join("");
+  const invites = org.invites.map((i) => `<tr>
+      <td class="mono">${esc(i.email)}</td><td>${esc(i.role)}</td>
+      <td class="muted">invited by ${esc(i.invited_by)}, until ${esc(day(i.expires_at))}</td>
+      <td><button class="ghost withdraw-invite" data-email="${esc(i.email)}">Withdraw</button></td>
+    </tr>`).join("");
+  view.innerHTML = `<div class="page-head"><h1>${esc(org.name)}</h1>
+      <div class="sub">Everyone here shares one workspace: the portfolio, screens,
+      notices, watchlists, screening settings and alert lists. Each person belongs to
+      this organisation only.</div></div>
+    ${notice ? `<div class="card">${notice}</div>` : ""}
+    <div class="card"><h2>People</h2>
+      <table><thead><tr><th>Email</th><th>Role</th><th>Address</th><th>Last signed in</th>
+      <th></th></tr></thead><tbody>${members}</tbody></table>
+      <div id="org-error" class="error" hidden></div></div>
+    ${org.owner ? `<div class="card"><h2>Invite someone</h2>
+      <p class="muted">They get an email with a link to choose a password and join. An
+      address that already has an account cannot be invited.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <input id="invite-email" type="email" placeholder="colleague@agency.gov"
+               class="text-input" style="flex:1;min-width:220px">
+        <select id="invite-role" class="text-input"><option value="member">member</option>
+          <option value="owner">owner</option></select>
+        <button class="primary" id="invite-go">Send invitation</button></div>
+      <p class="muted" style="font-size:12.5px">Owners can also invite and remove people
+      and rename the organisation. Members can do everything else.</p>
+      <div id="invite-status" style="margin-top:8px"></div>
+      ${invites ? `<h3 style="margin-top:14px">Open invitations</h3>
+        <table><tbody>${invites}</tbody></table>` : ""}</div>
+    <div class="card"><h2>Name</h2>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input id="org-name" type="text" value="${esc(org.name)}" class="text-input"
+               style="flex:1;min-width:220px">
+        <button id="org-rename">Rename</button></div></div>` : ""}`;
+
+  const fail = (err) => {
+    const box = document.getElementById("org-error");
+    box.textContent = err.message || String(err);
+    box.hidden = false;
+  };
+  view.querySelectorAll(".remove-member").forEach((b) => {
+    b.onclick = async () => {
+      // Two clicks rather than a confirm(): a browser dialog blocks the page.
+      if (b.dataset.armed !== "1") {
+        b.dataset.armed = "1";
+        b.textContent = `Remove ${b.dataset.email}?`;
+        return;
+      }
+      try {
+        await apiSend("DELETE", `/v1/org/members/${encodeURIComponent(b.dataset.id)}`);
+        viewOrganisation();
+      } catch (err) { fail(err); }
+    };
+  });
+  view.querySelectorAll(".withdraw-invite").forEach((b) => {
+    b.onclick = async () => {
+      try {
+        await apiSend("DELETE", `/v1/org/invites/${encodeURIComponent(b.dataset.email)}`);
+        viewOrganisation();
+      } catch (err) { fail(err); }
+    };
+  });
+  const inviteGo = document.getElementById("invite-go");
+  if (inviteGo) inviteGo.onclick = async () => {
+    const status = document.getElementById("invite-status");
+    inviteGo.disabled = true;
+    try {
+      const r = await apiPost("/v1/org/invites", {
+        email: document.getElementById("invite-email").value.trim(),
+        role: document.getElementById("invite-role").value });
+      viewOrganisation(r.delivery.sent
+        ? `Invitation emailed to <span class="mono">${esc(r.email)}</span>.`
+        : `<strong>The invitation is ready.</strong>
+           ${esc(r.delivery.detail)} Send <span class="mono">${esc(r.email)}</span>
+           this link yourself — it works once, for 7 days:<div class="code" style="margin-top:8px;word-break:break-all">${esc(r.link)}</div>`);
+    } catch (err) {
+      status.innerHTML = `<div class="error">${esc(err.message || String(err))}</div>`;
+      inviteGo.disabled = false;
+    }
+  };
+  const rename = document.getElementById("org-rename");
+  if (rename) rename.onclick = async () => {
+    try {
+      await apiSend("PUT", "/v1/org", { name: document.getElementById("org-name").value });
+      await refreshAccount();
+      viewOrganisation("Renamed.");
+    } catch (err) { fail(err); }
+  };
+}
+
 /* --------------------------------------------------------------- API client */
 
 const KEY_STORAGE = "foci.apikey";
@@ -69,12 +488,17 @@ try {
   // Private mode or blocked storage: the key just will not persist.
 }
 
+/* Sent with every request. With a sign-in cookie, the server accepts a
+ * change only when this header is present, which another site's page cannot
+ * add — that is what stops it acting on a signed-in person's behalf. */
+const CLIENT_HEADER = { "X-Foci-Client": "web" };
+
 async function api(path) {
   const res = await fetch(path, {
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+    headers: { ...CLIENT_HEADER, ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
   });
   if (res.status === 401) {
-    throw { title: "Not authorised", message: "The API key is missing or wrong. Set it from the top right." };
+    throw notSignedIn();
   }
   if (res.status === 503) {
     // The server's detail names the variable and how to set it; repeating a
@@ -102,6 +526,7 @@ async function apiSend(method, path, body) {
   const res = await fetch(path, {
     method,
     headers: {
+      ...CLIENT_HEADER,
       ...(body ? { "Content-Type": "application/json" } : {}),
       ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
@@ -131,6 +556,7 @@ async function apiPost(path, body) {
   const res = await fetch(path, {
     method: "POST",
     headers: {
+      ...CLIENT_HEADER,
       "Content-Type": "application/json",
       ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
     },
@@ -521,7 +947,22 @@ function firstRunPanel() {
       <span class="mono">DATABASE_URL</span> (works on any plan).</p>
     </div>` : ""}
 
-    <div class="card">
+    ${account ? `<div class="card">
+      <h2>Your workspace is empty</h2>
+      <p class="muted">Nothing has been screened in your account yet — which is a
+      different thing from a screen that found nothing. To start:</p>
+      <ul class="muted">
+        <li><strong>One contractor:</strong> search for it in the box at the top. If it
+        has not been screened, the results offer to screen it now.</li>
+        <li><strong>A whole agency, on a schedule:</strong> add it on the
+        <a href="#/watchlists">Watchlists</a> page.</li>
+        <li><strong>Companies you already follow:</strong> build a
+        <a href="#/portfolio">portfolio</a>; it is saved to your account.</li>
+      </ul>
+      <p class="muted">Expect minutes, not seconds. The first screen is a
+      <strong>baseline</strong>: it records what each document looks like now. From
+      the second on, findings are about what changed.</p>
+    </div>` : `<div class="card">
       <h2>No screens have run</h2>
       <p class="muted">The API is answering and your key works — this database
       is simply empty, which is a different thing from a screen that found
@@ -538,7 +979,7 @@ function firstRunPanel() {
       <p class="muted">Findings are scoped to the tenant that wrote them. The
       command line writes as <code>default</code>, so screens run there are
       invisible here unless your key names that tenant.</p>
-    </div>`;
+    </div>`}`;
 }
 
 /* With a portfolio saved, the overview is that portfolio. Without one it shows
@@ -2407,7 +2848,11 @@ async function downloadNotice(id) {
  * letting someone discover it. */
 const PORTFOLIO_STORAGE = "foci.portfolio";
 
+/* Signed in, the portfolio is the account's: read from it, and saved to it
+ * on every change, so it is there on the next computer. Signed out, it is
+ * this browser's, as before. */
 function savedPortfolioKey() {
+  if (account) return account.portfolio_key || "";
   try {
     return localStorage.getItem(PORTFOLIO_STORAGE) || "";
   } catch {
@@ -2416,6 +2861,13 @@ function savedPortfolioKey() {
 }
 
 function rememberPortfolioKey(key) {
+  if (account) {
+    account.portfolio_key = key || "";
+    apiSend("PUT", "/v1/me/portfolio", { portfolio_key: key || "" }).catch((e) => {
+      console.warn("could not save the portfolio to the account", e);
+    });
+    return;
+  }
   try {
     if (key) localStorage.setItem(PORTFOLIO_STORAGE, key);
     else localStorage.removeItem(PORTFOLIO_STORAGE);
@@ -3716,6 +4168,9 @@ async function viewWatchlists(notes) {
 
 const ROUTES = [
   [/^\/?$/, () => viewOverview()],
+  [/^\/reset\/([\w-]+)$/, (t) => viewResetPassword(t)],
+  [/^\/join\/([\w-]+)$/, (t) => viewJoin(t)],
+  [/^\/organisation$/, () => viewOrganisation()],
   [/^\/search\/([^/]*)(?:\/([^/]*))?(?:\/(\d+))?$/,
    (q, k, off) => viewSearch(decodeURIComponent(q), k, off)],
   [/^\/entity\/(.+)$/, (k, params) => viewEntity(decodeURIComponent(k), params)],
@@ -3756,6 +4211,7 @@ async function route() {
         await handler(...m.slice(1), params);
       } catch (e) {
         showError(e);
+        if (e && e.signIn) openAccountDialog();
       }
       refreshBadge();
       return;
@@ -3976,5 +4432,8 @@ keyDialog.addEventListener("close", () => {
 });
 
 window.addEventListener("hashchange", route);
-route();
-refreshHealth();
+wireAccountDialog();
+refreshAccount().finally(() => {
+  route();
+  refreshHealth();
+});

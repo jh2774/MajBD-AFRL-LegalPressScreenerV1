@@ -27,7 +27,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import aliases
@@ -244,6 +244,51 @@ CREATE TABLE IF NOT EXISTS mail_suppressions (
     first_at     TEXT NOT NULL,
     last_at      TEXT NOT NULL,
     events       INTEGER NOT NULL DEFAULT 1
+);
+-- An organisation owns a workspace: its tenant_id is the tenant everything
+-- screened, decided and set up by its people is kept under.
+CREATE TABLE IF NOT EXISTS organisations (
+    tenant_id    TEXT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
+-- Sign-in accounts (accounts.py). Not tenant-scoped: an account is what
+-- selects the tenant. Each belongs to exactly one organisation, and holds the
+-- portfolio key that used to live only in one browser.
+CREATE TABLE IF NOT EXISTS users (
+    user_id      TEXT PRIMARY KEY,
+    email        TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL,
+    role         TEXT NOT NULL DEFAULT 'owner',
+    portfolio_key TEXT,
+    created_at   TEXT NOT NULL,
+    email_verified_at TEXT,
+    last_login_at TEXT,
+    failed_logins INTEGER NOT NULL DEFAULT 0,
+    locked_until TEXT
+);
+-- The links sent by email for an account: confirm an address, reset a
+-- password, join an organisation. Stored by a hash, like sessions, so the
+-- database never holds a usable link; each works once and expires.
+CREATE TABLE IF NOT EXISTS account_tokens (
+    token_hash   TEXT PRIMARY KEY,
+    purpose      TEXT NOT NULL,
+    email        TEXT NOT NULL,
+    user_id      TEXT,
+    tenant_id    TEXT,
+    role         TEXT,
+    invited_by   TEXT,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL,
+    used_at      TEXT
+);
+-- Signed-in sessions, by a hash of the cookie's token, never the token.
+CREATE TABLE IF NOT EXISTS user_sessions (
+    token_hash   TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    expires_at   TEXT NOT NULL
 );
 -- Every email composed, sent or not, with exactly what it said.
 CREATE TABLE IF NOT EXISTS alert_deliveries (
@@ -1561,6 +1606,164 @@ class Store:
             c.execute("DELETE FROM alert_recipients WHERE subscription_id=?",
                       (subscription_id,))
         return True
+
+    # ----------------------------------------------------------- accounts
+    # Not tenant-scoped: called on any Store, they read the shared tables.
+
+    def create_user(self, *, email: str, password_hash: str, tenant_id: str,
+                    role: str = "owner", organisation: str = "",
+                    verified: bool = False) -> dict:
+        """Returns the new account. Raises ValueError if the address is taken.
+
+        The organisation is created with the account when it does not exist
+        yet, named `organisation` (or after the address's domain).
+        """
+        if self.user_by_email(email):
+            raise ValueError("An account with that email address already exists.")
+        user_id = uuid.uuid4().hex[:16]
+        now = _now()
+        with self._tx() as c:
+            if self.organisation(tenant_id) is None:
+                c.execute("INSERT INTO organisations (tenant_id, name, created_at)"
+                          " VALUES (?,?,?) ON CONFLICT (tenant_id) DO NOTHING",
+                          (tenant_id, organisation.strip()
+                           or email.rsplit("@", 1)[-1], now))
+            c.execute("INSERT INTO users (user_id, email, password_hash, tenant_id, role,"
+                      " created_at, email_verified_at) VALUES (?,?,?,?,?,?,?)",
+                      (user_id, email, password_hash, tenant_id, role, now,
+                       now if verified else None))
+        return self.user_by_id(user_id)
+
+    def organisation(self, tenant_id: str) -> dict | None:
+        return self._one("SELECT * FROM organisations WHERE tenant_id=?", (tenant_id,))
+
+    def rename_organisation(self, tenant_id: str, name: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE organisations SET name=? WHERE tenant_id=?",
+                      (name.strip(), tenant_id))
+
+    def organisation_members(self, tenant_id: str) -> list[dict]:
+        return self._query(
+            "SELECT user_id, email, role, created_at, email_verified_at, last_login_at"
+            " FROM users WHERE tenant_id=? ORDER BY created_at", (tenant_id,))
+
+    def remove_user(self, user_id: str) -> None:
+        """Delete the account and end its sessions. Its organisation's work stays."""
+        with self._tx() as c:
+            c.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
+            c.execute("DELETE FROM account_tokens WHERE user_id=?", (user_id,))
+            c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
+
+    def mark_email_verified(self, user_id: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE users SET email_verified_at=COALESCE(email_verified_at, ?)"
+                      " WHERE user_id=?", (_now(), user_id))
+
+    # The links sent by email. A token is created with its purpose and
+    # whatever it carries, and is consumed once.
+    def create_account_token(self, token_hash: str, *, purpose: str, email: str,
+                             hours: float, user_id: str = "", tenant_id: str = "",
+                             role: str = "", invited_by: str = "") -> None:
+        expires = (datetime.now(timezone.utc) + timedelta(hours=hours)) \
+            .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+        with self._tx() as c:
+            c.execute("DELETE FROM account_tokens WHERE expires_at < ?", (_now(),))
+            c.execute("INSERT INTO account_tokens (token_hash, purpose, email, user_id,"
+                      " tenant_id, role, invited_by, created_at, expires_at)"
+                      " VALUES (?,?,?,?,?,?,?,?,?)",
+                      (token_hash, purpose, email, user_id or None, tenant_id or None,
+                       role or None, invited_by or None, _now(), expires))
+
+    def account_token(self, token_hash: str, purpose: str) -> dict | None:
+        """A live, unused token of this purpose, or None."""
+        return self._one("SELECT * FROM account_tokens WHERE token_hash=? AND purpose=?"
+                         " AND used_at IS NULL AND expires_at > ?",
+                         (token_hash, purpose, _now()))
+
+    def use_account_token(self, token_hash: str) -> bool:
+        """Consume a token. False if it was used a moment ago by someone else."""
+        with self._tx() as c:
+            c.execute("UPDATE account_tokens SET used_at=? WHERE token_hash=?"
+                      " AND used_at IS NULL", (_now(), token_hash))
+            return c.rowcount() == 1
+
+    def last_account_token(self, email: str, purpose: str) -> dict | None:
+        return self._one("SELECT * FROM account_tokens WHERE email=? AND purpose=?"
+                         " ORDER BY created_at DESC LIMIT 1", (email, purpose))
+
+    def pending_invites(self, tenant_id: str) -> list[dict]:
+        return self._query(
+            "SELECT token_hash, email, role, invited_by, created_at, expires_at"
+            " FROM account_tokens WHERE purpose='invite' AND tenant_id=?"
+            " AND used_at IS NULL AND expires_at > ? ORDER BY created_at",
+            (tenant_id, _now()))
+
+    def revoke_invites(self, tenant_id: str, email: str) -> int:
+        with self._tx() as c:
+            c.execute("UPDATE account_tokens SET used_at=? WHERE purpose='invite'"
+                      " AND tenant_id=? AND email=? AND used_at IS NULL",
+                      (_now(), tenant_id, email))
+            return c.rowcount()
+
+    def user_by_email(self, email: str) -> dict | None:
+        return self._one("SELECT * FROM users WHERE email=?", (email.strip().lower(),))
+
+    def user_by_id(self, user_id: str) -> dict | None:
+        return self._one("SELECT * FROM users WHERE user_id=?", (user_id,))
+
+    def count_users(self) -> int:
+        return int((self._one("SELECT COUNT(*) AS n FROM users") or {}).get("n") or 0)
+
+    def record_login(self, user_id: str, ok: bool, *, max_failures: int,
+                     lock_minutes: int) -> None:
+        """A success clears the failure count; enough failures lock the account."""
+        with self._tx() as c:
+            if ok:
+                c.execute("UPDATE users SET failed_logins=0, locked_until=NULL,"
+                          " last_login_at=? WHERE user_id=?", (_now(), user_id))
+                return
+            c.execute("UPDATE users SET failed_logins=failed_logins+1 WHERE user_id=?",
+                      (user_id,))
+        user = self.user_by_id(user_id) or {}
+        if int(user.get("failed_logins") or 0) >= max_failures:
+            until = (datetime.now(timezone.utc) + timedelta(minutes=lock_minutes)) \
+                .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+            with self._tx() as c:
+                c.execute("UPDATE users SET failed_logins=0, locked_until=? WHERE user_id=?",
+                          (until, user_id))
+
+    def set_password(self, user_id: str, password_hash: str) -> None:
+        """Change the password and end every session the account has."""
+        with self._tx() as c:
+            c.execute("UPDATE users SET password_hash=? WHERE user_id=?",
+                      (password_hash, user_id))
+            c.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
+
+    def set_user_portfolio(self, user_id: str, portfolio_key: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE users SET portfolio_key=? WHERE user_id=?",
+                      (portfolio_key or None, user_id))
+
+    def create_session(self, token_hash: str, user_id: str, days: int) -> None:
+        expires = (datetime.now(timezone.utc) + timedelta(days=days)) \
+            .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+        with self._tx() as c:
+            # Expired sessions are swept as new ones are made, which is often
+            # enough for a table that only grows by sign-ins.
+            c.execute("DELETE FROM user_sessions WHERE expires_at < ?", (_now(),))
+            c.execute("INSERT INTO user_sessions (token_hash, user_id, created_at,"
+                      " expires_at) VALUES (?,?,?,?)",
+                      (token_hash, user_id, _now(), expires))
+
+    def session_user(self, token_hash: str) -> dict | None:
+        """The account behind a live session, or None."""
+        return self._one(
+            "SELECT u.* FROM user_sessions s JOIN users u ON u.user_id = s.user_id"
+            " WHERE s.token_hash=? AND s.expires_at > ?", (token_hash, _now()))
+
+    def end_session(self, token_hash: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM user_sessions WHERE token_hash=?", (token_hash,))
 
     # ----------------------------------------------------- unsubscribing
     def unsubscribe_token(self, subscription_id: str, email: str) -> str:

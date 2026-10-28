@@ -20,12 +20,22 @@ without a key. A key is then an admin key, needed only for what removes work
 or changes the site for everyone, and for the one action that emails a federal
 official — see `make_admin_dependency`. Alert emails need no key because each
 address has to confirm before it receives one (`consent`).
+
+**Signed-in accounts** (`accounts.py`) come first in every dependency here: a
+live session cookie selects the account's own tenant, and its holder is the
+admin of that workspace. Keys work exactly as before for anything without a
+session — the scheduled check, the command line, scripts.
 """
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, Request, status
+
+# Request -> the signed-in account's tenant, or "". Supplied by the app, which
+# owns the database; None where accounts are not wired in (tests of keys alone).
+SessionLookup = Callable[[Request], str] | None
 
 CLOSED_DETAIL = (
     "FOCI_API_KEYS is not set, so the API is closed and no data can be read. "
@@ -103,13 +113,23 @@ def _presented(authorization: str, x_api_key: str) -> str:
     return presented
 
 
-def make_dependency(keymap: dict[str, str], public: bool = False):
+SIGN_IN_DETAIL = "Sign in, or supply a key in Authorization: Bearer <key> or X-API-Key."
+
+
+def make_dependency(keymap: dict[str, str], public: bool = False,
+                    session: SessionLookup = None,
+                    accounts_possible: Callable[[], bool] | None = None):
     """Build the FastAPI dependency that yields a tenant id."""
 
     async def require_tenant(
+        request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> str:
+        if session is not None:
+            tenant = session(request)
+            if tenant:
+                return tenant
         presented = _presented(authorization, x_api_key)
         if public:
             # No key needed. A known one still selects its tenant; an unknown
@@ -118,7 +138,8 @@ def make_dependency(keymap: dict[str, str], public: bool = False):
             return (resolve_tenant(keymap, presented) if presented else "") \
                 or DEFAULT_TENANT
 
-        if not keymap:
+        signing_in = accounts_possible is not None and accounts_possible()
+        if not keymap and not signing_in:
             # Say how to fix it. The symptom otherwise is a web page that shows
             # nothing, which looks like missing data rather than missing config.
             raise HTTPException(
@@ -128,7 +149,8 @@ def make_dependency(keymap: dict[str, str], public: bool = False):
         if not presented:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Supply a key in Authorization: Bearer <key> or X-API-Key.",
+                detail=SIGN_IN_DETAIL if signing_in else
+                "Supply a key in Authorization: Bearer <key> or X-API-Key.",
                 headers={"WWW-Authenticate": "Bearer"})
 
         tenant = resolve_tenant(keymap, presented)
@@ -140,21 +162,31 @@ def make_dependency(keymap: dict[str, str], public: bool = False):
     return require_tenant
 
 
-def make_admin_dependency(keymap: dict[str, str], public: bool = False):
+def make_admin_dependency(keymap: dict[str, str], public: bool = False,
+                          session: SessionLookup = None,
+                          accounts_possible: Callable[[], bool] | None = None):
     """The dependency for routes that remove recorded work, change how the
     site screens for everyone, or email a federal official.
 
     Outside public mode every caller already holds a key, and any key will
     do, as before. In public mode a key from FOCI_API_KEYS is required; with
-    none configured these routes are closed (403), not opened.
+    none configured these routes are closed (403), not opened. A signed-in
+    account is admin of its own workspace either way: nobody else's work is
+    in it.
     """
     if not public:
-        return make_dependency(keymap)
+        return make_dependency(keymap, session=session,
+                               accounts_possible=accounts_possible)
 
     async def require_admin(
+        request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> str:
+        if session is not None:
+            tenant = session(request)
+            if tenant:
+                return tenant
         if not keymap:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ADMIN_UNSET)
         presented = _presented(authorization, x_api_key)
@@ -170,7 +202,8 @@ def make_admin_dependency(keymap: dict[str, str], public: bool = False):
     return require_admin
 
 
-def make_admin_flag(keymap: dict[str, str], public: bool = False):
+def make_admin_flag(keymap: dict[str, str], public: bool = False,
+                    session: SessionLookup = None):
     """A dependency answering whether this request carries a known key.
 
     Always yes outside public mode, where a request without one never gets
@@ -180,10 +213,13 @@ def make_admin_flag(keymap: dict[str, str], public: bool = False):
     """
 
     async def is_admin(
+        request: Request,
         authorization: str = Header(default=""),
         x_api_key: str = Header(default=""),
     ) -> bool:
         if not public:
+            return True
+        if session is not None and session(request):
             return True
         presented = _presented(authorization, x_api_key)
         return bool(presented and resolve_tenant(keymap, presented))

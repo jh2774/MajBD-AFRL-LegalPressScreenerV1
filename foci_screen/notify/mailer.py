@@ -181,18 +181,25 @@ class Mailer:
     # ------------------------------------------------------------------ sending
     def send(self, to: list[str], subject: str, text: str,
              html: str | None = None,
-             personalize: Personalize | None = None) -> Delivery:
+             personalize: Personalize | None = None,
+             redirectable: bool = True) -> Delivery:
         """Send one message per recipient.
 
         `personalize(address)`, when given, returns that address's own
         (text, html, headers) in place of the shared ones — for an unsubscribe
         link that only works for the person it was sent to.
+
+        `redirectable=False` is for mail a person asked for about their own
+        account — a password reset, an invitation they are expecting. The
+        pilot redirect exists to keep alerts about named companies from
+        reaching people before someone has read them; sending a reset link to
+        the pilot's inbox instead would only stop the person signing in.
         """
         recipients = [a for a in dict.fromkeys(x.strip() for x in to) if a]
         if not recipients:
             return Delivery("failed", [], "No recipients.")
 
-        if self.redirect:
+        if self.redirect and redirectable:
             subject = f"[for {', '.join(recipients)}] {subject}"
             recipients = [self.redirect]
 

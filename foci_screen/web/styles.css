@@ -374,6 +374,18 @@ textarea {
 }
 textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
 
+/* Single-line fields and selects outside a dialog: the same look as the
+   portfolio's name box, rather than the browser's. */
+.text-input {
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2);
+  color: var(--text);
+  font: inherit;
+}
+
 /* Settings: one option per line, the explanation on the same line as the
    choice it explains, and enough room to hit a box on a phone. */
 .checks { display: grid; gap: 6px; margin-top: 6px; }
@@ -571,7 +583,11 @@ dialog {
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--text);
-  max-width: 460px;
+  /* A 16px gutter on a phone; the browser's own default is overridden by
+   * any max-width, which left the dialog touching both edges. */
+  box-sizing: border-box;
+  width: min(460px, calc(100vw - 32px));
+  max-width: none;
   padding: 22px;
 }
 dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
@@ -586,7 +602,9 @@ dialog input {
   font-family: var(--mono);
   margin-top: 8px;
 }
-.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+.dialog-actions {
+  display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; margin-top: 16px;
+}
 
 .foot {
   max-width: 1180px;

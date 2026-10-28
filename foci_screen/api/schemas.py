@@ -190,3 +190,41 @@ class SignalDisposition(BaseModel):
     note: str = ""
     decided_by: str = ""
     run_id: str = ""
+
+
+class Credentials(BaseModel):
+    """Email and password, for signing up or in. Checked in accounts.py."""
+    email: str = Field(..., max_length=254)
+    password: str = Field(..., max_length=1024)
+    # Signing up only: what to call the new organisation. Defaults to the
+    # address's domain.
+    organisation: str = Field("", max_length=120)
+
+
+class PasswordChange(BaseModel):
+    current_password: str = Field(..., max_length=1024)
+    new_password: str = Field(..., max_length=1024)
+
+
+class AccountPortfolio(BaseModel):
+    """The portfolio key kept on the account; empty clears it."""
+    portfolio_key: str = Field("", max_length=64_000)
+
+
+class EmailOnly(BaseModel):
+    email: str = Field(..., max_length=254)
+
+
+class TokenPassword(BaseModel):
+    """A link's token, and the password chosen on the page it opened."""
+    token: str = Field(..., min_length=10, max_length=200)
+    password: str = Field(..., max_length=1024)
+
+
+class InviteRequest(BaseModel):
+    email: str = Field(..., max_length=254)
+    role: Literal["member", "owner"] = "member"
+
+
+class OrganisationRename(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
