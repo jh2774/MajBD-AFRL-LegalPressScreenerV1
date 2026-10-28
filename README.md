@@ -262,8 +262,10 @@ direct request (403); the download goes through SAM.gov's service, as its downlo
   ASSOCIATED PARTIES").
 - **Downloaded once a day.** The newest file is indexed into `sam_exclusions.db` in the cache
   directory: about 40 MB and six seconds to build, 37 MB of memory at peak. If a refresh
-  fails, the previous day's index is used; with none at all, the step reports nothing rather
-  than failing the screen.
+  fails, the previous index is used and the run notes say it was an older extract. With
+  none at all, the screen carries on but its notes say **exclusions were NOT checked**, so an
+  empty result is never read as "not excluded". After a failed download, screens wait an hour
+  before trying again, so an outage does not cost every screen the download's timeout.
 
 The rationale cites FAR subpart 9.4: no new award to an excluded party, while existing
 contracts may continue unless the agency decides otherwise (FAR 9.405-1).

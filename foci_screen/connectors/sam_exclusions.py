@@ -21,10 +21,12 @@ from __future__ import annotations
 import csv
 import io
 import logging
+import os
 import sqlite3
+import threading
 import time
 import zipfile
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote
 
@@ -44,6 +46,11 @@ PAGE_URL = "https://sam.gov/data-services/Exclusions/Public%20V2?privacy=Public"
 INDIVIDUAL = "Individual"
 
 REFRESH_SECONDS = 24 * 3600
+# After a failed download, how long before another screen tries again. Each
+# attempt can take minutes against an unresponsive host; without this, every
+# screen during an outage would spend them, on a host that limits a screen's
+# time, before reaching anything else.
+RETRY_AFTER_SECONDS = 3600
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS exclusions (
@@ -63,8 +70,11 @@ class SAMExclusionsConnector:
     def __init__(self, http, cache_dir: str = ".cache") -> None:
         self.http = http
         self.index_path = Path(cache_dir) / "sam_exclusions.db"
+        self.failed_marker = self.index_path.with_suffix(".failed")
         self._db: sqlite3.Connection | None = None
         self.file_name = ""
+        # Why today's extract was not read: either nothing was checked at all
+        # (no index), or an older index was used. `coverage_note` says which.
         self.unavailable_reason = ""
 
     # ---------------------------------------------------------------- index
@@ -79,12 +89,24 @@ class SAMExclusionsConnector:
             return self._db
         fresh = (self.index_path.is_file()
                  and time.time() - self.index_path.stat().st_mtime < REFRESH_SECONDS)
-        if not fresh:
+        recently_failed = (self.failed_marker.is_file() and time.time()
+                           - self.failed_marker.stat().st_mtime < RETRY_AFTER_SECONDS)
+        if not fresh and recently_failed:
+            self.unavailable_reason = (
+                "the last download from SAM.gov failed less than an hour ago "
+                f"({self.failed_marker.read_text(encoding='utf-8', errors='replace')[:200]})")
+        elif not fresh:
             try:
                 self._build()
+                self.failed_marker.unlink(missing_ok=True)
             except Exception as exc:          # a source outage must not sink the run
                 log.warning("SAM exclusions refresh failed: %s", exc)
-                self.unavailable_reason = str(exc)
+                self.unavailable_reason = f"{type(exc).__name__}: {exc}"[:300]
+                try:
+                    self.failed_marker.parent.mkdir(parents=True, exist_ok=True)
+                    self.failed_marker.write_text(self.unavailable_reason, encoding="utf-8")
+                except OSError:
+                    pass
         if not self.index_path.is_file():
             return None
         self._db = sqlite3.connect(f"file:{self.index_path}?mode=ro", uri=True,
@@ -109,11 +131,37 @@ class SAMExclusionsConnector:
         if status != 200 or body[:2] != b"PK":
             raise RuntimeError(f"SAM.gov returned {status} for {newest}")
         self.index_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.index_path.with_suffix(".partial")
-        tmp.unlink(missing_ok=True)
-        count = build_index(body, tmp, newest)
-        tmp.replace(self.index_path)
+        # Its own name per build: two screens refreshing at once must not
+        # write into the same half-built file.
+        tmp = self.index_path.with_suffix(
+            f".{os.getpid()}.{threading.get_ident()}.partial")
+        try:
+            count = build_index(body, tmp, newest)
+            tmp.replace(self.index_path)
+        finally:
+            tmp.unlink(missing_ok=True)
         log.info("indexed %d SAM exclusions from %s", count, newest)
+
+    def coverage_note(self) -> str:
+        """A sentence for the run notes when today's list was not read, else "".
+
+        No index means nothing was checked, and a silent empty result would
+        read as "not excluded" — a different claim entirely.
+        """
+        if not self.unavailable_reason:
+            return ""
+        if self._db is None:
+            return (f"SAM.gov exclusions were NOT checked: {self.unavailable_reason}. "
+                    f"Search the contractor at {PAGE_URL} by hand before relying on "
+                    f"this screen.")
+        return (f"SAM.gov exclusions were checked against an older extract "
+                f"({self.file_name or 'previous download'}) because today's could not "
+                f"be read: {self.unavailable_reason}.")
+
+    def close(self) -> None:
+        if self._db is not None:
+            self._db.close()
+            self._db = None
 
     # ---------------------------------------------------------------- match
     def screen(self, name: str, uei: str = "", cage: str = "",
@@ -173,6 +221,17 @@ class SAMExclusionsConnector:
                   "file": self.file_name})
 
 
+def _iso_date(value: str) -> str:
+    """YYYY-MM-DD from either form the extract has used, else "" ("Indefinite")."""
+    value = (value or "").strip()
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return ""
+
+
 def _julian_key(name: str) -> str:
     stem = name.rsplit(".", 1)[0]
     return stem.rsplit("_", 1)[-1]
@@ -202,8 +261,8 @@ def build_index(zip_bytes: bytes, path: Path, file_name: str) -> int:
                     continue
                 # The file lists active exclusions, but it is a day old when
                 # read: one whose end date has passed is not one any more.
-                ends = rec.get("Termination Date", "")
-                if len(ends) == 10 and ends[4] == "-" and ends < date.today().isoformat():
+                ends = _iso_date(rec.get("Termination Date", ""))
+                if ends and ends < date.today().isoformat():
                     continue
                 name = rec.get("Name") or " ".join(
                     filter(None, (rec.get("First"), rec.get("Middle"), rec.get("Last"))))

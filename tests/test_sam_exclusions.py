@@ -127,6 +127,59 @@ def test_an_outage_with_no_index_returns_nothing_rather_than_failing(tmp_path):
     assert "503" in c.unavailable_reason
 
 
+def test_an_outage_is_reported_rather_than_read_as_not_excluded(tmp_path):
+    """An empty result with nothing checked would read as "not excluded"."""
+    c = SAMExclusionsConnector(StubHttp(status=503, body=b""), str(tmp_path))
+    c.screen("Harbour Optics LLC", uei="HARBOUR00001")
+    assert "NOT checked" in c.coverage_note() and "503" in c.coverage_note()
+
+    ok = SAMExclusionsConnector(StubHttp(), str(tmp_path / "ok"))
+    ok.screen("x", uei="HARBOUR00001")
+    assert ok.coverage_note() == ""
+
+
+def test_a_stale_index_is_reported_as_stale(tmp_path):
+    SAMExclusionsConnector(StubHttp(), str(tmp_path)).screen("x", uei="HARBOUR00001")
+    old = time.time() - 2 * 24 * 3600
+    os.utime(tmp_path / "sam_exclusions.db", (old, old))
+    stale = SAMExclusionsConnector(StubHttp(status=503, body=b""), str(tmp_path))
+    stale.screen("x", uei="HARBOUR00001")
+    assert "older extract" in stale.coverage_note()
+    stale.close()
+
+
+def test_after_a_failure_the_next_screens_do_not_retry_for_an_hour(tmp_path):
+    """Each attempt can take minutes; every screen during an outage must not
+    spend them."""
+    SAMExclusionsConnector(StubHttp(status=503, body=b""), str(tmp_path)).screen("x")
+    http = StubHttp()
+    later = SAMExclusionsConnector(http, str(tmp_path))
+    later.screen("x", uei="HARBOUR00001")
+    assert http.downloads == []
+    assert "less than an hour ago" in later.coverage_note()
+
+    old = time.time() - 2 * 3600
+    os.utime(tmp_path / "sam_exclusions.failed", (old, old))
+    recovered = SAMExclusionsConnector(http, str(tmp_path))
+    assert recovered.screen("x", uei="HARBOUR00001")
+    assert not (tmp_path / "sam_exclusions.failed").exists()
+    recovered.close()
+
+
+def test_a_build_leaves_no_partial_file_behind(tmp_path):
+    SAMExclusionsConnector(StubHttp(), str(tmp_path)).screen("x", uei="HARBOUR00001")
+    assert [p.name for p in tmp_path.iterdir() if p.name.endswith(".partial")] == []
+
+
+def test_a_lapsed_exclusion_is_dropped_whichever_date_format_the_file_uses(tmp_path):
+    us_past = (date.today() - timedelta(days=30)).strftime("%m/%d/%Y")
+    us_future = (date.today() + timedelta(days=30)).strftime("%m/%d/%Y")
+    rows = [record(name="Lapsed US Date Inc", uei="LAPSED000002", sam="L1", ends=us_past),
+            record(name="Current US Date Inc", uei="CURRENT00001", sam="L2", ends=us_future),
+            record(name="Indefinite Inc", uei="INDEF0000001", sam="L3", ends="Indefinite")]
+    assert build_index(extract(rows), tmp_path / "x.db", "f.ZIP") == 2
+
+
 # ------------------------------------------------------------------ matching
 
 def test_a_contractor_is_matched_by_uei_and_each_exclusion_is_its_own_record(conn):

@@ -291,6 +291,9 @@ class Screener:
         thereby said it has nothing to disclose.
         """
         notes: list[str] = []
+        exclusions = getattr(self, "exclusions", None)
+        if exclusions is not None and exclusions.coverage_note():
+            notes.append(exclusions.coverage_note())
         if self.web.skipped_js_hosts:
             hosts = ", ".join(sorted(self.web.skipped_js_hosts))
             notes.append(
