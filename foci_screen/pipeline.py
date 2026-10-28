@@ -15,6 +15,7 @@ from .connectors.alerts import AlertConnector
 from .connectors.feeds import FeedConnector
 from .connectors.fpds import FPDSConnector
 from .connectors.registries import IAPDConnector, OFACConnector, SAMConnector, USPTOConnector
+from .connectors.sam_exclusions import SAMExclusionsConnector
 from .connectors.sec_edgar import EdgarConnector
 from .connectors.usaspending import USASpendingConnector, looks_like_an_individual
 from .connectors.uspto_dataset import PatentAssignmentDataset
@@ -71,6 +72,7 @@ class Screener:
         self.edgar = EdgarConnector(http)
         self.iapd = IAPDConnector(http)
         self.ofac = OFACConnector(http)
+        self.exclusions = SAMExclusionsConnector(http, getattr(config, "cache_dir", ".cache"))
         self.uspto = USPTOConnector(http, config.uspto_api_key)
         self.patent_dataset = PatentAssignmentDataset(
             getattr(config, "patent_assignments_index", ""))
@@ -289,6 +291,9 @@ class Screener:
         thereby said it has nothing to disclose.
         """
         notes: list[str] = []
+        exclusions = getattr(self, "exclusions", None)
+        if exclusions is not None and exclusions.coverage_note():
+            notes.append(exclusions.coverage_note())
         if self.web.skipped_js_hosts:
             hosts = ", ".join(sorted(self.web.skipped_js_hosts))
             notes.append(
@@ -431,6 +436,11 @@ class Screener:
         else:
             progress("  Ownership filings and IAPD: skipped (needs a CIK to "
                      "know whose holders to look up)")
+
+        progress("  SAM.gov exclusions (debarment and suspension)...")
+        docs.extend(self.exclusions.screen(
+            entity.name, uei=entity.uei, cage=entity.cage,
+            parent_name=entity.parent_name, parent_uei=entity.parent_uei))
 
         progress("  OFAC SDN name screen...")
         docs.extend(self.ofac.screen(entity.name))
