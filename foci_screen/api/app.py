@@ -18,6 +18,7 @@ import os
 import secrets
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from importlib import metadata
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from .. import alerts as alerts_engine
-from .. import fund_managers
+from .. import consent, fund_managers, syscheck
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
 from .. import vehicles as vehicles_engine
@@ -40,13 +41,16 @@ from ..connectors.formd import READABLE_URL as FORMD_READABLE_URL
 from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
 from ..connectors.vehicles import VehicleConnector, default_phrase, phrase_problem
-from ..jobs import HOLD_SECONDS, JobQueue
+from ..jobs import HOLD_SECONDS, JobQueue, _hold_open
+from ..notify import bounces
 from ..notify import render as render_notice
+from ..notify.gmail import GmailNotifier
 from ..notify.mailer import LABEL as LABEL_OF_MAIL
 from ..notify.mailer import Mailer
 from ..store import DRIVER_MISSING, Store, annotate_diff, postgres_driver_available
 from . import auth
 from .schemas import (
+    MAX_ALERT_RECIPIENTS,
     AlertSubscriptionRequest,
     IdentityDecision,
     ManagerRequest,
@@ -65,7 +69,12 @@ log = logging.getLogger("foci.api")
 
 cfg = get_config()
 keymap = auth.parse_keys(cfg.api_keys)
-require_tenant = auth.make_dependency(keymap)
+require_tenant = auth.make_dependency(keymap, public=cfg.public)
+# Removing recorded work, changing how the site screens for everyone, and
+# approving a notice to a federal official. The same as require_tenant unless
+# the site is public, where these alone need a key.
+require_admin = auth.make_admin_dependency(keymap, public=cfg.public)
+is_admin = auth.make_admin_flag(keymap, public=cfg.public)
 queue = JobQueue(cfg)
 
 app = FastAPI(
@@ -98,6 +107,10 @@ def store_for(tenant: str) -> Store:
 
 
 def tenant_store(tenant: str = Depends(require_tenant)) -> Store:
+    return store_for(tenant)
+
+
+def admin_store(tenant: str = Depends(require_admin)) -> Store:
     return store_for(tenant)
 
 
@@ -137,10 +150,11 @@ def deployment_warnings() -> list[str]:
     host = cfg.managed_host
     on_sqlite = not cfg.dsn.startswith("postgres")
 
-    if not keymap:
+    if not keymap and not cfg.public:
         warnings.append(
             "FOCI_API_KEYS is not set: every authenticated route returns 503 and "
-            "the web interface will show nothing.")
+            "the web interface will show nothing. To open the site to anyone with "
+            "its address instead, set FOCI_PUBLIC=true.")
     if storage_is_ephemeral():
         warnings.append(
             f"This database will not survive a restart. It is SQLite on {host}'s "
@@ -184,7 +198,23 @@ def deployment_warnings() -> list[str]:
     mail = Mailer(cfg).status()
     if mail["mode"] == "misconfigured":
         warnings.append("Email alerts: " + mail["explanation"])
+    if cfg.alerts_paused:
+        warnings.append(ALERTS_PAUSED_NOTE)
+    # The same for notices: Gmail switched on but never signed in means every
+    # approval silently stops short of Gmail.
+    if cfg.gmail_enabled and not Path(cfg.gmail_token).is_file():
+        warnings.append(
+            f"Notices: GMAIL_ENABLED is true but there is no Gmail sign-in at "
+            f"{cfg.gmail_token}, so approved notices cannot reach Gmail. Run "
+            f"`foci-screen gmail-auth` once and place token.json at GMAIL_TOKEN.")
     return warnings
+
+
+ALERTS_PAUSED_NOTE = (
+    "Alert checks are paused on this site (ALERTS_PAUSED is set). Nothing is checked "
+    "and nothing is emailed until that setting is removed. This is the right state "
+    "for a site being moved away from, or a new one still being tried out; it is the "
+    "wrong one for the site people rely on.")
 
 
 INTERRUPTED_NOTE = (
@@ -193,17 +223,51 @@ INTERRUPTED_NOTE = (
     "beyond the point it reached. Start another screen.")
 
 
+STALE_NOTE = (
+    "This screen did not finish. It runs inside the request the page sends to start it, "
+    "and that request ended — the page was closed or reloaded, or the host's time limit "
+    "cut it off — so nothing is running it now. What it had finished is kept. Start "
+    "another, and keep the page open until it ends.")
+
+
+def _stale_cutoff() -> str:
+    """Runs started before this, and not finished, can no longer be running:
+    the longest a screen may take, and two minutes over."""
+    limit = (cfg.screen_seconds or 300) + 120
+    when = datetime.now(timezone.utc) - timedelta(seconds=limit)
+    return when.replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+
+
+def close_stale_runs(store: Store) -> int:
+    """Where screens run inside requests, close the ones whose request is gone.
+
+    Several copies of the site may be running, so a run is only closed once
+    it is older than any request could last; until then it may belong to a
+    request still under way somewhere else. A run still queued that long was
+    never started — its page was closed before it could ask.
+    """
+    if queue.backend != "request":
+        return 0
+    return store.close_stale_runs(STALE_NOTE, statuses=("queued", "running"),
+                                  started_before=_stale_cutoff())
+
+
 def reap_interrupted_runs() -> int:
     """Close out runs left `running` by a process that no longer exists.
 
     Only when screening happens in this process. With a queue, a run marked
     running may be owned by a worker that is alive and working, and closing it
     from here would report a screen as interrupted while it is still going.
+    Where screens run inside requests, only runs too old to be running are
+    closed (`close_stale_runs`).
     """
+    tenants = sorted(set(keymap.values()) | {auth.DEFAULT_TENANT})
+    if queue.backend == "request":
+        return sum(close_stale_runs(store_for(t)) for t in tenants)
     if queue.backend != "thread":
         return 0
     reaped = 0
-    for tenant in sorted(set(keymap.values()) | {auth.DEFAULT_TENANT}):
+    for tenant in tenants:
         reaped += store_for(tenant).reap_interrupted_runs(INTERRUPTED_NOTE)
     return reaped
 
@@ -223,7 +287,7 @@ for _warning in deployment_warnings():
     # logging may not be configured yet under some servers, so print as well.
     log.error(_warning)
     print(f"\n*** {_warning}\n", flush=True)
-if not keymap:
+if not keymap and not cfg.public:
     # The long form says how to set it; the health warning stays short enough
     # to read in a banner.
     print(f"*** {auth.STARTUP_WARNING}\n", flush=True)
@@ -241,26 +305,57 @@ def health() -> dict:
     return {"status": "ok", "version": VERSION, "queue": queue.backend,
             # Which platform answered, and which deploy of it. During a move
             # between hosts this is how to tell the old site from the new one
-            # at a glance; K_REVISION is Cloud Run's name for a deploy.
+            # at a glance: Cloud Run's revision name, or on Render the commit.
             "host": cfg.managed_host or "self-hosted",
-            "revision": os.environ.get("K_REVISION", ""),
+            "revision": syscheck.revision(os.environ),
             "database": "postgres" if cfg.dsn.startswith("postgres") else "sqlite",
             "authenticated": bool(keymap),
+            # Open to anyone with the address; a key is then for admin only.
+            "public": cfg.public,
             "ephemeral_storage": storage_is_ephemeral(),
             # Whether alert emails actually leave: send, redirect, draft or
             # misconfigured — and through which service. No addresses, no keys.
             "alerts": {"mode": mail.status()["mode"],
-                       "provider": LABEL_OF_MAIL.get(mail.transport, "")},
+                       "provider": LABEL_OF_MAIL.get(mail.transport, ""),
+                       "paused": cfg.alerts_paused,
+                       # Whether bounces can be heard about at all.
+                       "bounce_reports": _bounce_reports()},
+            # What an approved notice turns into: render_only, draft, send or
+            # redirected.
+            "notices": {"mode": _delivery_state()["mode"]},
             "warnings": deployment_warnings()}
 
 
+def _probe_client():
+    from ..httpclient import HttpClient
+    return HttpClient(cfg)
+
+
+@app.get("/v1/system/check", tags=["meta"])
+def system_check(request: Request, store: Store = Depends(admin_store)) -> dict:
+    """Try, for real, each thing this deployment has to be able to do, and
+    count what is stored.
+
+    For moving between hosts: the checks say whether a new site can do the
+    work, not merely answer; the counts, read on the old site and the new,
+    say whether everything was copied. Takes a few seconds. Settings are
+    named, never shown. On a public site it needs the admin key: each check
+    writes to the database and asks six outside services.
+    """
+    return syscheck.run(cfg, store, _probe_client(), _base_url(request),
+                        Mailer(cfg).status(), environ=os.environ,
+                        queue_backend=queue.backend, version=VERSION)
+
+
 @app.get("/v1/config", tags=["meta"])
-def configuration(tenant: str = Depends(require_tenant)) -> dict:
+def configuration(tenant: str = Depends(require_tenant),
+                  admin: bool = Depends(is_admin)) -> dict:
     """Which connectors this deployment can actually run."""
+    redirect = cfg.email_redirect_to if admin else consent.mask_text(cfg.email_redirect_to)
     return {"tenant": tenant, "connectors": cfg.availability(),
             "queue": queue.backend,
             "gmail": {"enabled": cfg.gmail_enabled, "send": cfg.gmail_send,
-                      "redirect_to": cfg.email_redirect_to or None}}
+                      "redirect_to": redirect or None}}
 
 
 # ---------------------------------------------------------------- screens
@@ -276,7 +371,41 @@ def create_screen(body: ScreenRequest, request: Request,
     subject = body.recipient or body.agency
     run_id = store.start_run(subject, options, status="queued")
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
-    return {"run_id": run_id, "status": "queued", "backend": queue.backend}
+    return {"run_id": run_id, "status": "queued", "backend": queue.backend,
+            **_execute_link(run_id)}
+
+
+def _execute_link(run_id: str) -> dict:
+    """Where screens run inside requests, the request that runs this one."""
+    if queue.backend != "request":
+        return {}
+    return {"execute": f"/v1/screens/{run_id}/execute",
+            "time_limit_seconds": cfg.screen_seconds}
+
+
+@app.post("/v1/screens/{run_id}/execute", tags=["screens"])
+def execute_screen(run_id: str, tenant: str = Depends(require_tenant)) -> dict:
+    """Run a queued screen inside this request, and answer when it ends.
+
+    For a host that gives a function no time once its response has gone
+    (Vercel), where a screen cannot carry on in the background. The page
+    that started the screen sends this and leaves it open; the screen's own
+    page shows its progress meanwhile. It stops at `FOCI_SCREEN_SECONDS` and
+    keeps what it finished. A screen already started — by another tab, or a
+    second click — is not started again.
+    """
+    store = store_for(tenant)
+    run = store.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, "No such run.")
+    if not store.claim_run(run_id):
+        return {"run_id": run_id, "status": run["status"], "started_here": False}
+    from .. import jobs as jobs_mod
+    result = jobs_mod.run_screen_job(tenant, run_id, _json(run["params"]),
+                                     limit_seconds=cfg.screen_seconds)
+    finished = store.get_run(run_id) or {}
+    return {"run_id": run_id, "status": finished.get("status", result.get("status")),
+            "started_here": True}
 
 
 # ------------------------------------------------- staying awake for a screen
@@ -290,34 +419,43 @@ _hold_token = secrets.token_urlsafe(24)
 
 def _hold_for(run_id: str, request: Request) -> dict:
     """The hold address for a run, or nothing where holding is not wanted."""
-    wanted = cfg.keep_awake if cfg.keep_awake is not None else bool(cfg.managed_host)
+    wanted = cfg.keep_awake_wanted
     if not wanted or queue.backend != "thread":
         return {}
     return {"hold_url": f"{_base_url(request)}/internal/hold/{run_id}",
             "hold_token": _hold_token}
 
 
+ALERTS_HOLD = "alerts"      # the hold address used while an alert check runs
+
+
 @app.get("/internal/hold/{run_id}", include_in_schema=False)
 def hold_for_screen(run_id: str, request: Request) -> dict:
-    """Wait while this process is running the screen, then say whether it still is."""
+    """Wait while this process is running the screen — or the alert check —
+    then say whether it still is."""
     given = request.headers.get("x-hold-token", "")
     if not secrets.compare_digest(given, _hold_token):
         raise HTTPException(404, "Not Found")
+
+    def running() -> bool:
+        return _alerts_running.locked() if run_id == ALERTS_HOLD else queue.is_running(run_id)
+
     deadline = time.monotonic() + HOLD_SECONDS
-    while queue.is_running(run_id) and time.monotonic() < deadline:
+    while running() and time.monotonic() < deadline:
         time.sleep(1)
-    return {"running": queue.is_running(run_id)}
+    return {"running": running()}
 
 
 @app.get("/v1/screens", tags=["screens"])
 def list_screens(limit: int = Query(25, ge=1, le=200),
                  store: Store = Depends(tenant_store)) -> dict:
+    close_stale_runs(store)
     return {"runs": store.recent_runs(limit=limit)}
 
 
 @app.delete("/v1/screens/{run_id}", tags=["screens"])
 def delete_screen(run_id: str, confirm: bool = Query(False),
-                  store: Store = Depends(tenant_store)) -> dict:
+                  store: Store = Depends(admin_store)) -> dict:
     """Remove a screen and everything it recorded.
 
     Without `confirm=true` this reports what would go and deletes nothing,
@@ -344,6 +482,7 @@ def delete_screen(run_id: str, confirm: bool = Query(False),
 
 @app.get("/v1/screens/{run_id}", tags=["screens"])
 def get_screen(run_id: str, store: Store = Depends(tenant_store)) -> dict:
+    close_stale_runs(store)
     run = store.get_run(run_id)
     if run is None:
         raise HTTPException(404, "No such run.")
@@ -374,12 +513,29 @@ def list_findings(severity: str = Query("", pattern="^(|info|low|medium|high|cri
         severity=severity, since=since, entity_key=entity_key, limit=limit)}
 
 
+PAGE_ROWS = 200
+
+
+def _paged(fetch, limit: int, offset: int) -> tuple[list[dict], bool]:
+    """One page of rows, and whether another follows.
+
+    Asked for one row beyond the page; that row says there is more without a
+    second query to count.
+    """
+    rows = fetch(limit + 1, offset)
+    return rows[:limit], len(rows) > limit
+
+
 @app.get("/v1/entities/{entity_key}", tags=["findings"])
-def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
+def get_entity(entity_key: str,
+               offset: int = Query(0, ge=0, le=1_000_000),
+               limit: int = Query(PAGE_ROWS, ge=1, le=500),
+               store: Store = Depends(tenant_store)) -> dict:
     # A company's name, as typed into a portfolio, finds the contractor it was
     # screened as. `entity_key` in the reply says which record answered.
     key = store.resolve_entity_key(entity_key)
-    contracts = store.contracts_where("entity_key", key)
+    contracts, more = _paged(
+        lambda n, off: store.contracts_where("entity_key", key, n, off), limit, offset)
     findings = store.search_findings(entity_key=key, limit=1)
     changes = store.contract_change_events(key, limit=50)
     # A contractor whose every award has been novated away has no awards and
@@ -407,6 +563,8 @@ def get_entity(entity_key: str, store: Store = Depends(tenant_store)) -> dict:
         "obligated": totals["obligated"],
         "contract_count": totals["contract_count"],
         "contracts_shown": len(contracts),
+        "contracts_offset": offset,
+        "contracts_more": more,
         "latest_finding": latest,
         "history": store.entity_history(key),
         # What moved in the award record, one row per event, including awards
@@ -544,6 +702,11 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
         screened = bool(totals["contract_count"]) or bool(latest)
         rows.append({
             **_latest_raise(store, [company.key, page_key]),
+            # Funds named after it, as last looked up on its page. The page is
+            # at `page_key`, so that is where a look was recorded — unless it
+            # was looked up by name before it was ever screened.
+            "funds": vehicles_engine.summary(
+                store, vehicles_engine.watch_key(store, page_key)),
             "entity_key": company.key,
             "page_key": page_key,
             # The database's name wins when it has one: it is the name the
@@ -745,9 +908,9 @@ def entity_vehicles(entity_key: str, store: Store = Depends(tenant_store)) -> di
     Reads the database only. `suggested_phrase` is the contractor's name
     without its legal ending — the words a first look would match on.
     """
-    key = entity_key.upper()
+    key = vehicles_engine.watch_key(store, entity_key)
     name = vehicles_engine.contractor_name(store, key)
-    return {"entity_key": key, "suggested_phrase": default_phrase(name),
+    return {"entity_key": entity_key.upper(), "suggested_phrase": default_phrase(name),
             **vehicles_engine.view(store, key)}
 
 
@@ -765,7 +928,7 @@ def change_entity_vehicles(entity_key: str, body: VehicleRequest,
     show what has arrived and ask again while `pending_names` or `unread`
     say there is more.
     """
-    key = entity_key.upper()
+    key = vehicles_engine.watch_key(store, entity_key)
     watch = store.vehicle_watch(key)
 
     try:
@@ -808,7 +971,7 @@ def find_fund_managers(entity_key: str, body: ManagerRequest,
     which any fund that firm lists now carries what the firm reports about
     it; `checked.lists` says how many it did.
     """
-    key = entity_key.upper()
+    key = vehicles_engine.watch_key(store, entity_key)
     watch = store.vehicle_watch(key)
     if watch is None:
         raise HTTPException(409, "Look this company's funds up first.")
@@ -843,22 +1006,145 @@ def find_fund_managers(entity_key: str, body: ManagerRequest,
 
 # ------------------------------------------------------------ email alerts
 
+def _shown_list(store: Store, sub: dict, admin: bool) -> dict:
+    """A list as the page shows it: each address and whether it has agreed.
+
+    On a public site a visitor sees addresses masked — a list holds people at
+    other organisations, and the page is open to anyone. Holding the admin
+    key shows them in full.
+    """
+    recipients = consent.statuses(store, sub)
+    # Who took themselves off, so the list's owner can see why an address
+    # they added is gone — and not type it back in.
+    opted_out = [{"email": email, "at": at} for email, at
+                 in sorted(store.opted_out(sub["subscription_id"]).items())]
+    # Addresses still on the list that the mail service says are dead or
+    # complained. They stay listed so the owner can see and correct them.
+    bounced = [{"email": r["email"], "kind": r["kind"], "at": r["last_at"],
+                "reason": r.get("reason") or "", "description": bounces.describe(r)}
+               for r in sorted(store.suppressed(sub["emails"]).values(),
+                               key=lambda r: r["email"])]
+    if not admin:
+        recipients = [{**r, "email": consent.mask(r["email"])} for r in recipients]
+        opted_out = [{**o, "email": consent.mask(o["email"])} for o in opted_out]
+        bounced = [{**b, "email": consent.mask(b["email"]),
+                    "reason": consent.mask_text(b["reason"]),
+                    "description": consent.mask_text(b["description"])} for b in bounced]
+    return {**sub, "emails": [r["email"] for r in recipients],
+            "recipients": recipients, "opted_out": opted_out, "bounced": bounced,
+            "can_edit_addresses": admin}
+
+
+def _shown_delivery(d: dict, admin: bool) -> dict:
+    if admin:
+        return d
+    return {**d, "recipients": [consent.mask(a) for a in d["recipients"]],
+            **{k: consent.mask_text(d.get(k) or "") for k in ("subject", "detail",
+                                                              "body_text")}}
+
+
 @app.get("/v1/alerts", tags=["alerts"])
-def get_alerts(store: Store = Depends(tenant_store)) -> dict:
+def get_alerts(store: Store = Depends(tenant_store),
+               admin: bool = Depends(is_admin)) -> dict:
     """Subscriptions, what sending will do, and what was sent recently."""
-    return {"sending": Mailer(cfg).status(),
-            "subscriptions": store.alert_subscriptions(),
-            "deliveries": store.alert_deliveries(limit=30)}
+    sending = Mailer(cfg).status()
+    if not admin:
+        sending = {**sending, "explanation": consent.mask_text(sending["explanation"])}
+    return {"sending": sending, "public": cfg.public, "can_edit_addresses": admin,
+            "subscriptions": [_shown_list(store, s, admin)
+                              for s in store.alert_subscriptions()],
+            "deliveries": [_shown_delivery(d, admin)
+                           for d in store.alert_deliveries(limit=30)],
+            "bounce_reports": _bounce_reports()}
+
+
+def _bounce_reports() -> str:
+    """Which mail service can tell this site about bounces: brevo, resend or ""."""
+    return ("resend" if cfg.resend_webhook_secret else
+            "brevo" if cfg.mail_webhook_secret else "")
+
+
+@app.delete("/v1/alerts/bounces/{email}", status_code=204, tags=["alerts"])
+def clear_bounce(email: str, store: Store = Depends(admin_store)) -> Response:
+    """Mail an address again: it was mistyped and has been fixed, or the
+    mailbox works again.
+
+    Only an address on one of this tenant's lists. A spam complaint cannot be
+    cleared here: it is the reader saying no, and overruling them is not the
+    list owner's call. On a public site it needs the admin key, like taking
+    an address off a list: visitors see addresses masked.
+    """
+    email = email.strip().lower()
+    if not any(email in (e.lower() for e in s["emails"])
+               for s in store.alert_subscriptions()):
+        raise HTTPException(404, "That address is not on any of your alert lists.")
+    outcome = store.clear_suppression(email)
+    if outcome == "not_found":
+        raise HTTPException(404, "That address has no bounce on record.")
+    if outcome == "complaint":
+        raise HTTPException(
+            409, "This person marked an alert as spam, so it will not be sent to them "
+                 "again from here. If they ask to be mailed again, an operator can "
+                 "clear it with `foci-screen mail-suppressions --clear`.")
+    return Response(status_code=204)
+
+
+# ------------------------------------------------------------ bounce reports
+# Called by the mail service, not by a person, so no API key; each provider's
+# own proof of origin is checked instead (notify/bounces.py).
+
+async def _mail_report(request: Request, parse, verify) -> Response:
+    body = await request.body()
+    try:
+        verify(body)
+    except bounces.NotAuthentic as exc:
+        log.warning("refused a mail report from %s: %s", request.url.path, exc)
+        raise HTTPException(401, str(exc)) from exc
+    try:
+        payload = json.loads(body or b"null")
+    except ValueError as exc:
+        raise HTTPException(400, "The report is not JSON.") from exc
+    store = store_for(auth.DEFAULT_TENANT)      # the table is not tenant-scoped
+    events = parse(payload)
+    for e in events:
+        store.suppress_address(e.email, e.kind, e.reason, e.provider)
+        log.info("mail service reported %s for an alert address", e.kind)
+    return Response(status_code=204)
+
+
+@app.post("/hooks/mail/brevo", include_in_schema=False)
+async def brevo_report(request: Request, token: str = Query("")) -> Response:
+    def verify(_body: bytes) -> None:
+        presented = token
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer "):
+            presented = header[7:].strip()
+        bounces.check_shared_secret(cfg.mail_webhook_secret, presented)
+    return await _mail_report(request, bounces.parse_brevo, verify)
+
+
+@app.post("/hooks/mail/resend", include_in_schema=False)
+async def resend_report(request: Request) -> Response:
+    def verify(body: bytes) -> None:
+        bounces.check_svix_signature(cfg.resend_webhook_secret,
+                                     dict(request.headers), body)
+    return await _mail_report(request, bounces.parse_resend, verify)
 
 
 @app.post("/v1/alerts/subscriptions", tags=["alerts"])
-def save_subscription(body: AlertSubscriptionRequest,
-                      store: Store = Depends(tenant_store)) -> dict:
+def save_subscription(body: AlertSubscriptionRequest, request: Request,
+                      store: Store = Depends(tenant_store),
+                      admin: bool = Depends(is_admin)) -> dict:
     """Create or update who is emailed about a portfolio.
 
     Whatever is already known about the portfolio's companies is marked as
     sent, so the first email is about something that happens next — not the
     firm's history presented as news.
+
+    An address added here by a visitor to a public site is sent a request to
+    confirm and nothing else until it does (`consent`). Such a visitor adds
+    to a list; taking an address off is for the address itself, through the
+    link in every email, or for someone holding the admin key.
     """
     try:
         loaded = portfolio_keys.decode(body.portfolio_key)
@@ -869,21 +1155,48 @@ def save_subscription(body: AlertSubscriptionRequest,
     existing = store.alert_subscription(body.subscription_id) \
         if body.subscription_id else None
     before = set(existing["companies"]) if existing else set()
+    had = existing["emails"] if existing else []
 
+    # Someone who unsubscribed stays unsubscribed. Typing their address back in
+    # is refused by name, so the owner knows rather than wonders; they can
+    # rejoin from the link in their last email. A visitor to a public site
+    # adds to a list rather than restating it.
+    gone = store.opted_out(existing["subscription_id"]) if existing else {}
+    wanted = body.emails if admin else list(dict.fromkeys(had + body.emails))
+    declined = [e for e in wanted if e in gone]
+    emails = [e for e in wanted if e not in gone]
+    shown = declined if admin else [consent.mask(e) for e in declined]
+    if not emails:
+        if declined:
+            raise HTTPException(
+                422, "Everyone on this list has unsubscribed themselves: "
+                     f"{', '.join(shown)}. They can rejoin from the link in their last "
+                     "alert email.")
+        raise HTTPException(400, "Add at least one email address.")
+    if len(emails) > MAX_ALERT_RECIPIENTS:
+        raise HTTPException(400, f"A list holds at most {MAX_ALERT_RECIPIENTS} addresses.")
     sub_id = store.save_alert_subscription(
         subscription_id=body.subscription_id if existing else "",
         name=(body.name or loaded.name).strip() or loaded.name,
-        emails=body.emails, companies=companies,
-        portfolio_key=body.portfolio_key, active=body.active)
+        emails=emails, companies=companies, portfolio_key=body.portfolio_key,
+        active=body.active if admin or not existing else existing["active"])
+    sub = store.alert_subscription(sub_id)
+    asked = consent.add(store, Mailer(cfg), sub, [e for e in emails if e not in had],
+                        _base_url(request), trusted=admin)
+    if not admin:
+        asked = {k: [consent.mask(a) if isinstance(a, str)
+                     else {**a, "email": consent.mask(a["email"])} for a in v]
+                 for k, v in asked.items()}
     baselined = alerts_engine.baseline(store, sub_id,
                                        [c for c in companies if c not in before])
-    return {"subscription": store.alert_subscription(sub_id), "baselined": baselined}
+    return {"subscription": _shown_list(store, sub, admin), "baselined": baselined,
+            "declined": shown, "consent": asked}
 
 
 @app.delete("/v1/alerts/subscriptions/{subscription_id}", status_code=204,
             tags=["alerts"])
 def delete_subscription(subscription_id: str,
-                        store: Store = Depends(tenant_store)) -> Response:
+                        store: Store = Depends(admin_store)) -> Response:
     if not store.delete_alert_subscription(subscription_id):
         raise HTTPException(404, "No such alert list.")
     return Response(status_code=204)
@@ -895,9 +1208,48 @@ def delete_subscription(subscription_id: str,
 _alerts_running = threading.Lock()
 
 
+def _keep_awake_for_alerts(request: Request) -> None:
+    """Hold a request open against this service for as long as the check runs.
+
+    The check runs inside the request that asked for it, which is enough only
+    while whoever asked is still waiting. The portfolio page asks and moves
+    on; the daily schedule gives up after ten minutes; Cloud Run ends any
+    request at its timeout. After that a managed host sees no work in
+    progress — Cloud Run withdraws the processor, and it or Render's free
+    plan may shut the instance down — with a check half done. In the weeks
+    investment firms refile, reading dozens of new forms takes longer than
+    any of those limits. So, as for a screen (`jobs._hold_open`), the service
+    keeps a request open to itself until the check has finished.
+    """
+    wanted = cfg.keep_awake_wanted
+    if wanted:
+        threading.Thread(
+            target=_hold_open, name="hold-alerts", daemon=True,
+            args=(f"{_base_url(request)}/internal/hold/{ALERTS_HOLD}", _hold_token,
+                  _alerts_running.locked)).start()
+
+
+# On a public site, how soon "Check now" may run again, and a test email be
+# sent to the same list again. Each check reads every watched firm from the
+# SEC, and each test lands in every inbox on a list.
+CHECK_AGAIN_MINUTES = 10
+TEST_AGAIN_MINUTES = 10
+
+
+def _minutes_ago(stamp: str) -> float:
+    try:
+        when = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return float("inf")
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - when).total_seconds() / 60
+
+
 @app.post("/v1/alerts/run", tags=["alerts"])
 def run_alerts(request: Request, only_if_due: bool = Query(False),
-               store: Store = Depends(tenant_store)) -> dict:
+               store: Store = Depends(tenant_store),
+               admin: bool = Depends(is_admin)) -> dict:
     """Check every watched firm and company now and email what is new.
 
     A free instance has no scheduler, so something has to ask. Two things do:
@@ -910,8 +1262,14 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
     busy = {"status": "already running", "emails": [],
             "detail": "A check is already under way. Its results will appear "
                       "under Recent alerts when it finishes."}
+    if cfg.alerts_paused:
+        return {"status": "paused", "emails": [], "detail": ALERTS_PAUSED_NOTE}
     if only_if_due and not alerts_engine.is_due(store):
         return {"status": "not due", "emails": []}
+    if not admin and not alerts_engine.is_due(store, hours=CHECK_AGAIN_MINUTES / 60):
+        return {"status": "recently checked", "emails": [],
+                "detail": f"Every list was checked within the last {CHECK_AGAIN_MINUTES} "
+                          f"minutes. Try again in a few minutes."}
     if not _alerts_running.acquire(blocking=False):
         return busy
     try:
@@ -921,6 +1279,7 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
         if not store.try_lock("alerts"):
             return busy
         try:
+            _keep_awake_for_alerts(request)
             result = alerts_engine.run_alerts(store, _adv(), Mailer(cfg),
                                               _base_url(request), formd=_formd(),
                                               vehicles=_vehicles())
@@ -928,29 +1287,234 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
             store.unlock("alerts")
     finally:
         _alerts_running.release()
+    if not admin:
+        # What went to whom names addresses; visitors see them masked.
+        result["emails"] = [{**e, "detail": consent.mask_text(e.get("detail") or "")}
+                            for e in result["emails"]]
     return {"status": "checked", **result}
 
 
 @app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])
-def test_subscription(subscription_id: str,
-                      store: Store = Depends(tenant_store)) -> dict:
-    """Send one short test email to a list, to prove delivery works."""
+def test_subscription(subscription_id: str, request: Request,
+                      store: Store = Depends(tenant_store),
+                      admin: bool = Depends(is_admin)) -> dict:
+    """Send one short test email to a list, to prove delivery works.
+
+    To the addresses that have confirmed, each with its own unsubscribe link.
+    """
     sub = store.alert_subscription(subscription_id)
     if not sub:
         raise HTTPException(404, "No such alert list.")
     subject = f"FOCI-Screener: test alert for \"{sub['name']}\""
-    text = (f"This is a test from FOCI-Screener. You are on the \"{sub['name']}\" alert "
-            f"list, which watches {len(sub['companies'])} compan"
-            f"{'y' if len(sub['companies']) == 1 else 'ies'}. When one of them changes, "
-            f"an email like this will say what changed and where to look.\n\n"
-            + alerts_engine.FOOTER.format(name=sub["name"]))
-    delivery = Mailer(cfg).send(sub["emails"], subject, text)
+    if not admin:
+        last = next((d for d in store.alert_deliveries(subscription_id, limit=10)
+                     if d["subject"] == subject), None)
+        if last and _minutes_ago(last["created_at"]) < TEST_AGAIN_MINUTES:
+            raise HTTPException(429, f"A test was sent to this list in the last "
+                                     f"{TEST_AGAIN_MINUTES} minutes. It can take a minute "
+                                     f"to arrive; check spam folders too.")
+    to = alerts_engine.recipients(store, sub)
+    if not to:
+        return {"status": "waiting", "recipients": [], "detail": (
+            "Nobody on this list has confirmed yet. Each address was sent a link to "
+            "confirm; alerts, and tests, go to those that have."
+            if consent.waiting(store, sub) else
+            "Nobody on this list can be emailed: everyone on it has unsubscribed.")}
+    intro = (f"This is a test from FOCI-Screener. You are on the \"{sub['name']}\" alert "
+             f"list, which watches {len(sub['companies'])} compan"
+             f"{'y' if len(sub['companies']) == 1 else 'ies'}. When one of them changes, "
+             f"an email like this will say what changed and where to look.\n\n")
+    text = intro + alerts_engine.footer(sub["name"])
+    delivery = Mailer(cfg).send(
+        to, subject, text,
+        personalize=alerts_engine.personalizer(
+            store, sub, _base_url(request),
+            lambda url: (intro + alerts_engine.footer(sub["name"], url), None)))
     store.log_alert_delivery(subscription_id=subscription_id,
                              recipients=delivery.recipients, subject=subject,
                              body_text=text, item_count=0, status=delivery.status,
                              detail=delivery.detail)
-    return {"status": delivery.status, "recipients": delivery.recipients,
-            "detail": delivery.detail}
+    shown = _shown_delivery({"recipients": delivery.recipients, "detail": delivery.detail},
+                            admin)
+    return {"status": delivery.status, "recipients": shown["recipients"],
+            "detail": shown["detail"]}
+
+
+# ------------------------------------------------------------ unsubscribing
+# The link in every alert email. No API key: the person clicking is not a user
+# of this site, and the token in the link is what proves the address is theirs.
+#
+# Opening the link does not unsubscribe. Mail scanners and link previewers
+# fetch every URL in a message, and a GET that acted would take people off
+# lists they never asked to leave. The page asks; its button POSTs. A mail
+# client's own "Unsubscribe" button POSTs directly (RFC 8058), and that is
+# honoured without a page.
+
+def _link_page(title: str, body: str, status: int = 200) -> HTMLResponse:
+    """A page of its own for the links in an email — to unsubscribe, or to
+    confirm. It arrives in a mail program, often on a phone, and needs
+    nothing from the rest of the site."""
+    import html as html_lib
+
+    page = (
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        "<meta name=\"robots\" content=\"noindex\">"
+        f"<title>{html_lib.escape(title)}</title><style>"
+        "body{font-family:Arial,Helvetica,sans-serif;font-size:16px;line-height:1.5;"
+        "color:#1c1c1c;background:#fafaf7;margin:0;padding:48px 16px}"
+        "main{max-width:520px;margin:0 auto;background:#fff;border:1px solid #e3e0d6;"
+        "border-radius:8px;padding:28px}h1{font-size:20px;margin:0 0 12px}"
+        "button{font:inherit;padding:8px 16px;border-radius:6px;border:1px solid #8a6d1f;"
+        "background:#c8a24a;color:#1c1c1c;cursor:pointer}"
+        ".muted{color:#666;font-size:14px}.mono{font-family:Consolas,monospace}"
+        "</style></head><body><main>"
+        f"<h1>{html_lib.escape(title)}</h1>{body}</main></body></html>")
+    return HTMLResponse(page, status_code=status,
+                        headers={"Cache-Control": "no-store",
+                                 "Referrer-Policy": "no-referrer"})
+
+
+def _optout_context(token: str) -> tuple[Store, dict, dict | None] | None:
+    row = store_for(auth.DEFAULT_TENANT).optout_by_token(token) if token else None
+    if row is None:
+        return None
+    store = store_for(row["tenant_id"])
+    return store, row, store.alert_subscription(row["subscription_id"])
+
+
+_UNKNOWN_LINK = ("This link is not recognised. The alert list it belonged to may have "
+                 "been deleted, in which case no more emails will come from it.")
+
+
+@app.get("/u/{token}", include_in_schema=False)
+# The first unsubscribe links, sent before this one, went to /alerts/stop/.
+@app.get("/alerts/stop/{token}", include_in_schema=False)
+def unsubscribe_page(token: str) -> HTMLResponse:
+    import html as html_lib
+
+    found = _optout_context(token)
+    if found is None:
+        return _link_page("Link not recognised",
+                                 f"<p>{_UNKNOWN_LINK}</p>", 404)
+    _, row, sub = found
+    e = html_lib.escape
+    name = e(sub["name"]) if sub else "this list"
+    who = f'<span class="mono">{e(row["email"])}</span>'
+    if row["opted_out_at"]:
+        return _link_page(
+            "You are unsubscribed",
+            f"<p>{who} no longer receives alerts from “{name}”.</p>"
+            f'<form method="post" action="/u/{e(token)}/undo">'
+            f'<p class="muted">Changed your mind?</p>'
+            f"<button type=\"submit\">Subscribe again</button></form>")
+    return _link_page(
+        "Stop these alerts?",
+        f"<p>Stop sending FOCI-Screener alerts for “{name}” to {who}?</p>"
+        f'<form method="post" action="/u/{e(token)}">'
+        f'<input type="hidden" name="List-Unsubscribe" value="One-Click">'
+        f'<button type="submit">Unsubscribe</button></form>'
+        f'<p class="muted" style="margin-top:16px">Only this address is taken off, and '
+        f"only this list. Whoever runs the list will see that you left.</p>")
+
+
+@app.post("/u/{token}", include_in_schema=False)
+@app.post("/alerts/stop/{token}", include_in_schema=False)
+def unsubscribe(token: str) -> HTMLResponse:
+    import html as html_lib
+
+    found = _optout_context(token)
+    if found is None:
+        return _link_page("Link not recognised", f"<p>{_UNKNOWN_LINK}</p>", 404)
+    store, row, sub = found
+    store.set_opted_out(token, True)
+    e = html_lib.escape
+    name = e(sub["name"]) if sub else "this list"
+    return _link_page(
+        "You are unsubscribed",
+        f'<p><span class="mono">{e(row["email"])}</span> will get no more alerts from '
+        f"“{name}”.</p>"
+        f'<form method="post" action="/u/{e(token)}/undo">'
+        f'<p class="muted">Did that by mistake?</p>'
+        f'<button type="submit">Undo</button></form>')
+
+
+@app.post("/u/{token}/undo", include_in_schema=False)
+def resubscribe(token: str) -> HTMLResponse:
+    import html as html_lib
+
+    found = _optout_context(token)
+    if found is None or found[2] is None:
+        return _link_page("Link not recognised", f"<p>{_UNKNOWN_LINK}</p>", 404)
+    store, row, sub = found
+    e = html_lib.escape
+    who = f'<span class="mono">{e(row["email"])}</span>'
+    restored = bool(row["opted_out_at"]) and bool(row["restorable"])
+    store.set_opted_out(token, False)
+    if restored:
+        return _link_page(
+            "Subscribed again",
+            f"<p>{who} is back on “{e(sub['name'])}”. The next alert will reach you "
+            f"as before.</p>")
+    return _link_page(
+        "Not on the list",
+        f"<p>{who} was not on “{e(sub['name'])}” when it unsubscribed, so it has not "
+        f"been added. To be added, ask whoever runs the list.</p>")
+
+
+# ------------------------------------------------------------- confirming
+# The link in the one email a visitor's address is sent before any alert
+# (`consent`). The same token as the unsubscribe link. As there, opening it
+# only asks; the button acts.
+
+def _confirm_page(token: str, row: dict, sub: dict | None, done: bool) -> HTMLResponse:
+    import html as html_lib
+
+    e = html_lib.escape
+    name = e(sub["name"]) if sub else "this list"
+    who = f'<span class="mono">{e(row["email"])}</span>'
+    if row["opted_out_at"]:
+        return _link_page(
+            "You are unsubscribed",
+            f"<p>{who} took itself off “{name}”.</p>"
+            f'<form method="post" action="/u/{e(token)}/undo">'
+            f'<p class="muted">Changed your mind?</p>'
+            f"<button type=\"submit\">Subscribe again</button></form>")
+    if row["status"] == consent.CONFIRMED:
+        return _link_page(
+            "Confirmed" if done else "Already confirmed",
+            f"<p>{who} receives alerts for “{name}”. The first is sent when something "
+            f"next changes.</p><p class=\"muted\">Every alert ends with a link to "
+            f"unsubscribe.</p>")
+    return _link_page(
+        "Confirm email alerts",
+        f"<p>Start sending FOCI-Screener alerts for “{name}” to {who}? An email arrives "
+        f"when something changes for the companies it watches.</p>"
+        f'<form method="post" action="/alerts/confirm/{e(token)}">'
+        f'<button type="submit">Confirm alerts</button></form>'
+        f'<p class="muted" style="margin-top:16px">If you did not ask for this, close '
+        f"this page. Nothing will be sent to you.</p>")
+
+
+@app.get("/alerts/confirm/{token}", include_in_schema=False)
+def confirm_page(token: str) -> HTMLResponse:
+    found = _optout_context(token)
+    if found is None:
+        return _link_page("Link not recognised", f"<p>{_UNKNOWN_LINK}</p>", 404)
+    _, row, sub = found
+    return _confirm_page(token, row, sub, done=False)
+
+
+@app.post("/alerts/confirm/{token}", include_in_schema=False)
+def confirm_recipient(token: str) -> HTMLResponse:
+    found = _optout_context(token)
+    if found is None:
+        return _link_page("Link not recognised", f"<p>{_UNKNOWN_LINK}</p>", 404)
+    store, row, sub = found
+    if not row["opted_out_at"]:
+        store.confirm_alert_recipient(token)
+        row = store.optout_by_token(token) or row
+    return _confirm_page(token, row, sub, done=True)
 
 
 # -------------------------------------------------------------- type-ahead
@@ -1111,12 +1675,20 @@ def list_officers(q: str = "", limit: int = Query(50, ge=1, le=200),
 
 
 @app.get("/v1/officers/{email}", tags=["search"])
-def officer_profile(email: str, store: Store = Depends(tenant_store)) -> dict:
+def officer_profile(email: str,
+                    offset: int = Query(0, ge=0, le=1_000_000),
+                    limit: int = Query(PAGE_ROWS, ge=1, le=500),
+                    store: Store = Depends(tenant_store)) -> dict:
     """What one contracting officer holds — the view that decides who to notify."""
-    contracts = store.contracts_where("ko_email", email)
+    contracts, more = _paged(
+        lambda n, off: store.contracts_where("ko_email", email, n, off), limit, offset)
     if not contracts:
+        if offset:
+            raise HTTPException(404, "No more awards for that officer.")
         raise HTTPException(404, "No contracts recorded for that officer.")
-    entity_keys = {c["entity_key"] for c in contracts}
+    # Over every award the officer holds, not the page shown: which of their
+    # contractors have findings does not depend on which page is open.
+    entity_keys = set(store.entity_keys_where("ko_email", email))
     findings = [f for k in entity_keys
                 for f in store.search_findings(entity_key=k, limit=1)]
     return {
@@ -1130,6 +1702,9 @@ def officer_profile(email: str, store: Store = Depends(tenant_store)) -> dict:
         **store.contract_totals("ko_email", email),
         "contracts": contracts,
         "contracts_shown": len(contracts),
+        "contracts_offset": offset,
+        "contracts_more": more,
+        "entity_keys": sorted(entity_keys),
         "findings": sorted(findings, key=lambda f: -(f.get("total_score") or 0)),
     }
 
@@ -1141,12 +1716,22 @@ def list_agencies(q: str = "", limit: int = Query(50, ge=1, le=200),
 
 
 @app.get("/v1/agencies/{name:path}", tags=["search"])
-def agency_profile(name: str, store: Store = Depends(tenant_store)) -> dict:
-    contracts = store.contracts_where("agency", name)
+def agency_profile(name: str,
+                   entities_offset: int = Query(0, ge=0, le=1_000_000),
+                   officers_offset: int = Query(0, ge=0, le=1_000_000),
+                   limit: int = Query(PAGE_ROWS, ge=1, le=500),
+                   store: Store = Depends(tenant_store)) -> dict:
+    # Two lists on one page, each paged on its own: turning through an
+    # agency's contractors should not reset where its officer list was.
+    contracts = store.contracts_where("agency", name, 1)
     if not contracts:
-        contracts = store.contracts_where("sub_agency", name)
+        contracts = store.contracts_where("sub_agency", name, 1)
     if not contracts:
         raise HTTPException(404, "No contracts recorded for that agency.")
+    entities, entities_more = _paged(
+        lambda n, off: store.entities_for_agency(name, n, off), limit, entities_offset)
+    officers, officers_more = _paged(
+        lambda n, off: store.officers_for_agency(name, n, off), limit, officers_offset)
 
     # Totals, contractors and officers all come from SQL over the whole agency.
     # Aggregating the 200-row page above understated every figure on the page,
@@ -1155,9 +1740,14 @@ def agency_profile(name: str, store: Store = Depends(tenant_store)) -> dict:
     return {
         "agency": name,
         **store.agency_totals(name),
-        "contracts_shown": len(contracts),
-        "entities": store.entities_for_agency(name),
-        "officers": store.officers_for_agency(name),
+        "entities": entities,
+        "entities_offset": entities_offset,
+        "entities_more": entities_more,
+        "officers": officers,
+        "officers_offset": officers_offset,
+        "officers_more": officers_more,
+        # Every contractor, for "watch them all" — not the page shown.
+        "entity_keys": store.entity_keys_for_agency(name),
     }
 
 
@@ -1256,7 +1846,7 @@ def list_rules(store: Store = Depends(tenant_store)) -> dict:
 
 @app.put("/v1/rules/{rule_id}", tags=["rules"])
 def set_rule(rule_id: str, body: RuleSetting,
-             tenant: str = Depends(require_tenant)) -> dict:
+             tenant: str = Depends(require_admin)) -> dict:
     """Override a rule for this tenant. Takes effect on the next screen."""
     store = store_for(tenant)
     store.set_rule_setting(
@@ -1266,7 +1856,7 @@ def set_rule(rule_id: str, body: RuleSetting,
 
 
 @app.delete("/v1/rules/{rule_id}", status_code=204, tags=["rules"])
-def clear_rule(rule_id: str, tenant: str = Depends(require_tenant)) -> Response:
+def clear_rule(rule_id: str, tenant: str = Depends(require_admin)) -> Response:
     """Drop the override and go back to the engine default."""
     store_for(tenant).clear_rule_setting(rule_id)
     return Response(status_code=204)
@@ -1298,7 +1888,7 @@ def get_policy(store: Store = Depends(tenant_store)) -> dict:
 
 
 @app.put("/v1/policy", tags=["policy"])
-def set_policy(body: dict, tenant: str = Depends(require_tenant)) -> dict:
+def set_policy(body: dict, tenant: str = Depends(require_admin)) -> dict:
     """Save a policy. Takes effect on the next screen.
 
     Anything inconsistent is corrected rather than refused — a notice for a
@@ -1317,7 +1907,7 @@ def set_policy(body: dict, tenant: str = Depends(require_tenant)) -> dict:
 
 
 @app.delete("/v1/policy", status_code=204, tags=["policy"])
-def reset_policy(tenant: str = Depends(require_tenant)) -> Response:
+def reset_policy(tenant: str = Depends(require_admin)) -> Response:
     """Back to the defaults, and to any later change in what they are."""
     store_for(tenant).clear_screening_policy()
     return Response(status_code=204)
@@ -1446,16 +2036,52 @@ def document_diff(source: str, key: str, from_sha: str = "", to_sha: str = "",
 @app.post("/v1/watchlists", status_code=201, tags=["watchlists"])
 def create_watchlist(body: WatchlistRequest,
                      store: Store = Depends(tenant_store)) -> dict:
-    watchlist_id = store.create_watchlist(body.name, body.screen.model_dump())
-    return {"watchlist_id": watchlist_id, "name": body.name, "active": True}
+    override, policy, notes = screening.clean_override(store.screening_policy(),
+                                                       body.policy)
+    watchlist_id = store.create_watchlist(body.name, body.screen.model_dump(),
+                                          policy=override or None)
+    return {"watchlist_id": watchlist_id, "name": body.name, "active": True,
+            "policy_override": override, "policy": policy.to_dict(), "notes": notes}
 
 
 @app.get("/v1/watchlists", tags=["watchlists"])
 def list_watchlists(store: Store = Depends(tenant_store)) -> dict:
+    tenant_policy = store.screening_policy()
     rows = store.list_watchlists()
     for r in rows:
         r["params"] = _json(r.get("params"))
+        override = _json(r.pop("policy", None)) or {}
+        r["policy_override"] = override
+        r["policy"] = screening.merge(tenant_policy, override)[0].to_dict()
     return {"watchlists": rows}
+
+
+@app.put("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
+def set_watchlist_policy(watchlist_id: str, body: dict,
+                         store: Store = Depends(admin_store)) -> dict:
+    """Replace the settings this watchlist overrides. Takes effect on its next run.
+
+    Name only what differs from the tenant policy — `{"notice_min_severity":
+    "low"}` for a portfolio of high-priority primes. Unnamed settings keep
+    following the tenant, including later changes to it. Inconsistencies are
+    corrected and reported, as for the tenant policy.
+    """
+    override, policy, notes = screening.clean_override(store.screening_policy(), body)
+    if not store.set_watchlist_policy(watchlist_id, override or None):
+        raise HTTPException(404, "No such watchlist.")
+    return {"watchlist_id": watchlist_id, "policy_override": override,
+            "policy": policy.to_dict(), "notes": notes}
+
+
+@app.delete("/v1/watchlists/{watchlist_id}/policy", tags=["watchlists"])
+def clear_watchlist_policy(watchlist_id: str,
+                           store: Store = Depends(admin_store)) -> dict:
+    """Back to the tenant policy for everything."""
+    if not store.set_watchlist_policy(watchlist_id, None):
+        raise HTTPException(404, "No such watchlist.")
+    policy, _ = screening.merge(store.screening_policy(), None)
+    return {"watchlist_id": watchlist_id, "policy_override": {},
+            "policy": policy.to_dict()}
 
 
 @app.post("/v1/watchlists/{watchlist_id}/run", status_code=202, tags=["watchlists"])
@@ -1465,16 +2091,26 @@ def run_watchlist(watchlist_id: str, request: Request,
     rows = [w for w in store.list_watchlists() if w["watchlist_id"] == watchlist_id]
     if not rows:
         raise HTTPException(404, "No such watchlist.")
-    options = _json(rows[0]["params"])
+    options = {**_json(rows[0]["params"]), "watchlist_id": watchlist_id}
     run_id = store.start_run(options.get("agency", ""), options, status="queued")
     store.mark_watchlist_run(watchlist_id, run_id)
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
-    return {"run_id": run_id, "status": "queued"}
+    return {"run_id": run_id, "status": "queued", **_execute_link(run_id)}
+
+
+@app.post("/v1/watchlists/{watchlist_id}/resume", tags=["watchlists"])
+def resume_watchlist(watchlist_id: str, store: Store = Depends(tenant_store)) -> dict:
+    """Put a paused watchlist back on the nightly sweep."""
+    if not store.set_watchlist_active(watchlist_id, True):
+        raise HTTPException(404, "No such watchlist.")
+    return {"watchlist_id": watchlist_id, "active": True}
 
 
 @app.delete("/v1/watchlists/{watchlist_id}", tags=["watchlists"])
 def deactivate_watchlist(watchlist_id: str,
                          store: Store = Depends(tenant_store)) -> dict:
+    """Pause a watchlist. Nothing is removed, and resuming is open to all, so
+    pausing is too."""
     if not store.set_watchlist_active(watchlist_id, False):
         raise HTTPException(404, "No such watchlist.")
     return {"watchlist_id": watchlist_id, "active": False}
@@ -1540,12 +2176,15 @@ def _decision_error(outcome: str) -> None:
 
 @app.post("/v1/notices/{notice_id}/approve", tags=["notices"])
 def approve_notice(notice_id: str, body: NoticeDecision,
-                   tenant: str = Depends(require_tenant)) -> dict:
-    """Approve a notice for delivery, optionally with an edited body.
+                   tenant: str = Depends(require_admin)) -> dict:
+    """Approve a notice, optionally with an edited body, and hand it to Gmail.
 
-    Approval records a decision; it does not itself send. Delivery still depends
-    on `GMAIL_ENABLED` and `GMAIL_SEND`, and while `FOCI_EMAIL_REDIRECT_TO` is
-    set every approved notice goes to that address instead of the officer.
+    Approval is the decision; delivery follows it under the same guards as
+    everything else: nothing leaves unless `GMAIL_ENABLED`, it becomes a draft
+    rather than a send unless `GMAIL_SEND`, and while `FOCI_EMAIL_REDIRECT_TO` is
+    set it goes to that address instead of the officer. If delivery does not
+    happen — switched off, not signed in, refused — the approval still stands
+    and `POST /v1/notices/{id}/deliver` tries again.
 
     An edit may change anything except the limitations statement. That paragraph
     is what makes the notice a screening result rather than an assertion about a
@@ -1568,15 +2207,55 @@ def approve_notice(notice_id: str, body: NoticeDecision,
     _decision_error(store.decide_notice(
         notice_id, "approved", decided_by=_decider(body, tenant),
         note=body.note, body_text=body.body_text))
-    decided = store.get_notice(notice_id)
-    return {"notice_id": notice_id, "status": "approved",
-            "edited": bool(decided and decided.get("original_body_text")),
-            "delivery": _delivery_state()}
+    edited = bool((store.get_notice(notice_id) or {}).get("original_body_text"))
+    delivery = _deliver(store, notice_id)
+    return {"notice_id": notice_id, "status": delivery.pop("notice_status"),
+            "edited": edited, "delivery": delivery}
+
+
+@app.post("/v1/notices/{notice_id}/deliver", tags=["notices"])
+def deliver_notice(notice_id: str, store: Store = Depends(admin_store)) -> dict:
+    """Try again to deliver an approved notice that has not reached Gmail.
+
+    For a notice approved while delivery was off, or whose delivery failed.
+    Only an approved notice qualifies: a pending one has not been decided, and
+    one already drafted or sent is not sent twice.
+    """
+    notice = store.get_notice(notice_id)
+    if notice is None:
+        raise HTTPException(404, "No such notice.")
+    if notice["status"] != "approved":
+        raise HTTPException(
+            409, f"Only an approved notice that has not been delivered can be; this "
+                 f"one is {notice['status']}.")
+    delivery = _deliver(store, notice_id)
+    return {"notice_id": notice_id, "status": delivery.pop("notice_status"),
+            "delivery": delivery}
+
+
+# One notifier for the process, so a Gmail connection is made once rather than
+# on every approval.
+_gmail = GmailNotifier(cfg)
+
+
+def _deliver(store: Store, notice_id: str) -> dict:
+    """Hand an approved notice to Gmail and record the outcome on it."""
+    notice = store.get_notice(notice_id) or {}
+    result = _gmail.deliver_notice(notice)
+    if store.record_notice_delivery(notice_id, result.status,
+                                    delivered_to=result.recipient,
+                                    detail=result.detail) != "ok":
+        # Decided by someone else between the read and the write; what Gmail
+        # did is still worth saying, but the row is theirs.
+        log.warning("notice %s changed state during delivery", notice_id)
+    current = store.get_notice(notice_id) or {}
+    return {**_delivery_state(), "outcome": result.status, "to": result.recipient,
+            "detail": result.detail, "notice_status": current.get("status", "")}
 
 
 @app.post("/v1/notices/{notice_id}/reject", tags=["notices"])
 def reject_notice(notice_id: str, body: NoticeDecision,
-                  tenant: str = Depends(require_tenant)) -> dict:
+                  tenant: str = Depends(require_admin)) -> dict:
     """Reject a notice.
 
     Worth capturing the reason: rejections are the only labelled false-positive
@@ -1593,10 +2272,13 @@ def _delivery_state() -> dict:
         return {"mode": "render_only",
                 "detail": "GMAIL_ENABLED is false; download the .eml to route it."}
     if cfg.email_redirect_to:
-        return {"mode": "redirected", "detail": f"All mail goes to {cfg.email_redirect_to}."}
+        return {"mode": "redirected",
+                "detail": f"Approved notices go to {cfg.email_redirect_to} instead of the "
+                          f"officer, as Gmail "
+                          f"{'sends' if cfg.gmail_send else 'drafts'}."}
     return {"mode": "send" if cfg.gmail_send else "draft",
-            "detail": "Gmail drafts are created for review."
-                      if not cfg.gmail_send else "Approved notices are sent."}
+            "detail": "Approved notices become Gmail drafts for someone to send."
+                      if not cfg.gmail_send else "Approved notices are sent through Gmail."}
 
 
 # ---------------------------------------------------------------------- web

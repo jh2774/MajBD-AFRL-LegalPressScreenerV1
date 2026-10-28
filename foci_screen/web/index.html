@@ -28,6 +28,7 @@
     <a href="#/">Overview</a>
     <a href="#/portfolio">Portfolio</a>
     <a href="#/notices">Notices <span id="notice-badge" class="badge" hidden></span></a>
+    <a href="#/watchlists">Watchlists</a>
     <a href="#/screening">Screening</a>
     <a href="#/rules">Rules</a>
     <button id="key-button" type="button" class="linkish">API key</button>
@@ -40,8 +41,8 @@
 
 <dialog id="key-dialog">
   <form method="dialog" id="key-form">
-    <h2>API key</h2>
-    <p class="muted">
+    <h2 id="key-title">API key</h2>
+    <p class="muted" id="key-explain">
       This deployment requires a key. It is kept in this browser's local storage
       and sent as a bearer token — treat it like a password and use a private
       browser profile on a shared machine.
@@ -57,6 +58,7 @@
 <footer class="foot">
   Screening output from public records. Not a FOCI determination, a sanctions
   adjudication, or a finding of non-compliance.
+  <a href="#/system">System check</a>
 </footer>
 
 <script src="./app.js"></script>

@@ -73,7 +73,8 @@ def sweep() -> int:
         for row in watchlists:
             tenant = row["tenant_id"]
             try:
-                options = json.loads(row["params"])
+                options = {**json.loads(row["params"]),
+                           "watchlist_id": row["watchlist_id"]}
             except (ValueError, TypeError):
                 log.warning("watchlist %s has unreadable params — skipping",
                             row["watchlist_id"])

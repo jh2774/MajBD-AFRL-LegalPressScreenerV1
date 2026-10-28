@@ -22,6 +22,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import secrets
 import threading
 import time
 import uuid
@@ -130,7 +131,10 @@ CREATE TABLE IF NOT EXISTS notices (
     decision_note TEXT,
     created_at  TEXT NOT NULL,
     signal_ids  TEXT,
-    trigger_reason TEXT
+    trigger_reason TEXT,
+    delivered_to TEXT,
+    delivered_at TEXT,
+    delivery_detail TEXT
 );
 -- The latest reading of each investment firm's Form ADV, and every change seen
 -- between readings. Global, like document snapshots: a filing is a public
@@ -229,6 +233,18 @@ CREATE TABLE IF NOT EXISTS alert_sent (
     sent_at      TEXT NOT NULL,
     PRIMARY KEY (subscription_id, item_id)
 );
+-- Addresses the mail service reported as dead or complaining (notify/
+-- bounces.py). Not tenant-scoped, like snapshots: that an address bounces is a
+-- fact about the address, not about whose list it is on.
+CREATE TABLE IF NOT EXISTS mail_suppressions (
+    email        TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    reason       TEXT,
+    provider     TEXT,
+    first_at     TEXT NOT NULL,
+    last_at      TEXT NOT NULL,
+    events       INTEGER NOT NULL DEFAULT 1
+);
 -- Every email composed, sent or not, with exactly what it said.
 CREATE TABLE IF NOT EXISTS alert_deliveries (
     delivery_id  TEXT PRIMARY KEY,
@@ -241,6 +257,28 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
     item_count   INTEGER NOT NULL DEFAULT 0,
     status       TEXT NOT NULL,
     detail       TEXT
+);
+-- One row per address on an alert list: whether it has agreed to be emailed
+-- — pending (asked, not yet answered), confirmed, or unsubscribed — and the
+-- token behind the links its emails carry, which is all that confirming or
+-- unsubscribing takes. An address with no row was put on its list before
+-- this existed, by someone holding a key, and is taken as confirmed. A row
+-- outlives the address's removal from the list on purpose: someone who
+-- unsubscribed is not quietly put back by whoever next saves the list.
+CREATE TABLE IF NOT EXISTS alert_recipients (
+    subscription_id TEXT NOT NULL,
+    email        TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    token        TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    added_at     TEXT NOT NULL,
+    asked_at     TEXT,
+    answered_at  TEXT,
+    -- Whether unsubscribing is what took the address off the list. Only then
+    -- does "undo" put it back: someone the list's owner removed must not be
+    -- able to re-add themselves through an old email's link.
+    restorable   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (subscription_id, email)
 );
 -- One row per tenant: what it screens for and what raises a notice. JSON
 -- rather than columns because the shape will grow, and every read wants the
@@ -361,11 +399,15 @@ CREATE TABLE IF NOT EXISTS watchlists (
     active       INTEGER NOT NULL DEFAULT 1,
     last_run_at  TEXT,
     last_run_id  TEXT,
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    -- Only the screening-policy settings this watchlist changes, as JSON.
+    -- Everything else follows the tenant's policy. NULL: follows it entirely.
+    policy       TEXT
 );
 """
 
 INDEXES = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_recipients_token ON alert_recipients(token);
 CREATE INDEX IF NOT EXISTS idx_findings_entity ON findings(entity_key);
 CREATE INDEX IF NOT EXISTS idx_findings_run ON findings(run_id);
 CREATE INDEX IF NOT EXISTS idx_findings_tenant ON findings(tenant_id, id);
@@ -390,6 +432,7 @@ CREATE INDEX IF NOT EXISTS idx_formd_index_filed ON formd_index(filed);
 # would keep its old shape and then fail on the first index over a new column.
 # Applied only where the column is genuinely absent.
 COLUMN_ADDITIONS = [
+    ("watchlists", "policy", "TEXT"),
     ("runs", "tenant_id", "TEXT NOT NULL DEFAULT 'default'"),
     ("runs", "status", "TEXT NOT NULL DEFAULT 'complete'"),
     ("runs", "progress", "TEXT"),
@@ -404,9 +447,16 @@ COLUMN_ADDITIONS = [
     # from a threshold.
     ("notices", "signal_ids", "TEXT"),
     ("notices", "trigger_reason", "TEXT"),
+    # Where an approved notice actually went, and what became of it. Approval
+    # and delivery are separate events: a notice can be approved while delivery
+    # is switched off, and the record has to say which one happened.
+    ("notices", "delivered_to", "TEXT"),
+    ("notices", "delivered_at", "TEXT"),
+    ("notices", "delivery_detail", "TEXT"),
     ("contracts", "is_subaward", "INTEGER DEFAULT 0"),
     ("contracts", "prime_award_id", "TEXT"),
     ("contracts", "prime_recipient_name", "TEXT"),
+    ("alert_recipients", "restorable", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -518,9 +568,23 @@ def open_connection(dsn: str):
         except ImportError as exc:      # say which extra, not "no module named"
             raise RuntimeError(DRIVER_MISSING) from exc
 
+        from psycopg import sql
+
+        from .dburl import schema_for
+
         # Render hands out postgres:// ; psycopg wants postgresql://
-        return psycopg.connect(dsn.replace("postgres://", "postgresql://", 1),
+        conn = psycopg.connect(dsn.replace("postgres://", "postgresql://", 1),
                                row_factory=dict_row, autocommit=False)
+        schema = schema_for(dsn)
+        if schema:
+            # Every table, index and query here is unqualified, so naming the
+            # schema once per connection puts all of it there (see dburl).
+            with conn.cursor() as cur:
+                cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(
+                    sql.Identifier(schema)))
+                cur.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
+            conn.commit()
+        return conn
 
     import sqlite3
 
@@ -608,8 +672,12 @@ class Store:
     def _table_columns(self, cur, table: str) -> set[str]:
         """Existing column names, or empty if the table is absent."""
         if self.is_postgres:
+            # In this connection's own schema: Supabase's other schemas hold
+            # tables of their own, and a name shared with one of them would
+            # otherwise answer for a table that is not there.
             cur.execute("SELECT column_name FROM information_schema.columns"
-                        " WHERE table_name = %s", (table,))
+                        " WHERE table_name = %s AND table_schema = current_schema()",
+                        (table,))
             return {r["column_name"] for r in cur.fetchall()}
         cur.execute(f"PRAGMA table_info({table})")
         return {r[1] for r in cur.fetchall()}
@@ -765,17 +833,41 @@ class Store:
         caller decides that; see the startup sweep in the API, which runs it
         only when screening happens in-process.
         """
-        stuck = self._query(
-            "SELECT run_id FROM runs WHERE tenant_id=? AND status='running'",
-            (self.tenant_id,))
+        return self.close_stale_runs(note, statuses=("running",))
+
+    def close_stale_runs(self, note: str, *, statuses: tuple[str, ...] = ("running",),
+                         started_before: str = "") -> int:
+        """Mark runs in `statuses` as interrupted, with `note` as the reason —
+        only those started before `started_before` (an ISO time), if given.
+
+        The age limit is what makes this safe where several copies of the
+        site run at once, as on Vercel: a run younger than the longest a
+        screen may take could belong to another copy that is still on it.
+        """
+        marks = ",".join("?" for _ in statuses)
+        where = f" WHERE tenant_id=? AND status IN ({marks})"
+        params: list = [self.tenant_id, *statuses]
+        if started_before:
+            where += " AND started_at < ?"
+            params.append(started_before)
+        stuck = self._query("SELECT run_id FROM runs" + where, tuple(params))
         if not stuck:
             return 0
         with self._tx() as c:
-            c.execute(
-                "UPDATE runs SET status='interrupted', finished_at=?, error=?"
-                " WHERE tenant_id=? AND status='running'",
-                (_now(), note, self.tenant_id))
+            c.execute("UPDATE runs SET status='interrupted', finished_at=?, error=?" + where,
+                      (_now(), note, *params))
         return len(stuck)
+
+    def claim_run(self, run_id: str) -> bool:
+        """Move a queued run to running, unless something else already has.
+
+        Two tabs, or a page reloaded at the wrong moment, can ask for the same
+        screen to be run twice; only the first is allowed to.
+        """
+        with self._tx() as c:
+            c.execute("UPDATE runs SET status='running' WHERE run_id=? AND tenant_id=?"
+                      " AND status='queued'", (run_id, self.tenant_id))
+            return c.rowcount() == 1
 
     def finish_run(self, run_id: str, status: str = "complete",
                    stats: dict | None = None, error: str = "") -> None:
@@ -1466,7 +1558,117 @@ class Store:
             c.execute("DELETE FROM alert_subscriptions WHERE tenant_id=? AND"
                       " subscription_id=?", (self.tenant_id, subscription_id))
             c.execute("DELETE FROM alert_sent WHERE subscription_id=?", (subscription_id,))
+            c.execute("DELETE FROM alert_recipients WHERE subscription_id=?",
+                      (subscription_id,))
         return True
+
+    # ----------------------------------------------------- unsubscribing
+    def unsubscribe_token(self, subscription_id: str, email: str) -> str:
+        """The secret behind one address's links. An address on a list with no
+        record yet was put there before records were kept, by someone holding a
+        key, and is recorded now as confirmed.
+
+        Random rather than derived from a server secret, so there is no key to
+        configure or rotate, and a link stays valid for as long as its row does.
+        """
+        email = email.strip().lower()
+        row = self.alert_recipients(subscription_id).get(email) \
+            or self.add_alert_recipient(subscription_id, email, "confirmed")
+        return row["token"]
+
+    def optout_by_token(self, token: str) -> dict | None:
+        """The row behind a link, whichever tenant it belongs to, with
+        `opted_out_at` set when the address has unsubscribed.
+
+        Deliberately not tenant-scoped: the person clicking has no key, and
+        the token is what identifies the tenant.
+        """
+        row = self.alert_recipient_by_token(token)
+        if row is None:
+            return None
+        return {**row, "opted_out_at": row["answered_at"]
+                if row["status"] == "unsubscribed" else None}
+
+    def opted_out(self, subscription_id: str) -> dict[str, str]:
+        """{address: when} for everyone who has unsubscribed from a list."""
+        return {r["email"]: r["answered_at"] for r in self._query(
+            "SELECT email, answered_at FROM alert_recipients WHERE tenant_id=?"
+            " AND subscription_id=? AND status='unsubscribed'",
+            (self.tenant_id, subscription_id))}
+
+    def set_opted_out(self, token: str, out: bool) -> dict | None:
+        """Unsubscribe, or undo it. Returns the updated row, or None for an
+        unknown token.
+
+        Unsubscribing takes the address off the list. Undoing clears the
+        opt-out, and puts the address back only if unsubscribing is what took
+        it off — not if the list's owner had already removed it. Either way
+        the link proved the address is theirs, so undoing confirms it.
+        """
+        row = self.optout_by_token(token)
+        if row is None or row["tenant_id"] != self.tenant_id:
+            return None
+        if bool(row["opted_out_at"]) == out:
+            return row                              # already so; a second click
+        sub = self.alert_subscription(row["subscription_id"])
+        listed = sub is not None and row["email"] in {e.lower() for e in sub["emails"]}
+        with self._tx() as c:
+            if out:
+                c.execute("UPDATE alert_recipients SET status='unsubscribed', answered_at=?,"
+                          " restorable=? WHERE token=?", (_now(), 1 if listed else 0, token))
+                emails = [e for e in sub["emails"] if e.lower() != row["email"]] \
+                    if listed else None
+            else:
+                c.execute("UPDATE alert_recipients SET status='confirmed', answered_at=?,"
+                          " restorable=0 WHERE token=?", (_now(), token))
+                emails = sub["emails"] + [row["email"]] \
+                    if sub is not None and row["restorable"] and not listed else None
+            if emails is not None:
+                c.execute("UPDATE alert_subscriptions SET emails=?, updated_at=?"
+                          " WHERE tenant_id=? AND subscription_id=?",
+                          (json.dumps(emails), _now(), self.tenant_id,
+                           row["subscription_id"]))
+        return self.optout_by_token(token)
+
+    # ------------------------------------------------- bounces, complaints
+    def suppress_address(self, email: str, kind: str, reason: str = "",
+                         provider: str = "") -> None:
+        """Record a bounce or complaint. A complaint is never downgraded to a
+        bounce by a later report: it is the stronger reason not to send."""
+        email, now = email.strip().lower(), _now()
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO mail_suppressions (email, kind, reason, provider, first_at,"
+                " last_at, events) VALUES (?,?,?,?,?,?,1) ON CONFLICT (email) DO UPDATE SET"
+                " kind=CASE WHEN mail_suppressions.kind='complaint' THEN 'complaint'"
+                " ELSE excluded.kind END,"
+                " reason=excluded.reason, provider=excluded.provider,"
+                " last_at=excluded.last_at, events=mail_suppressions.events+1",
+                (email, kind, reason, provider, now, now))
+
+    def suppressed(self, emails: list[str] | None = None) -> dict[str, dict]:
+        """{address: row} for suppressed addresses, optionally among `emails`."""
+        if emails is not None:
+            wanted = sorted({e.strip().lower() for e in emails if e})
+            if not wanted:
+                return {}
+            marks = ",".join("?" for _ in wanted)
+            rows = self._query(f"SELECT * FROM mail_suppressions WHERE email IN ({marks})",
+                               tuple(wanted))
+        else:
+            rows = self._query("SELECT * FROM mail_suppressions ORDER BY last_at DESC")
+        return {r["email"]: r for r in rows}
+
+    def clear_suppression(self, email: str, *, allow_complaint: bool = False) -> str:
+        """Returns "ok", "not_found" or "complaint" (refused without allow_complaint)."""
+        row = self.suppressed([email]).get(email.strip().lower())
+        if row is None:
+            return "not_found"
+        if row["kind"] == "complaint" and not allow_complaint:
+            return "complaint"
+        with self._tx() as c:
+            c.execute("DELETE FROM mail_suppressions WHERE email=?", (row["email"],))
+        return "ok"
 
     def alert_already_sent(self, subscription_id: str) -> set[str]:
         return {r["item_id"] for r in self._query(
@@ -1509,13 +1711,73 @@ class Store:
             r["recipients"] = json.loads(r.get("recipients") or "[]")
         return rows
 
+    # ------------------------------------------------ who agreed to be emailed
+    def alert_recipients(self, subscription_id: str) -> dict[str, dict]:
+        """{address: consent record} for a list's addresses that have one."""
+        rows = self._query("SELECT * FROM alert_recipients WHERE subscription_id=?",
+                           (subscription_id,))
+        return {r["email"]: r for r in rows}
+
+    def add_alert_recipient(self, subscription_id: str, email: str, status: str) -> dict:
+        """Record an address as on a list, as `status`. One already recorded is
+        left as it is: an unsubscribe is undone only by the person, from their
+        own link (`set_opted_out`)."""
+        email = email.strip().lower()
+        existing = self.alert_recipients(subscription_id).get(email)
+        if existing:
+            return existing
+        with self._tx() as c:
+            # Another process may have recorded it first; theirs is kept.
+            c.execute("INSERT INTO alert_recipients (subscription_id, email, tenant_id,"
+                      " token, status, added_at) VALUES (?,?,?,?,?,?)"
+                      " ON CONFLICT (subscription_id, email) DO NOTHING",
+                      (subscription_id, email, self.tenant_id,
+                       secrets.token_urlsafe(24), status, _now()))
+        return self.alert_recipients(subscription_id)[email]
+
+    def mark_alert_recipient_asked(self, subscription_id: str, email: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE alert_recipients SET asked_at=? WHERE subscription_id=?"
+                      " AND email=?", (_now(), subscription_id, email))
+
+    def alert_recipient_last_asked(self, email: str) -> str:
+        """When this address was last asked to confirm, for any list of any
+        tenant, or "" if never: a request a day is the most anyone gets."""
+        row = self._one("SELECT MAX(asked_at) AS asked FROM alert_recipients WHERE email=?",
+                        (email,))
+        return str((row or {}).get("asked") or "")
+
+    def alert_recipients_asked_since(self, when: str) -> int:
+        """Requests to confirm sent since `when`, by every tenant: the mail
+        service's daily allowance is the site's, not one tenant's."""
+        row = self._one("SELECT COUNT(*) AS n FROM alert_recipients WHERE asked_at >= ?",
+                        (when,))
+        return int(row["n"]) if row else 0
+
+    def alert_recipient_by_token(self, token: str) -> dict | None:
+        """Whichever tenant's it is: the token is the whole of the authority to
+        confirm, or unsubscribe, that one address on that one list."""
+        return self._one("SELECT * FROM alert_recipients WHERE token=?", (token,))
+
+    def confirm_alert_recipient(self, token: str) -> dict | None:
+        """The person agreed, from the link in their request to confirm. An
+        address that has since unsubscribed is left unsubscribed."""
+        row = self.alert_recipient_by_token(token)
+        if not row or row["status"] != "pending":
+            return row
+        with self._tx() as c:
+            c.execute("UPDATE alert_recipients SET status='confirmed', answered_at=?"
+                      " WHERE token=? AND status='pending'", (_now(), token))
+        return self.alert_recipient_by_token(token)
+
     def notices_for_entities(self, entity_keys: list[str], limit: int = 200) -> list[dict]:
         if not entity_keys:
             return []
         marks = ",".join("?" for _ in entity_keys)
         return self._query(
             f"SELECT * FROM notices WHERE tenant_id=? AND entity_key IN ({marks})"
-            f" AND status IN ('pending','approved') ORDER BY created_at DESC LIMIT ?",
+            f" AND status IN ('pending','approved','drafted','sent')"
+            f" ORDER BY created_at DESC LIMIT ?",
             (self.tenant_id, *entity_keys, limit))
 
     # --------------------------------------------------------- screening policy
@@ -1595,6 +1857,42 @@ class Store:
             if c.rowcount() == 0:
                 return "already_decided"
         return "ok"
+
+    def record_notice_delivery(self, notice_id: str, status: str, *,
+                               delivered_to: str = "", detail: str = "") -> str:
+        """Record what happened when an approved notice was handed to Gmail.
+
+        `status` is the delivery outcome: "drafted" or "sent" move the notice on,
+        so it leaves the approved-but-undelivered pile; anything else ("rendered",
+        "error") leaves it approved, with the reason kept, so it can be tried
+        again once delivery is switched on or fixed.
+
+        Returns "ok", "not_found" or "not_approved". Only an approved notice can
+        be delivered — the guard is in the UPDATE as well, so a notice decided
+        a moment ago by someone else cannot be sent from a stale read.
+        """
+        existing = self.get_notice(notice_id)
+        if existing is None:
+            return "not_found"
+        if existing["status"] != "approved":
+            return "not_approved"
+        moved = status in ("drafted", "sent")
+        with self._tx() as c:
+            c.execute("UPDATE notices SET status=?, delivered_to=?, delivered_at=?,"
+                      " delivery_detail=?"
+                      " WHERE notice_id=? AND tenant_id=? AND status='approved'",
+                      (status if moved else "approved", delivered_to or None,
+                       _now() if moved else None, detail[:1000],
+                       notice_id, self.tenant_id))
+            if c.rowcount() == 0:
+                return "not_approved"
+        return "ok"
+
+    def undelivered_notices(self, limit: int = 200) -> list[dict]:
+        """Approved notices that have not yet become a Gmail draft or a send."""
+        return self._query("SELECT * FROM notices WHERE tenant_id=? AND status='approved'"
+                           " ORDER BY decided_at, created_at LIMIT ?",
+                           (self.tenant_id, limit))
 
     def notice_edits(self, notice: dict) -> dict | None:
         """What a reviewer changed, as diff lines. None if the text is as generated."""
@@ -1800,14 +2098,39 @@ class Store:
             " ORDER BY status, confidence ASC LIMIT ?", (self.tenant_id, limit))
 
     # ------------------------------------------------------------ watchlists
-    def create_watchlist(self, name: str, params: dict) -> str:
+    def create_watchlist(self, name: str, params: dict,
+                         policy: dict | None = None) -> str:
         watchlist_id = uuid.uuid4().hex[:12]
         with self._tx() as c:
             c.execute("INSERT INTO watchlists (watchlist_id, tenant_id, name, params,"
-                      " active, created_at) VALUES (?,?,?,?,?,?)",
+                      " active, created_at, policy) VALUES (?,?,?,?,?,?,?)",
                       (watchlist_id, self.tenant_id, name,
-                       json.dumps(params, default=str), 1, _now()))
+                       json.dumps(params, default=str), 1, _now(),
+                       json.dumps(policy) if policy else None))
         return watchlist_id
+
+    def get_watchlist(self, watchlist_id: str) -> dict | None:
+        return self._one("SELECT * FROM watchlists WHERE watchlist_id=? AND tenant_id=?",
+                         (watchlist_id, self.tenant_id))
+
+    def watchlist_policy(self, watchlist_id: str) -> dict | None:
+        """The settings this watchlist overrides, or None to follow the tenant."""
+        row = self.get_watchlist(watchlist_id)
+        if not row or not row.get("policy"):
+            return None
+        try:
+            return json.loads(row["policy"]) or None
+        except (ValueError, TypeError):
+            return None
+
+    def set_watchlist_policy(self, watchlist_id: str, policy: dict | None) -> bool:
+        if self.get_watchlist(watchlist_id) is None:
+            return False
+        with self._tx() as c:
+            c.execute("UPDATE watchlists SET policy=? WHERE watchlist_id=? AND tenant_id=?",
+                      (json.dumps(policy) if policy else None, watchlist_id,
+                       self.tenant_id))
+        return True
 
     def list_watchlists(self, active_only: bool = False) -> list[dict]:
         sql = "SELECT * FROM watchlists WHERE tenant_id=?"
@@ -2064,14 +2387,28 @@ class Store:
 
     FILTERABLE = {"entity_key", "ko_email", "agency", "sub_agency", "run_id"}
 
-    def contracts_where(self, column: str, value: str, limit: int = 200) -> list[dict]:
-        """Contracts filtered on one indexed column. `column` is never user input."""
+    def contracts_where(self, column: str, value: str, limit: int = 200,
+                        offset: int = 0) -> list[dict]:
+        """Contracts filtered on one indexed column. `column` is never user input.
+
+        Largest first, then by key: equal amounts are common, and without a
+        tiebreak a page boundary can repeat some awards and skip others.
+        """
         if column not in self.FILTERABLE:
             raise ValueError(f"not a filterable column: {column}")
         rows = self._query(
             f"SELECT * FROM contracts WHERE tenant_id=? AND {column}=?"
-            " ORDER BY amount DESC LIMIT ?", (self.tenant_id, value, limit))
+            " ORDER BY amount DESC, contract_key LIMIT ? OFFSET ?",
+            (self.tenant_id, value, limit, offset))
         return [_decode_contract(r) for r in rows]
+
+    def entity_keys_where(self, column: str, value: str) -> list[str]:
+        """Every contractor with an award matching, not only those on one page."""
+        if column not in self.FILTERABLE:
+            raise ValueError(f"not a filterable column: {column}")
+        return [r["entity_key"] for r in self._query(
+            f"SELECT DISTINCT entity_key FROM contracts WHERE tenant_id=? AND {column}=?",
+            (self.tenant_id, value))]
 
     def resolve_entity_key(self, key: str) -> str:
         """The key this database files a company under, given what a person typed.
@@ -2254,7 +2591,8 @@ class Store:
     # saw only the 200 best-funded officers in the tenant, and it compared
     # against `MAX(agency)`, which for an officer working across two agencies
     # is whichever sorted higher. A sub-agency matched nothing at all.
-    def officers_for_agency(self, name: str, limit: int = 200) -> list[dict]:
+    def officers_for_agency(self, name: str, limit: int = 200,
+                            offset: int = 0) -> list[dict]:
         return self._query(
             "SELECT ko_email, MAX(ko_name) AS ko_name,"
             " MAX(ko_confidence) AS ko_confidence, MAX(ko_source) AS ko_source,"
@@ -2263,17 +2601,18 @@ class Store:
             " MAX(agency) AS agency"
             " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)"
             " AND ko_email IS NOT NULL AND ko_email != ''"
-            " GROUP BY ko_email ORDER BY SUM(amount) DESC LIMIT ?",
-            (self.tenant_id, name, name, limit))
+            " GROUP BY ko_email ORDER BY SUM(amount) DESC, ko_email LIMIT ? OFFSET ?",
+            (self.tenant_id, name, name, limit, offset))
 
-    def entities_for_agency(self, name: str, limit: int = 200) -> list[dict]:
+    def entities_for_agency(self, name: str, limit: int = 200,
+                            offset: int = 0) -> list[dict]:
         """Contractors under an agency, aggregated in SQL over every award."""
         rows = self._query(
             "SELECT entity_key, MAX(entity_name) AS entity_name,"
             " COUNT(*) AS contract_count, SUM(amount) AS obligated"
             " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)"
-            " GROUP BY entity_key ORDER BY SUM(amount) DESC LIMIT ?",
-            (self.tenant_id, name, name, limit))
+            " GROUP BY entity_key ORDER BY SUM(amount) DESC, entity_key LIMIT ? OFFSET ?",
+            (self.tenant_id, name, name, limit, offset))
         for r in rows:
             latest = self._one(
                 "SELECT severity FROM findings WHERE tenant_id=? AND entity_key=?"
@@ -2281,15 +2620,25 @@ class Store:
             r["severity"] = latest["severity"] if latest else None
         return rows
 
+    def entity_keys_for_agency(self, name: str) -> list[str]:
+        """Every contractor under an agency, for watching them all at once."""
+        return [r["entity_key"] for r in self._query(
+            "SELECT DISTINCT entity_key FROM contracts WHERE tenant_id=?"
+            " AND (agency=? OR sub_agency=?)", (self.tenant_id, name, name))]
+
     def agency_totals(self, name: str) -> dict:
         row = self._one(
             "SELECT COUNT(*) AS contract_count, COALESCE(SUM(amount), 0) AS obligated,"
-            " COUNT(DISTINCT entity_key) AS entity_count"
+            " COUNT(DISTINCT entity_key) AS entity_count,"
+            # Counted here: the page used to report the length of its officer
+            # list, which stops at one page, as the agency's officer count.
+            " COUNT(DISTINCT NULLIF(ko_email, '')) AS officer_count"
             " FROM contracts WHERE tenant_id=? AND (agency=? OR sub_agency=?)",
             (self.tenant_id, name, name))
         return {"contract_count": int(row["contract_count"] or 0),
                 "obligated": float(row["obligated"] or 0.0),
-                "entity_count": int(row["entity_count"] or 0)}
+                "entity_count": int(row["entity_count"] or 0),
+                "officer_count": int(row["officer_count"] or 0)}
 
     def search_all(self, q: str, limit: int = 10, offset: int = 0) -> dict:
         return {

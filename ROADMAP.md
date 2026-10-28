@@ -111,6 +111,18 @@ before acting.
    in the `UPDATE` so two reviewers cannot race); and an edit could delete the limitations
    statement (now refused).
 
+   **Approval now delivers.** Until this, approving a notice recorded the decision and
+   stopped: the response even said "Approved notices are sent" while nothing was. An approval
+   now hands the approved text to Gmail under the existing guards — a draft by default — and
+   records where it went (`drafted` / `sent`), or why it did not, in which case the approval
+   stands and `POST /v1/notices/{id}/deliver` or `foci-screen deliver-notices` tries again.
+   The service never opens a browser sign-in; `foci-screen gmail-auth` does that once.
+
+   That closed a bypass too: the CLI's `screen --notify` and `notify --run` used to hand
+   findings straight to Gmail, so with `GMAIL_ENABLED=true` they drafted — or with
+   `GMAIL_SEND`, sent — notices nobody had reviewed. They now only write `.eml` files to read.
+   There is no path from a finding to Gmail that does not pass through an approval.
+
    Remaining here: **per-person attribution.** Decisions record `api-key:<tenant>` because keys
    are shared. For an approval trail on notices to federal officials, that should become the
    signed-in reviewer — which is the SSO item under Phase 1 auth, not a UI change.
@@ -131,9 +143,23 @@ before acting.
    notifies once, a rejection counts as notified, and a newer draft supersedes an undecided
    older one.
 
-   Still open on this: **per-watchlist policies**, so a portfolio of high-priority primes can
-   notify on "low" while a broad agency sweep stays at "high"; and **per-person attribution**
-   of policy changes, which records `api-key:<tenant>` for the same reason decisions do.
+   ~~Still open on this: per-watchlist policies.~~ **Done.** A watchlist can carry its own
+   policy — only the settings it changes, stored as given (`{"notice_min_severity": "low"}`),
+   so everything else keeps following the tenant, including later changes to it. A portfolio
+   of high-priority primes notifies on "low" while an agency sweep stays at "high". The merged
+   policy goes through the same normalising as a saved one, so an override cannot ask for
+   notices about a category it does not screen. Runs now record the watchlist that started
+   them (`watchlist_id` in their options), which they could not before, and both halves of
+   the policy follow it: what is screened for, and what raises a notice.
+
+   Still open on this: **per-person attribution** of policy changes, which records
+   `api-key:<tenant>` for the same reason decisions do.
+
+   **Built on it: a Watchlists page** (`#/watchlists`). Scheduled screening had no page at
+   all — watchlists could only be created, run or paused through the API, and a paused one
+   could not be resumed by any route. The page lists each watchlist with what it screens, its
+   last run and its policy in words; runs one now; pauses and resumes; and edits the policy,
+   where "Follow Screening settings" means not overriding that setting at all.
 4. ~~**Server-side pagination.**~~ **Done for search.** `/v1/search` takes an `offset` and
    returns `more` per kind; the "All" tab links to a kind's own tab when it has another page,
    and that tab pages with Previous / Next. The decision the roadmap left open went to the flag
@@ -152,9 +178,15 @@ before acting.
    they render. `contract_totals` and `agency_totals` count and sum in SQL over every matching
    row, and the UI says "showing the 200 largest of N".
 
-   Still open: those three pages show the 200 largest and stop. Paging them is the same
-   change as search's, if a contractor or an agency ever holds more than 200 awards worth
-   reading one by one.
+   ~~Still open: those three pages show the 200 largest and stop.~~ **Done.** A contractor's
+   and an officer's awards, and an agency's contractors and officers, page 200 at a time
+   with Previous / Next, ordered by amount and then a unique key so ties cannot repeat or
+   skip rows across a page boundary. The page position is in the address
+   (`#/entity/…?awards=200`), so a page can be linked to and Back works; an agency's two
+   lists page independently. Paging exposed three more one-page figures, now fixed: the
+   agency's officer count was the length of its first page of officers, and the "watch
+   these contractors" buttons on officer and agency pages added only the contractors on
+   the page open.
 
 5. ~~**Detect a novated award as an event, not just a new value.**~~ **Done.**
    `contract_changes` records what moved on an award between screens, and three rules read it:
@@ -286,9 +318,14 @@ Ordered by how much they limit the tool today.
    and ownership-change signals — it needs the disposition data from item 7 to be worth
    anything.
 
-   Also open: **distinguishing sole proprietors properly.** The individual test is a name
-   heuristic. SAM.gov's entity registration states whether a registrant is a sole proprietor,
-   which is authoritative; that needs `SAM_API_KEY` (item 2).
+   ~~Also open: distinguishing sole proprietors properly.~~ **Done without a SAM key, for
+   most cases.** FPDS copies the vendor's SAM registration onto every award, including whether
+   it is a sole proprietor (spelled `isSolePropreitorship` in FPDS). A prime registered as one
+   is no longer screened; it was never checked before. A subcontractor is looked up by its own
+   UEI (`VENDOR_UEI:"…"` in the FPDS feed), and if it has ever held a prime award, its
+   registration decides in both directions — a person trading as "Apex Precision Machining"
+   is skipped, and "Shield AI" is screened. Only a subcontractor with no prime award of its
+   own still falls back to the name heuristic, and the run notes say which test decided.
 6. ~~**Entity resolution.**~~ **Done for UEI → CIK**, which is the mapping that bites: EDGAR
    full-text search is constrained by CIK, so a wrong answer returns another registrant's
    exhibits rather than nothing. `entity_links` stores the resolution with its confidence, and
@@ -299,7 +336,8 @@ Ordered by how much they limit the tool today.
    rather than its own name, and only an exact match (legal suffixes aside) is accepted, with
    its CRD kept on the record. What is missing is the link from a holding company to its
    registered advisers — FMR LLC and BlackRock, Inc. have no IAPD record of their own. There
-   is still no CAGE crosswalk. Both want an authoritative seed rather than another
+   is a CAGE code now — FPDS carries it on every award, and it is on the contractor record
+   and page — but nothing yet keys on it. Both want an authoritative seed rather than another
    similarity score.
 7. ~~**Feedback loop.**~~ **Done.** Verdicts are recorded per signal (`POST /v1/dispositions`),
    keyed on a hash of rule plus evidence so rewording a rule does not orphan them, and

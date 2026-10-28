@@ -171,8 +171,11 @@ Subaward data is weaker than prime-award data, in ways established by querying t
 - **Some subawardees are people.** Sole proprietors appear in the data; `JOSHUA D GOODWIN` came
   back under a Navy prime. Screening a named individual, then writing to their customer's
   contracting officer about them, is a different act from screening a company, and the tool
-  declines by default. The test is a heuristic — a two-word company with no "Inc" can land in
-  it — so skipped names are listed in the run notes instead of disappearing.
+  declines by default. Where the subcontractor has held a prime award of its own, FPDS carries
+  its SAM registration, which says outright whether it is a sole proprietor, and that decides.
+  Otherwise the test is a heuristic — a two-word company with no "Inc" can land in it — so
+  skipped names are listed in the run notes instead of disappearing, with which test decided.
+  A *prime* registered as a sole proprietor is skipped the same way.
 
 A subcontractor has no contracting officer of its own, so a notice about one goes to the KO on
 the **prime** contract, and says so in its first sentence: the Government has no privity with
@@ -396,6 +399,43 @@ draft. Set `FOCI_EMAIL_REDIRECT_TO` to your own address for the entirety of any 
 
 An unresolved KO is never guessed at: the notice is written to disk and logged as `suppressed`.
 
+**Only an approved notice reaches Gmail.** `screen --notify` and `notify --run` write each
+notice as an `.eml` file to read and nothing more, whatever the guards say; every screen also
+queues its notices for review, and approval is the only way on to Gmail.
+
+### From approval to Gmail
+
+Approving a notice in the review queue is the decision; delivery follows it, under the same
+three guards. What an approval turns into:
+
+| Settings | The notice becomes | Status |
+|---|---|---|
+| `GMAIL_ENABLED=false` (default) | Nothing leaves. Download the `.eml` and route it by hand | `approved`, with the reason |
+| `GMAIL_ENABLED=true` | A **Gmail draft** for a person to open and send | `drafted` |
+| `GMAIL_ENABLED=true`, `GMAIL_SEND=true` | Sent | `sent` |
+
+What goes to Gmail is the **approved text** — the reviewer's edit if there was one — not a
+re-render of the finding. With `FOCI_EMAIL_REDIRECT_TO` set it goes to that address instead,
+with the intended officer named in the subject (`[for ko@agency.mil] …`). Every delivered notice
+records where it went and when; the review queue shows it on the card.
+
+Delivery that does not happen leaves the approval standing. Approved while Gmail was off, not
+yet signed in, or refused by Gmail: the card says why and offers **Deliver now**, and
+`foci-screen deliver-notices` sweeps every such notice at once. Nothing can be delivered that a
+person has not approved, and nothing is delivered twice.
+
+**Sign in once, from a machine with a browser:**
+
+```bash
+foci-screen gmail-auth          # writes token.json (GMAIL_TOKEN)
+foci-screen deliver-notices     # anything approved while it was off
+```
+
+The web service never starts a sign-in itself — there is nobody to complete it, and the request
+would hang. On a server, copy `token.json` to the path `GMAIL_TOKEN` names. `/health` reports
+what an approval turns into (`notices.mode`) and warns when Gmail is switched on with no
+sign-in in place.
+
 ---
 
 ## Running as a service
@@ -447,18 +487,31 @@ every night on a deploy that was screening nothing.
 | `POST /v1/entities/{key}/vehicles/managers` | Find the firms worth reading (`find`), or read one firm's Form ADV and join it to the funds (`check`) |
 | `POST /v1/alerts/subscriptions` | Save who is emailed about a portfolio |
 | `POST /v1/alerts/run` | Check every watched firm and company now and email what is new |
+| `GET /v1/system/check` | Try each thing the deployment depends on, and count what is stored — for moving hosts |
 | `POST /v1/policy/preview` | What a proposed policy would do over past findings — saves nothing |
 | `POST /v1/portfolio/key` | Mint a portfolio key from a list of companies |
 | `POST /v1/portfolio/edit` | Add or drop companies, returning a new key |
 | `POST /v1/portfolio` | Open a key into a dashboard of those companies |
-| `POST /v1/watchlists` | Agencies to re-screen on a schedule |
+| `POST /v1/watchlists` | Agencies to re-screen on a schedule, optionally with their own `policy` |
+| `PUT / DELETE /v1/watchlists/{id}/policy` | The screening-policy settings one watchlist changes — the rest follow the tenant |
+| `POST /v1/watchlists/{id}/resume` | Put a paused watchlist back on the nightly sweep (`DELETE /v1/watchlists/{id}` pauses it) |
 | `GET /v1/notices` | The review queue |
-| `POST /v1/notices/{id}/approve` | The human gate. Records a decision — does not send |
+| `POST /v1/notices/{id}/approve` | The human gate. Records the decision, then hands the notice to Gmail if delivery is switched on |
+| `POST /v1/notices/{id}/deliver` | Try again for an approved notice that has not reached Gmail |
 | `GET /v1/notices/{id}.eml` | Download the notice to route by hand |
 
 **Auth fails closed.** Keys are `tenant:key` pairs in `FOCI_API_KEYS`. With that unset, every
 authenticated route returns 503. A tool that drafts email to federal officials must not be
 reachable because someone deployed it before setting a variable.
+
+**Public mode is the deliberate exception.** `FOCI_PUBLIC=true` opens the site to anyone with
+its address, as tenant `default`, with no key. A key from `FOCI_API_KEYS` is then an admin key,
+needed only to delete a screen or alert list, change the screening rules or policy,
+approve or reject a notice, and open the system check; with no key configured those are closed
+(403), not opened. Visitors see alert-list addresses masked, can add to a list but not take an
+address off, and each address they add must confirm before it receives anything
+(`foci_screen/consent.py`). [docs/VERCEL.md](docs/VERCEL.md), "Who can do what", has the
+detail.
 
 **Tenancy.** Runs, findings, notices and watchlists are tenant-scoped. Snapshots deliberately
 are not — a document's hash is a fact about the world, not about who is watching, so ten
@@ -851,9 +904,21 @@ firm whose name merely resembles the fund's is never shown.
   every series together, not the one named after the contractor.
 * **A fund on a Form ADV with no Form D** under the same name — sold abroad, say — is listed
   separately.
-* **"Watch this firm"** adds the firm to the portfolio, so its Form ADV is checked with the
-  others. An alert about a fund named after a contractor in the same portfolio then says
-  so, and is listed first. The firm's own page marks those funds too.
+* **Switching on fund alerts for a contractor also follows its funds' managers.** Each check
+  asks whether those firms have filed a new Form ADV, and passes on what changed about a
+  fund carrying the contractor's name — a new one, or its share owned outside the U.S.
+  moving — and nothing else the firm did. A manager's yearly filing is where a new fund's
+  foreign share first appears, so this is the alert that matters most here, and it does not
+  depend on anyone remembering to add the firm.
+* **"Watch this firm"** adds the firm to the portfolio in its own right, so everything on its
+  Form ADV is watched. An alert about a fund named after a contractor in the same portfolio
+  says so, and is listed first. The firm's own page marks those funds too.
+* **The portfolio table has a column for it**: how many funds are named after each
+  contractor, what their latest notices add up to, whether alerts are on, and the largest
+  share owned outside the U.S. that a manager reports for any one of them. A figure for a
+  whole series company is left out of that last number.
+* A company looked up while it was only a name typed into a portfolio keeps its funds, the
+  funds ruled out and its alert once it is screened and its page moves to its UEI.
 * If the lookup finds nothing, a firm can be searched by name and checked the same way.
 
 Limits: Form ADV is refiled once a year, so a fund set up since a firm's last filing is not
@@ -874,15 +939,37 @@ decides.
 * Each item goes to each list once. A failed send is retried next time.
 * **Connecting a mail service is what turns sending on.** With none, every alert is written and
   shown on the Portfolio page exactly as it would be sent, and nothing leaves. Setting
-  `BREVO_API_KEY` and `ALERTS_FROM` is enough to send; `ALERTS_SEND=false` holds everything as
+  `RESEND_API_KEY` and `ALERTS_FROM` is enough to send; `ALERTS_SEND=false` holds everything as
   a draft again without disconnecting anything. `FOCI_EMAIL_REDIRECT_TO` still applies, so a
   pilot can route every alert to one person first.
-* Mail goes over HTTPS (Brevo or Resend) because **Render's free plan blocks the SMTP ports**
-  (25, 465, 587), so Gmail or Outlook cannot be reached from a free instance. Plain SMTP is
-  still supported for a paid instance, or on port 2525 where a relay offers it.
+* Mail goes over HTTPS — **Resend**, or Brevo — because serverless hosts and Render's free
+  plan block the SMTP ports (25, 465, 587). Plain SMTP is still supported elsewhere, or on
+  port 2525 where a relay offers it.
 * Each person on a list gets their own copy and is not shown the other addresses. One refused
   address does not hold up the rest: the alert is logged as *sent to some*, naming the address
   and the reason, and is not sent again to the people it reached.
+* **Anyone on a list can take themselves off it.** Each copy carries an unsubscribe link of its
+  own, and the `List-Unsubscribe` / `List-Unsubscribe-Post` headers (RFC 8058) that Gmail,
+  Outlook and Apple Mail turn into an Unsubscribe button. Opening the link only asks; mail
+  scanners open every link, so nothing happens until the button is pressed. The page offers
+  an undo.
+  * Unsubscribing removes the address from the list. The Portfolio page names who left and
+    when, and **refuses to add them back**: they rejoin from their own link, not on someone
+    else's say-so.
+  * Undo restores an address only if unsubscribing is what removed it. Someone the list's
+    owner took off cannot use an old email's link to put themselves back.
+  * The link needs the site's address — `FOCI_PUBLIC_URL`, or the address the check was
+    requested on. A copy redirected by `FOCI_EMAIL_REDIRECT_TO` carries no link, because its
+    reader is not on the list.
+* **Only to addresses that agreed.** On a public site an address a visitor adds gets one email
+  asking it to confirm, and nothing else until it does. The confirmation link and the
+  unsubscribe link share one token per address per list.
+* **A dead address stops being mailed.** With a bounce webhook set up (DEPLOY.md, "Hearing
+  about bounces"), Brevo or Resend tell the site when an alert bounces or is marked as spam.
+  The address is skipped from then on and shown on the Portfolio page with the reason; the
+  alert log names it too. Reports are believed only with the shared secret (Brevo) or a valid
+  signature (Resend). A bounce can be cleared from the page; a spam complaint only by an
+  operator, with `foci-screen mail-suppressions`.
 * A check runs when the Portfolio page is opened and the last one was most of a day ago, and
   once a day from a GitHub Actions workflow if that is set up. Two checks never run at once.
 * `GET /health` reports whether alerts actually leave (`send`, `redirect`, `draft` or
@@ -1100,7 +1187,35 @@ Every tool in `tools/` is Python, so the repository runs the same way on Windows
 Linux. The only non-Python code is the web interface's HTML, CSS and JavaScript, which a
 browser requires.
 
+### Deploying on Vercel, with Supabase
+
+**This is how the site is deployed**, at contractscreener.com, open to anyone with the address
+(`FOCI_PUBLIC`) and sending through Resend. [docs/VERCEL.md](docs/VERCEL.md) is the
+step-by-step guide: the repository imported into Vercel, Supabase connected as its database,
+the domain verified with Resend, and the daily alert check pointed at it. What the code does
+for that host:
+
+* `pyproject.toml` names the application for Vercel (`[tool.vercel] entrypoint`) and carries
+  FastAPI and the Postgres driver as ordinary dependencies, because Vercel installs no extras.
+  `vercel.json` gives the function Vercel's free-plan limit of 300 seconds.
+* **The database address** (`foci_screen/dburl.py`): of the addresses Supabase's integration
+  sets, the pooler's session mode on port 5432 is used — the direct address is IPv6 only,
+  which Vercel cannot reach, and transaction mode would break the alert lock and prepared
+  statements. Query parameters meant for other drivers are dropped.
+* **Its own schema.** On Supabase the tables live in `foci`, not `public`, so Supabase's Data
+  API does not publish them (`FOCI_DB_SCHEMA` to change).
+* **Screens inside requests.** A Vercel function gets no processor time after it has answered,
+  so `POST /v1/screens` leaves the run queued and returns an `execute` address; the page calls
+  it and keeps it open, and the screen runs there. It stops between steps at
+  `FOCI_SCREEN_SECONDS` (240 on Vercel) and keeps what it finished; a run whose request ended
+  is closed once it is too old to be running anywhere.
+* **Files** go to `/tmp`, and nothing calls its own address to stay awake.
+* **Links in emails** point at the production domain Vercel reports
+  (`VERCEL_PROJECT_PRODUCTION_URL`) unless `FOCI_PUBLIC_URL` is set.
+
 ### Deploying to Google Cloud
+
+Not the current plan; kept for reference.
 
 [docs/GOOGLE_CLOUD.md](docs/GOOGLE_CLOUD.md) is the step-by-step guide: Cloud Run for the site,
 Cloud SQL for the database, and how to move an existing deployment's data across. The same
@@ -1112,7 +1227,10 @@ each:
   runs the service holds a request open against itself (`jobs._hold_open`). That keeps the
   thread running and the instance alive, and it is billed for the minutes the screen takes. On
   by default wherever a managed host is detected; `FOCI_KEEP_AWAKE=false` turns it off. It also
-  stops Render's free plan cutting a long screen short.
+  stops Render's free plan cutting a long screen short. An alert check is held the same way:
+  it runs inside the request that asked for it, and whoever asked — the portfolio page, the
+  daily schedule with its ten-minute limit — has usually stopped waiting before a long one
+  ends.
 * **A database connection can be closed while the instance is frozen.** The store checks a
   connection that has sat idle before using it and reconnects; a read that hits a dead
   connection is repeated once on a new one. A write is never silently replayed.
@@ -1128,6 +1246,22 @@ only reads the source, creates the current schema at the destination, refuses a 
 that already holds rows, and on Postgres moves the id counters past the copied rows.
 
 `GET /health` reports `host` (`Cloud Run`, `Render`, …) and, on Cloud Run, the `revision`.
+
+Two things exist for the move itself:
+
+* **`ALERTS_PAUSED=true`** stops a site checking for changes altogether. It is set on the old
+  site before the copy and on the new one until the switch, so nothing is emailed twice and
+  nothing is used up unsent. Holding alerts as drafts (`ALERTS_SEND=false`) would not do: a
+  draft counts as said, so a new site tried out on drafts would consume alerts nobody received.
+  A paused site says so in a banner.
+* **System check** — the link in the footer, or `GET /v1/system/check`. It tries each thing the
+  site depends on for real: writes a row to the database and reads it back, calls its own
+  address (which is how long work stays alive on Cloud Run), asks each SEC service, IAPD,
+  USAspending and FPDS. It says how many watchlists are saved and whether anything screens them
+  on a schedule — without a job queue, nothing does. It also counts every table. The same counts
+  on the old site and the new are the evidence that everything was copied. Settings in use are
+  listed by name, never by value, so the ones to carry across are not forgotten. Its top line,
+  like `/health`, names the deploy: Cloud Run's revision, or the commit Render built.
 
 ### Deploying to Render
 

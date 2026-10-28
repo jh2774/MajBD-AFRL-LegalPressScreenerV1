@@ -2,6 +2,9 @@
 
 Concrete steps. Roughly 30 minutes, most of it waiting for the worker image to build.
 
+> **The site is deployed on Vercel, with Supabase as its database:**
+> [docs/VERCEL.md](docs/VERCEL.md). The Render steps below are kept for reference.
+>
 > **Moving to, or starting on, Google Cloud?** That has its own guide:
 > [docs/GOOGLE_CLOUD.md](docs/GOOGLE_CLOUD.md) — Cloud Run for the site, Cloud SQL for the
 > database, and a command that copies the data across from Render and checks it arrived.
@@ -391,6 +394,9 @@ which machine spends the minutes.
 
 ## Turning on email alerts
 
+> **On the Vercel site, email goes through Resend:** [docs/VERCEL.md](docs/VERCEL.md),
+> "Email through Resend". The Brevo steps below are for a Render setup.
+
 Alerts go to the addresses typed into a portfolio's **Email alerts** box. Until a mail service
 is connected, every alert is still written and shown on the Portfolio page exactly as it would
 be sent, and nothing leaves. **Connecting a mail service is what turns sending on.**
@@ -479,10 +485,45 @@ schedule and a button press cannot send the same alert twice.
 
 | Service | Settings | Notes |
 |---|---|---|
-| Resend | `RESEND_API_KEY`, `ALERTS_FROM` | Also HTTPS. Needs a domain you control. |
+| Resend | `RESEND_API_KEY`, `ALERTS_FROM` | Also HTTPS. Needs a domain you control. The Vercel site's service: [docs/VERCEL.md](docs/VERCEL.md). |
 | Any SMTP relay | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `ALERTS_FROM` | On Render's free plan use port `2525` where the service offers it; 25, 465 and 587 are blocked there. On a paid instance any port works, including Gmail on 587 with an app password. |
 
-If more than one is set, `MAIL_PROVIDER` (`brevo`, `resend` or `smtp`) picks.
+If more than one is set, Resend is used, then Brevo, then SMTP; `MAIL_PROVIDER` (`resend`,
+`brevo` or `smtp`) picks otherwise. `ALERTS_REPLY_TO` sets where replies go.
+
+### 5. Hearing about bounces (optional, five minutes)
+
+The mail service accepts an alert and only later learns the address does not exist. Without
+this step the site never finds out: the alert is logged as sent, and every later alert goes to
+the same dead address. With it, the mail service tells the site, the address is skipped from
+then on, and the Portfolio page shows it under **Not being emailed** with the reason.
+
+**Brevo.** Brevo cannot sign what it sends, so it is given a secret to send back.
+
+1. Make up a long random secret (a password manager's generator is fine) and add it on Render
+   → **Environment** as `MAIL_WEBHOOK_SECRET`.
+2. In Brevo: **Transactional** → **Settings** → **Webhook** → **Add a new webhook**. URL:
+   `https://<your site>/hooks/mail/brevo?token=<the secret>`.
+3. Tick **Hard bounced**, **Invalid email**, **Blocked** and **Complaint** (sometimes called
+   **Marked as spam**). Nothing else is needed; delivered, opened and clicked are ignored.
+
+**Resend.** Resend signs every report, and the site checks the signature.
+
+1. In Resend: **Webhooks** → **Add endpoint**. URL: `https://<your site>/hooks/mail/resend`.
+   Events: `email.bounced` and `email.complained`.
+2. Copy the endpoint's **signing secret** (it starts `whsec_`) and add it on Render as
+   `RESEND_WEBHOOK_SECRET`.
+
+`/health` shows `"bounce_reports": "brevo"` or `"resend"` once a secret is set. A report that
+does not carry the secret, or whose signature does not match, is refused: a forged bounce
+would otherwise silently stop alerts to a real person.
+
+**What happens to a reported address.** It stays on the list and is skipped. A mistyped
+address is corrected in the list's box; **Mail again** is for one that has started working.
+A **spam complaint** has no Mail again button — it is the reader saying no. If they later ask
+to be mailed, an operator can lift it with
+`foci-screen mail-suppressions --clear <address> --complaint`. A temporary failure (a full
+mailbox, a server that is down) is not treated as a bounce.
 
 ## Costs and gotchas
 

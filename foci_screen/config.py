@@ -30,8 +30,15 @@ def _switch(name: str) -> bool | None:
     return raw.lower() in _TRUE if raw else None
 
 
+def _on_vercel() -> bool:
+    """Vercel sets VERCEL=1 while building and while running."""
+    return bool(os.environ.get("VERCEL"))
+
+
 def _database_url() -> str:
-    """Where Postgres is, from DATABASE_URL or from Cloud SQL's separate values.
+    """Where Postgres is: one address (see `dburl.choose` for which, when a
+    host sets several, and how a Supabase one is corrected), or Cloud SQL's
+    separate values.
 
     Render hands over one URL. Google Cloud's own convention for Cloud Run is
     four values — the instance's connection name and a user, password and
@@ -43,7 +50,9 @@ def _database_url() -> str:
     /cloudsql/<connection name>; `host=` with a path is how libpq is told to
     use one.
     """
-    url = _env("DATABASE_URL")
+    from .dburl import choose
+
+    url = choose(os.environ)
     if url:
         return url
     instance = _env("INSTANCE_CONNECTION_NAME") or _env("CLOUD_SQL_CONNECTION_NAME")
@@ -56,10 +65,30 @@ def _database_url() -> str:
     return f"postgresql://{auth}@/{quote(name, safe='')}?host={quote(socket, safe='/:')}"
 
 
+def _public_url() -> str:
+    """Where links in emails point. On Vercel, unless set, the project's
+    production address — its custom domain once one is attached — which
+    Vercel supplies without the scheme."""
+    given = _env("FOCI_PUBLIC_URL")
+    if given:
+        return given
+    # Set by Vercel itself, not a setting of this application.
+    production = os.environ.get("VERCEL_PROJECT_PRODUCTION_URL", "").strip()
+    return f"https://{production}" if production else ""
+
+
 def _default_cache_mb() -> str:
     # Cloud Run has no disk: files written inside the container are held in
-    # the instance's memory and count against its limit.
-    return "64" if os.environ.get("K_SERVICE") else "256"
+    # the instance's memory and count against its limit. Vercel gives a
+    # function 500 MB of /tmp, shared with everything else written there.
+    return "64" if os.environ.get("K_SERVICE") or _on_vercel() else "256"
+
+
+def _writable(name: str, default: str, on_vercel: str) -> str:
+    """A path the site may write to. On Vercel everything but /tmp is
+    read-only, and writing the default relative path would stop the site
+    starting at all."""
+    return _env(name) or (on_vercel if _on_vercel() else default)
 
 
 def load_dotenv(path: str | Path = ".env") -> None:
@@ -87,9 +116,11 @@ class Config:
     trade_gov_key: str = field(default_factory=lambda: _env("TRADE_GOV_API_KEY"))
 
     # --- storage ---
-    db_path: str = field(default_factory=lambda: _env("FOCI_DB", "foci_screen.db"))
-    cache_dir: str = field(default_factory=lambda: _env("FOCI_CACHE", ".cache"))
-    out_dir: str = field(default_factory=lambda: _env("FOCI_OUT", "out"))
+    db_path: str = field(default_factory=lambda: _writable(
+        "FOCI_DB", "foci_screen.db", "/tmp/foci_screen.db"))
+    cache_dir: str = field(default_factory=lambda: _writable(
+        "FOCI_CACHE", ".cache", "/tmp/foci-cache"))
+    out_dir: str = field(default_factory=lambda: _writable("FOCI_OUT", "out", "/tmp/foci-out"))
     # The HTTP cache is a convenience, not storage, and is kept under this
     # size: expired responses are deleted, then the oldest, as it fills.
     cache_max_mb: int = field(
@@ -117,6 +148,16 @@ class Config:
     # processor time (Cloud Run) nor shuts the instance down as idle (Cloud
     # Run, Render's free plan). Unset: on wherever a managed host is detected.
     keep_awake: bool | None = field(default_factory=lambda: _switch("FOCI_KEEP_AWAKE"))
+    # Run each screen inside a request that the page starting it keeps open,
+    # rather than in a background thread. For a host that gives a function no
+    # time once its response is sent — Vercel. On there by default.
+    screens_in_request: bool = field(
+        default_factory=lambda: _flag("FOCI_SCREENS_IN_REQUEST", _on_vercel()))
+    # How long one screen may run before it stops and keeps what it finished.
+    # 0 is no limit. On Vercel a request is cut off at 300 seconds on the free
+    # plan; stopping a minute earlier leaves time to record the stop.
+    screen_seconds: int = field(default_factory=lambda: int(
+        _env("FOCI_SCREEN_SECONDS", "240" if _on_vercel() else "0") or 0))
 
     # --- portfolio email alerts ---
     # Alerts go to the addresses typed into a portfolio as soon as a mail
@@ -127,6 +168,12 @@ class Config:
     # missing service as a fault. Left unset, connecting a service is the
     # decision to send.
     alerts_send: bool | None = field(default_factory=lambda: _switch("ALERTS_SEND"))
+    # Stop checking altogether — nothing read, nothing composed, nothing
+    # recorded as said. For a site that is being moved from, or a new one
+    # being tried before people are sent to it. ALERTS_SEND=false is not the
+    # same thing: a draft still counts as said, so a new site left on drafts
+    # while it was being tested would use up alerts nobody ever received.
+    alerts_paused: bool = field(default_factory=lambda: _flag("ALERTS_PAUSED", False))
     # A mail service reached over HTTPS. This is the route that works on a
     # free Render instance, which blocks the SMTP ports (25, 465, 587).
     brevo_api_key: str = field(default_factory=lambda: _env("BREVO_API_KEY"))
@@ -140,9 +187,18 @@ class Config:
     # starttls (587, 2587), ssl (465, 2465), or none (a local relay).
     smtp_security: str = field(default_factory=lambda: _env("SMTP_SECURITY", "starttls"))
     alerts_from: str = field(default_factory=lambda: _env("ALERTS_FROM"))
+    # Where a reply to an alert goes, when the sending address has no mailbox
+    # behind it. Optional.
+    alerts_reply_to: str = field(default_factory=lambda: _env("ALERTS_REPLY_TO"))
+    # Bounce and complaint reports from the mail service (notify/bounces.py).
+    # Brevo cannot sign its webhooks, so it is given this secret to send back;
+    # Resend signs them, and RESEND_WEBHOOK_SECRET (whsec_...) checks that.
+    mail_webhook_secret: str = field(default_factory=lambda: _env("MAIL_WEBHOOK_SECRET"))
+    resend_webhook_secret: str = field(
+        default_factory=lambda: _env("RESEND_WEBHOOK_SECRET"))
     # Where the links in an alert point. Without it, links use whatever
     # address the request that triggered the alerts came in on.
-    public_url: str = field(default_factory=lambda: _env("FOCI_PUBLIC_URL"))
+    public_url: str = field(default_factory=_public_url)
 
     # --- investor-relations email alerts ---
     # A directory of saved .eml files. The IR platforms that refuse an
@@ -163,6 +219,11 @@ class Config:
 
     # --- API ---
     api_keys: str = field(default_factory=lambda: _env("FOCI_API_KEYS"))
+    # Open the site to anyone with its address: no key to read, screen or set
+    # up alerts. A key from FOCI_API_KEYS is then only for the few actions
+    # that remove work or change the site for everyone (see api.auth). Off
+    # unless set, so a deployment is never opened by accident.
+    public: bool = field(default_factory=lambda: _flag("FOCI_PUBLIC", False))
     cors_origins: str = field(default_factory=lambda: _env("FOCI_CORS_ORIGINS"))
 
     # --- HTTP behaviour ---
@@ -199,10 +260,23 @@ class Config:
         """
         for var, name in (("RENDER", "Render"), ("DYNO", "Heroku"),
                           ("FLY_APP_NAME", "Fly.io"), ("K_SERVICE", "Cloud Run"),
-                          ("WEBSITE_INSTANCE_ID", "Azure App Service")):
+                          ("WEBSITE_INSTANCE_ID", "Azure App Service"),
+                          ("VERCEL", "Vercel")):
             if os.environ.get(var):
                 return name
         return ""
+
+    @property
+    def keep_awake_wanted(self) -> bool:
+        """Whether long work holds a request open against the site itself.
+
+        On wherever a managed host is detected, unless switched off — except
+        Vercel, where a request to the site's own address starts another
+        function rather than keeping this one going, so it would only cost.
+        """
+        if self.keep_awake is not None:
+            return self.keep_awake
+        return bool(self.managed_host) and self.managed_host != "Vercel"
 
     @property
     def dsn(self) -> str:

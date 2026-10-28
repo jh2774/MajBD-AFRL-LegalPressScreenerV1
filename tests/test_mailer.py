@@ -77,7 +77,7 @@ class Post:
 def test_nothing_is_sent_until_a_mail_service_is_connected():
     mailer = Mailer(Cfg())
     assert mailer.status()["mode"] == "draft"
-    assert "BREVO_API_KEY" in mailer.status()["explanation"]
+    assert "RESEND_API_KEY" in mailer.status()["explanation"]
     d = mailer.send(["ko@agency.gov"], "s", "t")
     assert d.status == "drafted" and "No mail service" in d.detail
 
@@ -338,11 +338,14 @@ def client(tmp_path, monkeypatch):
 
 def test_health_says_whether_alerts_leave_without_naming_anyone(client):
     c, _ = client()
-    assert c.get("/health").json()["alerts"] == {"mode": "draft", "provider": ""}
+    assert c.get("/health").json()["alerts"] == {"mode": "draft", "provider": "",
+                                                 "paused": False,
+                                                 "bounce_reports": ""}
 
     c, _ = client(BREVO_API_KEY=KEY, ALERTS_FROM="alerts@concord.example")
     body = c.get("/health")
-    assert body.json()["alerts"] == {"mode": "send", "provider": "Brevo"}
+    assert body.json()["alerts"] == {"mode": "send", "provider": "Brevo", "paused": False,
+                                     "bounce_reports": ""}
     assert KEY not in body.text and "concord.example" not in body.text
 
 

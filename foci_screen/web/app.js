@@ -117,6 +117,16 @@ async function apiSend(method, path, body) {
   return res.status === 204 ? null : res.json();
 }
 
+/* Where the site runs a screen inside the request that asks for it — Vercel,
+ * which stops a function once its answer is sent — the page that started the
+ * screen sends that request and leaves it open. Moving to another page of this
+ * site keeps it open; closing or reloading the tab ends the screen, which then
+ * keeps what it had finished. The screen's own page shows how it went. */
+function runScreenInRequest(started) {
+  if (!started || !started.execute) return null;
+  return apiPost(started.execute, {}).catch(() => null);
+}
+
 async function apiPost(path, body) {
   const res = await fetch(path, {
     method: "POST",
@@ -227,12 +237,26 @@ function statCard(label, value) {
 /* The API returns the 200 best-funded awards and the true count alongside.
  * Rendering the page without saying it is a page invites the reader to count
  * the rows and believe the answer. */
-function truncationNote(shown, total) {
-  if (!total || !shown || shown >= total) return "";
-  return `<div class="muted" style="font-size:12px;margin-bottom:10px">
-    Showing the ${num(shown)} largest of ${num(total)} awards. The totals above
-    cover all ${num(total)}.</div>`;
+/* Where a long list is, and the way back and on. `hrefFor(offset)` builds
+ * the address of another page, so a page can be linked to and Back works.
+ * Says nothing when everything fits on one page. */
+function listPager(offset, shown, more, total, noun, hrefFor) {
+  offset = offset || 0;
+  if (!offset && !more) return "";
+  const first = shown ? offset + 1 : offset;
+  const of = total ? ` of ${num(total)}` : "";
+  return `
+    <div class="pager">
+      <span class="muted">Showing ${num(first)}–${num(offset + shown)}${of} ${esc(noun)}, largest first</span>
+      ${offset ? `<a class="linkish" href="${hrefFor(Math.max(0, offset - PAGE_ROWS))}">← Previous</a>` : ""}
+      ${more ? `<a class="linkish" href="${hrefFor(offset + shown)}">Next →</a>` : ""}
+    </div>`;
 }
+
+const PAGE_ROWS = 200;
+
+const pageParam = (params, name) =>
+  Math.max(0, parseInt((params && params.get(name)) || "0", 10) || 0);
 
 /* The award record as it moved, not as it stands. The contracts table holds
  * only the present value — once a novation is written over the old contractor,
@@ -699,8 +723,11 @@ function wireScreenFirm(q) {
       const d = await apiPost("/v1/screens", {
         recipient: q, months_back: 12, max_awards: 25, max_entities: 3,
       });
+      runScreenInRequest(d);
       status.innerHTML = `Screening started (run <span class="mono">${esc(d.run_id)}</span>).
         This takes minutes — the contractor appears in search once it finishes.
+        ${d.execute ? `Keep this page open until it ends; it stops after
+          ${num(Math.round(d.time_limit_seconds / 60))} minutes at most.` : ""}
         <a href="#/screens/${encodeURIComponent(d.run_id)}">Watch it</a>.`;
     } catch (e) {
       button.disabled = false;
@@ -895,12 +922,13 @@ function wireScreenRemove(runId) {
   };
 }
 
-async function viewEntity(key) {
+async function viewEntity(key, params) {
   setBusy("Loading contractor…");
+  const awardsFrom = pageParam(params, "awards");
   const [d, docs, verdicts, identity] = await Promise.all([
     // Nothing recorded is an answer, not a failure: a company named in a
     // portfolio but never screened still has a page — see viewUnscreened.
-    api(`/v1/entities/${encodeURIComponent(key)}`)
+    api(`/v1/entities/${encodeURIComponent(key)}?offset=${awardsFrom}`)
       .catch((e) => { if (e.status === 404) return null; throw e; }),
     api(`/v1/documents?entity_key=${encodeURIComponent(key)}`).catch(() => ({ documents: [] })),
     api(`/v1/entities/${encodeURIComponent(key)}/dispositions`)
@@ -933,6 +961,7 @@ async function viewEntity(key) {
         ${f ? sevTag(f.severity) + ` score ${esc((f.total_score ?? 0).toFixed ? f.total_score.toFixed(1) : f.total_score)}` : sevTag(null)}
         ${e.uei ? ` · UEI <span class="mono">${esc(e.uei)}</span>` : ""}
         ${e.cik ? ` · CIK <span class="mono">${esc(e.cik)}</span>` : ""}
+        ${e.cage ? ` · CAGE <span class="mono">${esc(e.cage)}</span>` : ""}
       </div>
     </div>
 
@@ -980,10 +1009,12 @@ async function viewEntity(key) {
 
     ${recordChanges(d.record_changes || [], d.entity_key || key.toUpperCase())}
 
-    <div class="card">
+    <div class="card" id="awards">
       <h2>Awards</h2>
-      ${truncationNote(d.contracts_shown, d.contract_count)}
       ${contractsTable(d.contracts || [])}
+      ${listPager(d.contracts_offset, (d.contracts || []).length, d.contracts_more,
+                  d.contract_count, "awards",
+                  (off) => `#/entity/${encodeURIComponent(key)}${off ? `?awards=${off}` : ""}`)}
     </div>`;
 
   wireVerdicts(view, key, f ? f.run_id : "");
@@ -1399,7 +1430,8 @@ function drawVehicles(card, key, d, busy = "", busyAt = "#vh-status") {
         <span class="muted" style="font-size:12.5px;align-self:center">${
           w.watching
             ? `The portfolio's email list is told about any fund named after “${esc(w.phrase)}”
-               that files ${sinceWords(w.watching_since)}.`
+               that files ${sinceWords(w.watching_since)}, and about what the firms managing
+               these funds change about them on a new Form ADV.`
             : "Sends to the email list of any portfolio this contractor is in. Past filings are never sent."}</span>
       </div>
       <p class="muted" style="font-size:12px">New filings are picked up from EDGAR's daily list
@@ -1977,9 +2009,10 @@ async function viewDiff(source, key, fromSha, entityKey) {
     </div>`;
 }
 
-async function viewOfficer(email) {
+async function viewOfficer(email, params) {
   setBusy("Loading contracting officer…");
-  const d = await api(`/v1/officers/${encodeURIComponent(email)}`);
+  const awardsFrom = pageParam(params, "awards");
+  const d = await api(`/v1/officers/${encodeURIComponent(email)}?offset=${awardsFrom}`);
   const o = d.officer;
 
   view.innerHTML = `
@@ -2017,21 +2050,34 @@ async function viewOfficer(email) {
     </div>
 
     ${addToPortfolioButton(
-        [...new Set(d.contracts.map((c) => c.entity_key).filter(Boolean))],
+        (d.entity_keys || []).filter(Boolean),
         "Watch the contractors this officer holds awards with.")}
 
     <div class="card">
       <h2>Awards</h2>
-      ${truncationNote(d.contracts_shown, d.contract_count)}
       ${contractsTable(d.contracts)}
+      ${listPager(d.contracts_offset, d.contracts.length, d.contracts_more,
+                  d.contract_count, "awards",
+                  (off) => `#/officer/${encodeURIComponent(email)}${off ? `?awards=${off}` : ""}`)}
     </div>`;
 
   wireAddToPortfolio();
 }
 
-async function viewAgency(name) {
+async function viewAgency(name, params) {
   setBusy("Loading agency…");
-  const d = await api(`/v1/agencies/${encodeURIComponent(name)}`);
+  const from = { contractors: pageParam(params, "contractors"),
+                 officers: pageParam(params, "officers") };
+  const d = await api(`/v1/agencies/${encodeURIComponent(name)}` +
+                      `?entities_offset=${from.contractors}&officers_offset=${from.officers}`);
+  // Each list pages on its own, keeping the other where it was.
+  const agencyHref = (which) => (off) => {
+    const q = new URLSearchParams();
+    const next = { ...from, [which]: off };
+    if (next.contractors) q.set("contractors", next.contractors);
+    if (next.officers) q.set("officers", next.officers);
+    return `#/agency/${encodeURIComponent(name)}${q.toString() ? `?${q}` : ""}`;
+  };
 
   view.innerHTML = `
     <div class="breadcrumb"><a href="#/">Overview</a> › Agency</div>
@@ -2043,7 +2089,7 @@ async function viewAgency(name) {
     <div class="grid cols-3">
       ${statCard("Obligated", money(d.obligated))}
       ${statCard("Contractors", num(d.entity_count ?? d.entities.length))}
-      ${statCard("Officers", num(d.officers.length))}
+      ${statCard("Officers", num(d.officer_count ?? d.officers.length))}
     </div>
 
     <div class="card">
@@ -2057,12 +2103,16 @@ async function viewAgency(name) {
     </div>
 
     <div class="card"><h2>Contractors</h2>
-      ${entitiesTable(d.entities, { showScreened: false })}</div>
+      ${entitiesTable(d.entities, { showScreened: false })}
+      ${listPager(d.entities_offset, d.entities.length, d.entities_more,
+                  d.entity_count, "contractors", agencyHref("contractors"))}</div>
 
-    <div class="card"><h2>Contracting officers</h2>${officersTable(d.officers)}</div>
+    <div class="card"><h2>Contracting officers</h2>${officersTable(d.officers)}
+      ${listPager(d.officers_offset, d.officers.length, d.officers_more,
+                  d.officer_count, "officers", agencyHref("officers"))}</div>
 
     ${addToPortfolioButton(
-        d.entities.map((e) => e.entity_key).filter(Boolean),
+        (d.entity_keys || d.entities.map((e) => e.entity_key)).filter(Boolean),
         "Watch this agency's contractors on your dashboard.")}`;
 
   wireAddToPortfolio();
@@ -2176,7 +2226,12 @@ async function viewNotices() {
              <button class="reject">Reject</button>`
           : `<span class="muted" style="align-self:center">
                decided by ${esc(n.decided_by || "—")}${n.decision_note ? ` · ${esc(n.decision_note)}` : ""}</span>`}
+        ${n.status === "approved"
+          ? `<button class="deliver" title="Hand this approved notice to Gmail">Deliver now</button>`
+          : ""}
       </div>
+      ${noticeDelivery(n)}
+      <div class="deliver-error error" hidden></div>
       <div class="decide-panel" hidden>
         <div class="edit-area" hidden>
           <label class="decide-prompt" for="body-${esc(n.notice_id)}">
@@ -2202,8 +2257,9 @@ async function viewNotices() {
   view.innerHTML = `
     <div class="page-head">
       <h1>Notices</h1>
-      <div class="sub">${pending} awaiting review. Approving records a decision —
-        it does not transmit anything unless Gmail delivery is armed on the server.</div>
+      <div class="sub">${pending} awaiting review. Approving records a decision and
+        hands the notice to Gmail if delivery is switched on for this server — as a
+        draft for someone to send, unless sending has been turned on as well.</div>
     </div>${cards}`;
 
   const PROMPTS = {
@@ -2233,6 +2289,20 @@ async function viewNotices() {
     const errorBox = panel.querySelector(".panel-error");
     const dl = card.querySelector(".dl");
     if (dl) dl.onclick = () => downloadNotice(id);
+    const dv = card.querySelector(".deliver");
+    if (dv) dv.onclick = async () => {
+      const box = card.querySelector(".deliver-error");
+      dv.disabled = true;
+      try {
+        await apiPost(`/v1/notices/${encodeURIComponent(id)}/deliver`, {});
+        route();
+      } catch (e) {
+        box.innerHTML = `<strong>${esc(e.title)}</strong>
+          <div class="muted" style="margin-top:4px">${esc(e.message)}</div>`;
+        box.hidden = false;
+        dv.disabled = false;
+      }
+    };
 
     const open = (mode) => {
       panel.querySelector(".note-prompt").textContent = PROMPTS[mode].label;
@@ -2270,6 +2340,23 @@ async function viewNotices() {
     const cancel = card.querySelector(".cancel");
     if (cancel) cancel.onclick = () => { panel.hidden = true; };
   });
+}
+
+/* Where an approved notice went. Approval and delivery are separate events,
+ * and a reviewer should never have to guess which one happened. */
+function noticeDelivery(n) {
+  const line = (text) =>
+    `<div class="muted" style="font-size:12.5px;margin-top:6px">${text}</div>`;
+  if (n.status === "drafted")
+    return line(`Gmail draft created for <span class="mono">${esc(n.delivered_to || "")}</span>
+      · ${esc(day(n.delivered_at))}. It has not been sent; open Gmail's drafts to send it.`);
+  if (n.status === "sent")
+    return line(`Sent through Gmail to <span class="mono">${esc(n.delivered_to || "")}</span>
+      · ${esc(day(n.delivered_at))}.`);
+  if (n.status === "approved")
+    return line(`<strong>Not delivered.</strong> ${esc(n.delivery_detail ||
+      "Approved before delivery was attempted.")}`);
+  return "";
 }
 
 function plainDiff(lines) {
@@ -2391,6 +2478,22 @@ function portfolioTable(companies) {
       <span class="muted" style="font-size:12px">· ${esc(x.filed)}</span>`;
   };
 
+  // Investment funds named after the contractor, as last looked up on its
+  // page. The second line is what decides whether anyone hears about the next
+  // one, so it is always shown; the foreign share is the largest any manager
+  // reports for one of the funds itself.
+  const pooled = (r) => {
+    const f = r.funds;
+    if (!f) return '<span class="muted" title="Look them up on the contractor page">not looked up</span>';
+    if (!f.funds) return `none found <div class="muted" style="font-size:12px">${f.watching ? "alerts on" : "alerts off"}</div>`;
+    return `${f.at_least ? "at least " : ""}${num(f.funds)}${f.read ? ` · ${money(f.raised)}` : ""}
+      <div class="muted" style="font-size:12px">${f.watching ? "alerts on" : "alerts off"}${
+        f.highest_non_us === null || f.highest_non_us === undefined ? ""
+          : ` · <span title="The largest share owned outside the U.S. that a managing firm reports for any one of these funds, out of the ${num(f.with_figure)} with a figure">highest
+              for one fund: <strong>${num(f.highest_non_us)}%</strong> owned outside the U.S.</span>`}${
+        f.abroad ? ` · ${num(f.abroad)} based or run abroad` : ""}</div>`;
+  };
+
   const contractorRows = contractors.map((r) => `
     <tr>
       <td>${linkEntity(r.page_key || r.entity_key, r.entity_name)}</td>
@@ -2398,6 +2501,7 @@ function portfolioTable(companies) {
       <td class="num">${r.contract_count ? num(r.contract_count) : "—"}</td>
       <td class="num">${r.obligated ? money(r.obligated) : "—"}</td>
       <td>${raise(r)}</td>
+      <td>${pooled(r)}</td>
       <td>${r.last_screened ? day(r.last_screened) : "—"}</td>
     </tr>`).join("");
 
@@ -2415,6 +2519,7 @@ function portfolioTable(companies) {
     ${contractors.length ? `<table>
       <thead><tr><th>Contractor</th><th>Latest severity</th><th class="num">Awards</th>
         <th class="num">Obligated</th><th title="From the company's latest SEC Form D">Latest private raise</th>
+        <th title="Investment funds named after the company, and the money their latest notices report. Looked up on the contractor's page.">Funds named after it</th>
         <th>Screened</th></tr></thead>
       <tbody>${contractorRows}</tbody></table>` : ""}
     ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
@@ -2526,11 +2631,47 @@ async function syncAlertList(newKey) {
     const d = await api("/v1/alerts");
     const list = d.subscriptions.find((s) => s.subscription_id === id);
     if (!list) return;
+    // Shown masked to a visitor of a public site, so not sent back: the
+    // server keeps the addresses it has.
     await apiPost("/v1/alerts/subscriptions", {
-      subscription_id: id, name: list.name, emails: list.emails,
+      subscription_id: id, name: list.name,
+      emails: list.can_edit_addresses === false ? [] : list.emails,
       portfolio_key: newKey, active: list.active,
     });
   } catch { /* shown as out of date on the portfolio page instead */ }
+}
+
+/* What saving the list did, carried across the redraw that follows it. */
+let alertSaveNote = "";
+
+function recipientRows(list) {
+  const word = {
+    confirmed: "gets alerts",
+    pending: "not confirmed yet; nothing is sent until they do",
+  };
+  if (!(list.recipients || []).length) return "";
+  return `<ul style="margin:6px 0 10px;padding-left:18px;font-size:13px">
+    ${list.recipients.map((r) => `<li>${esc(r.email)}
+      <span class="muted">· ${esc(word[r.status] || r.status)}</span></li>`).join("")}</ul>`;
+}
+
+/* The requests to confirm that saving sent, held back, or could not send. */
+function consentNote(c) {
+  if (!c) return "";
+  const parts = [];
+  if (c.asked.length) {
+    parts.push(`Emailed ${c.asked.join(", ")} asking to confirm. Alerts start for each `
+      + "address once it does; the email can take a minute, and may land in spam.");
+  }
+  if (c.waiting.length) parts.push(`${c.waiting.join(", ")} already had a request to confirm today.`);
+  if (c.held.length) {
+    parts.push(`The site has sent its day's requests to confirm, so ${c.held.join(", ")} `
+      + "will be asked when the list is next saved, from tomorrow.");
+  }
+  for (const n of c.not_sent || []) {
+    parts.push(`Could not email ${n.email} asking to confirm: ${n.detail}`);
+  }
+  return parts.join(" ");
 }
 
 function deliveryRows(deliveries) {
@@ -2572,6 +2713,12 @@ async function alertsCard(key, portfolioName) {
   const deliveries = list ? d.deliveries.filter((x) => x.subscription_id === list.subscription_id) : [];
   const outOfDate = list && list.portfolio_key !== key;
   const mode = d.sending.mode;
+  // A visitor to a public site adds people; the addresses already on the
+  // list are shown masked and are taken off by their own link, or by
+  // someone holding the admin key.
+  const editable = list ? list.can_edit_addresses !== false : d.can_edit_addresses !== false;
+  const note = alertSaveNote;
+  alertSaveNote = "";
 
   return `
     <div class="card" id="alerts-card">
@@ -2590,18 +2737,42 @@ async function alertsCard(key, portfolioName) {
       <div class="${mode === "send" ? "muted" : "error"}" style="font-size:12.5px;margin:8px 0">
         ${esc(d.sending.explanation)}</div>
 
-      <label class="field" style="display:block">Send to (one or more addresses)
+      ${list ? recipientRows(list) : ""}
+      <label class="field" style="display:block">${list && !editable
+        ? "Add people (one or more addresses)" : "Send to (one or more addresses)"}
         <textarea id="alert-emails" rows="2" style="width:100%;margin-top:4px"
-          placeholder="name@agency.gov, colleague@example.com">${esc(list ? list.emails.join(", ") : "")}</textarea>
+          placeholder="name@agency.gov, colleague@example.com">${esc(list && editable ? list.emails.join(", ") : "")}</textarea>
       </label>
+      ${!editable ? `<p class="muted" style="font-size:12.5px">Each new address is first
+        sent an email asking it to confirm. Nothing else is sent to it until it does, and
+        every alert ends with a link to unsubscribe.</p>` : ""}
+      ${list && (list.opted_out || []).length ? `<p class="muted" style="font-size:12.5px">
+        Unsubscribed themselves, from the link in an alert:
+        ${list.opted_out.map((o) => `<span class="mono">${esc(o.email)}</span>
+          (${esc(day(o.at))})`).join(", ")}.
+        They are not emailed again, even if added back here; they can rejoin from that
+        same link.</p>` : ""}
+      ${list && (list.bounced || []).length ? `<div class="error" style="font-size:12.5px;margin:6px 0">
+        <strong>Not being emailed:</strong>
+        ${list.bounced.map((b) => `<div style="margin-top:4px">${esc(b.description)}
+          ${b.kind === "complaint" || !editable ? "" : `<button class="ghost bounce-clear"
+            data-email="${esc(b.email)}" style="margin-left:6px">Mail again</button>`}</div>`).join("")}
+        ${editable ? `<div class="muted" style="margin-top:4px">If an address was mistyped,
+          correct it in the box above. “Mail again” is for an address that has started working
+          again.</div>` : ""}
+      </div>` : ""}
+      ${list && mode === "send" && !d.bounce_reports ? `<p class="muted" style="font-size:12px">
+        This site is not told when an alert bounces, so a dead address goes on being sent to
+        unnoticed. DEPLOY.md, “Hearing about bounces”, has the steps.</p>` : ""}
       ${outOfDate ? `<p class="muted" style="font-size:12.5px">This portfolio has changed
         since the list was saved. Save again to watch the new companies.</p>` : ""}
       <div class="actions">
-        <button class="primary" id="alert-save">${list ? "Update list" : "Start email alerts"}</button>
+        <button class="primary" id="alert-save">${list ? (editable ? "Update list" : "Add to list") : "Start email alerts"}</button>
         ${list ? `<button id="alert-run">Check now</button>
                   <button id="alert-test">Send a test email</button>
-                  <button class="ghost" id="alert-delete">Stop alerts</button>` : ""}
+                  ${editable ? '<button class="ghost" id="alert-delete">Stop alerts</button>' : ""}` : ""}
       </div>
+      ${note ? `<p style="font-size:12.5px;margin-top:8px">${esc(note)}</p>` : ""}
       <p class="muted" id="alert-status" style="font-size:12.5px;margin-top:8px">
         ${list && list.last_run_at ? `Last checked ${esc(day(list.last_run_at))}.` : ""}</p>
       ${list ? `<p class="muted" style="font-size:12px">A check runs when this page is
@@ -2613,13 +2784,16 @@ async function alertsCard(key, portfolioName) {
 }
 
 /* What a check did, for the line under the buttons. */
+const CHECK_NOT_RUN = ["already running", "paused", "recently checked"];
+
 function describeCheck(r, portfolioName) {
-  if (r.status === "already running") return r.detail;
+  if (CHECK_NOT_RUN.includes(r.status)) return r.detail;
   const mine = (r.emails || []).find((e) => e.subscription === portfolioName) || {};
   const funds = r.funds || {};
   const checked = `Checked ${r.firms_checked} investment firm(s) and `
     + `${r.companies_checked || 0} contractor(s) with an SEC record`
     + (funds.watched ? `, and looked for new funds named after ${funds.watched} contractor(s)` : "")
+    + (r.managers_checked ? ` and at the ${r.managers_checked} firm(s) managing those funds` : "")
     + (funds.error ? ". The list of new fund filings could not be read this time" : "") + ".";
   if (mine.status === "nothing new" || !mine.status) {
     return `${checked} Nothing new since the last alert.`;
@@ -2629,6 +2803,8 @@ function describeCheck(r, portfolioName) {
     drafted: "written but not sent",
     partial: "emailed to some of this list — see Recent alerts",
     failed: "could not be sent, and will be tried again — see Recent alerts",
+    "waiting for confirmation": "kept until someone on the list confirms their address",
+    "nobody to send to": "not sent: nobody on this list can be emailed",
   }[mine.status] || mine.status;
   return `${checked} ${mine.items || 0} update(s), ${outcome}.`;
 }
@@ -2656,6 +2832,18 @@ function wireAlerts(key, portfolioName) {
   const save = document.getElementById("alert-save");
   if (!save) return;
   if (document.getElementById("alert-run")) checkIfDue(portfolioName);
+  document.querySelectorAll(".bounce-clear").forEach((btn) => {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await apiSend("DELETE", `/v1/alerts/bounces/${encodeURIComponent(btn.dataset.email)}`);
+        viewPortfolio();
+      } catch (e) {
+        btn.disabled = false;
+        status.textContent = e.message || String(e);
+      }
+    };
+  });
   save.onclick = async () => {
     save.disabled = true;
     try {
@@ -2666,6 +2854,10 @@ function wireAlerts(key, portfolioName) {
         portfolio_key: key,
       });
       rememberAlertListId(r.subscription.subscription_id);
+      alertSaveNote = [
+        (r.declined || []).length ? `Not added: ${r.declined.join(", ")} unsubscribed `
+          + "themselves, and can rejoin from the link in their last alert." : "",
+        consentNote(r.consent)].filter(Boolean).join(" ");
       viewPortfolio();
     } catch (e) {
       save.disabled = false;
@@ -2681,7 +2873,10 @@ function wireAlerts(key, portfolioName) {
       try {
         const r = await apiPost("/v1/alerts/run", {});
         status.textContent = describeCheck(r, portfolioName);
-        if (r.status === "already running") { run.disabled = false; return; }
+        if (CHECK_NOT_RUN.includes(r.status)) {
+          run.disabled = false;
+          return;
+        }
         setTimeout(viewPortfolio, 2500);
       } catch (e) {
         run.disabled = false;
@@ -2697,17 +2892,26 @@ function wireAlerts(key, portfolioName) {
           drafted: `Test written but not sent: ${r.detail}`,
           partial: `Test sent to some addresses only. ${r.detail}`,
           failed: `Test not sent. ${r.detail}`,
+          waiting: `Test not sent. ${r.detail}`,
         }[r.status] || `Test ${r.status}: ${r.detail}`;
-        setTimeout(viewPortfolio, 4000);
+        if (r.status !== "waiting") setTimeout(viewPortfolio, 4000);
       } catch (e) {
         status.textContent = e.message || String(e);
       }
     };
-    document.getElementById("alert-delete").onclick = async () => {
-      await apiSend("DELETE", `/v1/alerts/subscriptions/${encodeURIComponent(savedAlertListId())}`);
-      rememberAlertListId("");
-      viewPortfolio();
-    };
+    const stop = document.getElementById("alert-delete");
+    if (stop) {
+      stop.onclick = async () => {
+        try {
+          await apiSend("DELETE", `/v1/alerts/subscriptions/${encodeURIComponent(savedAlertListId())}`);
+        } catch (e) {
+          status.textContent = e.message || String(e);
+          return;
+        }
+        rememberAlertListId("");
+        viewPortfolio();
+      };
+    }
   }
 }
 
@@ -3228,15 +3432,295 @@ async function viewScreening(notes) {
   };
 }
 
+/* ------------------------------------------------------------ system check */
+
+/* Whether this site can do its job, and what it holds. Made for moving between
+ * hosts: a new site that draws its pages can still be unable to write to its
+ * database, reach the SEC, or reach itself — and the row counts, read on the
+ * old site and the new, are how to tell that everything was copied. */
+async function viewSystem() {
+  setBusy("Trying each thing this site depends on — a few seconds…");
+  const d = await api("/v1/system/check");
+  const mark = (ok) => ok === true ? '<span class="pill">✓ working</span>'
+    : ok === false ? '<span class="pill warn">✗ not working</span>'
+      : '<span class="muted">note</span>';
+  const failing = d.checks.filter((c) => c.ok === false).length;
+  const tables = Object.entries(d.tables);
+  // One line that can be pasted next to the other site's, to compare by eye
+  // or in a text editor.
+  const fingerprint = tables.map(([t, n]) => `${t}=${n}`).join(" ");
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>System check</h1>
+      <div class="sub">${esc(d.host)}${d.revision ? " · " + esc(d.revision) : ""}
+        · version ${esc(d.version)} · ${esc(d.database)} · checked ${esc(day(d.checked_at))}</div>
+    </div>
+
+    <div class="card">
+      <h2>${failing ? `${num(failing)} thing${failing === 1 ? "" : "s"} not working`
+        : "Everything this site depends on is working"}</h2>
+      <p class="muted">Each line was tried just now, for real: a row written to the database
+      and read back, a request sent to each source. A “note” is worth knowing and is not a
+      fault.</p>
+      <table>
+        <tbody>${d.checks.map((c) => `<tr>
+          <td style="white-space:nowrap"><strong>${esc(c.name)}</strong></td>
+          <td style="white-space:nowrap">${mark(c.ok)}</td>
+          <td>${esc(c.detail)}${c.fix ? `<div style="margin-top:4px"><strong>To fix:</strong>
+            ${esc(c.fix)}</div>` : ""}</td></tr>`).join("")}</tbody>
+      </table>
+      <div class="actions"><button id="sys-again">Check again</button></div>
+    </div>
+
+    <div class="card">
+      <h2>What is stored here</h2>
+      <p class="muted"><strong>${num(d.rows)}</strong> rows in ${num(tables.length)} tables.
+      When moving the site, open this page on the old site and on the new one: the same
+      numbers on both mean everything was copied, and a different number names the table
+      to look at.</p>
+      <table>
+        <thead><tr><th>Table</th><th class="num">Rows</th></tr></thead>
+        <tbody>${tables.map(([t, n]) => `<tr><td class="mono">${esc(t)}</td>
+          <td class="num">${n < 0 ? '<span class="pill warn">could not be counted</span>'
+            : num(n)}</td></tr>`).join("")}</tbody>
+      </table>
+      <p class="muted" style="font-size:12.5px;margin-top:10px">The same, as one line to
+      paste beside the other site's:</p>
+      <textarea readonly rows="3" style="width:100%;font-size:12px"
+        onclick="this.select()">${esc(fingerprint)}</textarea>
+    </div>
+
+    <div class="card">
+      <h2>Settings in use</h2>
+      <p class="muted">By name only; values are never shown. A new site needs each of the
+      first group set to the same value as the old one.</p>
+      <p><strong>To carry to a new site:</strong>
+        ${d.settings.carry.length ? d.settings.carry.map((s) =>
+          `<span class="mono">${esc(s)}</span>`).join(", ") : "none"}</p>
+      <p class="muted"><strong>About this host only</strong> (expected to differ):
+        ${d.settings.this_host.length ? d.settings.this_host.map((s) =>
+          `<span class="mono">${esc(s)}</span>`).join(", ") : "none"}</p>
+    </div>`;
+  document.getElementById("sys-again").onclick = () => viewSystem();
+}
+
+/* -------------------------------------------------------------- watchlists
+ *
+ * Screens that re-run on the nightly sweep. Each can carry its own policy —
+ * only the settings it changes from the Screening page — so a short list of
+ * high-priority primes can raise notices at "low" while an agency sweep stays
+ * quiet. "Follow Screening settings" means not overriding that setting at
+ * all, so a later change on the Screening page reaches this watchlist too. */
+
+function watchlistSubject(p) {
+  const what = p.recipient ? `Contractor ${p.recipient}`
+    : [p.agency, p.sub_agency].filter(Boolean).join(" › ") || "—";
+  const scope = `${num(p.months_back ?? 12)} months · up to ${num(p.max_entities ?? 5)}` +
+    ` contractor(s)` +
+    (p.max_subaward_entities ? ` + ${num(p.max_subaward_entities)} subcontractor(s)` : "");
+  return `${esc(what)}<div class="muted" style="font-size:12px">${esc(scope)}</div>`;
+}
+
+function watchlistPolicySummary(override) {
+  const o = override || {};
+  const parts = [];
+  if (o.notice_min_severity) parts.push(`notices at ${o.notice_min_severity}`);
+  if (o.notice_mode) parts.push(o.notice_mode.replace(/_/g, " "));
+  if (o.categories) parts.push(`screens ${o.categories.length ? o.categories.join(", ") : "nothing"}`);
+  const other = Object.keys(o).filter(
+    (k) => !["notice_min_severity", "notice_mode", "categories"].includes(k));
+  if (other.length) parts.push(`${other.length} other setting(s)`);
+  return parts.length ? esc(parts.join(" · "))
+    : '<span class="muted">Follows Screening settings</span>';
+}
+
+function watchlistPolicyForm(w, cat) {
+  const o = w.policy_override || {};
+  const sev = ["", ...cat.notice_severities].map((s) =>
+    `<option value="${s}" ${s === (o.notice_min_severity || "") ? "selected" : ""}>${
+      s || "Follow Screening settings"}</option>`).join("");
+  const mode = ["", ...Object.keys(cat.notice_modes)].map((m) =>
+    `<option value="${m}" ${m === (o.notice_mode || "") ? "selected" : ""}>${
+      m ? m.replace(/_/g, " ") : "Follow Screening settings"}</option>`).join("");
+  const ownCats = Array.isArray(o.categories);
+  return `
+    <form class="wl-policy" data-id="${esc(w.watchlist_id)}" hidden>
+      <label class="field">Notify for findings at or above
+        <select name="notice_min_severity">${sev}</select></label>
+      <label class="field" style="margin-top:8px">When
+        <select name="notice_mode">${mode}</select></label>
+      <label class="check" style="margin-top:8px">
+        <input type="checkbox" name="own_categories" ${ownCats ? "checked" : ""}>
+        <span>Screen a different set of categories from the Screening page</span></label>
+      <div class="checks wl-cats" ${ownCats ? "" : "hidden"}>
+        ${checkboxes("categories", cat.categories,
+                     ownCats ? o.categories : w.policy.categories)}</div>
+      <div class="actions">
+        <button type="submit" class="primary">Save</button>
+        <button type="button" class="ghost wl-cancel">Cancel</button>
+      </div>
+    </form>`;
+}
+
+function readWatchlistPolicy(form) {
+  const override = {};
+  const sev = form.querySelector('[name="notice_min_severity"]').value;
+  const mode = form.querySelector('[name="notice_mode"]').value;
+  if (sev) override.notice_min_severity = sev;
+  if (mode) override.notice_mode = mode;
+  if (form.querySelector('[name="own_categories"]').checked) {
+    override.categories = [...form.querySelectorAll('input[name="categories"]:checked')]
+      .map((i) => i.value);
+  }
+  return override;
+}
+
+async function viewWatchlists(notes) {
+  setBusy("Loading watchlists…");
+  const [d, pol] = await Promise.all([api("/v1/watchlists"), api("/v1/policy")]);
+  const cat = pol.catalogue;
+  const lists = d.watchlists || [];
+
+  const rows = lists.map((w) => `
+    <tr class="${w.active ? "" : "rule-off"}">
+      <td><strong>${esc(w.name)}</strong>
+        ${w.active ? "" : '<div class="muted" style="font-size:12px">paused</div>'}</td>
+      <td>${watchlistSubject(w.params || {})}</td>
+      <td>${w.last_run_id
+        ? `<a href="#/screens/${encodeURIComponent(w.last_run_id)}">${day(w.last_run_at)}</a>`
+        : '<span class="muted">never</span>'}</td>
+      <td>${watchlistPolicySummary(w.policy_override)}
+        ${watchlistPolicyForm(w, cat)}</td>
+      <td class="wl-actions">
+        <button type="button" class="linkish" data-act="run" data-id="${esc(w.watchlist_id)}">Run now</button>
+        <button type="button" class="linkish" data-act="policy" data-id="${esc(w.watchlist_id)}">Policy</button>
+        <button type="button" class="linkish" data-act="${w.active ? "pause" : "resume"}"
+          data-id="${esc(w.watchlist_id)}">${w.active ? "Pause" : "Resume"}</button>
+      </td>
+    </tr>`).join("");
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Watchlists</h1>
+      <div class="sub">Screens that re-run on the nightly sweep. Each can raise
+        notices on its own terms; anything it does not set follows the
+        <a href="#/screening">Screening</a> page.</div>
+    </div>
+
+    ${policyNotes(notes)}
+
+    <div class="card">
+      ${lists.length ? `<table>
+        <thead><tr><th>Name</th><th>Screens</th><th>Last run</th><th>Policy</th><th></th></tr></thead>
+        <tbody>${rows}</tbody></table>`
+        : `<div class="empty">No watchlists yet. Add one below and it joins the
+           nightly sweep.</div>`}
+    </div>
+
+    <form id="wl-new" class="card">
+      <h2>New watchlist</h2>
+      <div class="form-grid">
+        <label>Name <input name="name" required maxlength="120"
+          placeholder="Navy primes"></label>
+        <label>Agency <input name="agency" placeholder="Department of Defense"></label>
+        <label>Sub-agency <input name="sub_agency" placeholder="Department of the Navy (optional)"></label>
+        <label>Or one contractor <input name="recipient"
+          placeholder="Name or UEI — instead of an agency"></label>
+        <label>Months to look back <input name="months_back" type="number" min="1" max="60" value="12"></label>
+        <label>Awards to read <input name="max_awards" type="number" min="1" max="500" value="25"></label>
+        <label>Contractors to screen <input name="max_entities" type="number" min="1" max="100" value="5"></label>
+        <label>Subcontractors too <input name="max_subaward_entities" type="number" min="0" max="50" value="0"></label>
+        <label>Notify at or above
+          <select name="notice_min_severity">
+            <option value="">Follow Screening settings</option>
+            ${cat.notice_severities.map((s) => `<option value="${s}">${s}</option>`).join("")}
+          </select></label>
+      </div>
+      <div class="actions"><button type="submit" class="primary">Add watchlist</button></div>
+    </form>`;
+
+  view.querySelectorAll(".wl-actions button").forEach((b) => {
+    b.onclick = async () => {
+      const id = b.dataset.id;
+      try {
+        if (b.dataset.act === "run") {
+          const r = await apiPost(`/v1/watchlists/${encodeURIComponent(id)}/run`, {});
+          runScreenInRequest(r);
+          location.hash = `#/screens/${encodeURIComponent(r.run_id)}`;
+        } else if (b.dataset.act === "pause") {
+          await apiSend("DELETE", `/v1/watchlists/${encodeURIComponent(id)}`);
+          viewWatchlists();
+        } else if (b.dataset.act === "resume") {
+          await apiPost(`/v1/watchlists/${encodeURIComponent(id)}/resume`, {});
+          viewWatchlists();
+        } else {
+          const form = view.querySelector(`form.wl-policy[data-id="${CSS.escape(id)}"]`);
+          form.hidden = !form.hidden;
+        }
+      } catch (err) {
+        showError(err);
+      }
+    };
+  });
+
+  view.querySelectorAll("form.wl-policy").forEach((form) => {
+    const own = form.querySelector('[name="own_categories"]');
+    own.onchange = () => { form.querySelector(".wl-cats").hidden = !own.checked; };
+    form.querySelector(".wl-cancel").onclick = () => { form.hidden = true; };
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const id = encodeURIComponent(form.dataset.id);
+      const override = readWatchlistPolicy(form);
+      try {
+        const r = Object.keys(override).length
+          ? await apiSend("PUT", `/v1/watchlists/${id}/policy`, override)
+          : await apiSend("DELETE", `/v1/watchlists/${id}/policy`);
+        viewWatchlists(r.notes);
+      } catch (err) {
+        showError(err);
+      }
+    };
+  });
+
+  document.getElementById("wl-new").onsubmit = async (e) => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const text = (k) => String(f.get(k) || "").trim();
+    const int = (k) => parseInt(f.get(k), 10);
+    if (!text("agency") && !text("recipient")) {
+      showError({ title: "Nothing to screen", message: "Give an agency or a contractor." });
+      return;
+    }
+    const body = {
+      name: text("name"),
+      screen: {
+        agency: text("agency"), sub_agency: text("sub_agency"), recipient: text("recipient"),
+        months_back: int("months_back"), max_awards: int("max_awards"),
+        max_entities: int("max_entities"), max_subaward_entities: int("max_subaward_entities"),
+      },
+    };
+    if (text("notice_min_severity")) {
+      body.policy = { notice_min_severity: text("notice_min_severity") };
+    }
+    try {
+      const r = await apiPost("/v1/watchlists", body);
+      viewWatchlists(r.notes);
+    } catch (err) {
+      showError(err);
+    }
+  };
+}
+
 /* ------------------------------------------------------------------ router */
 
 const ROUTES = [
   [/^\/?$/, () => viewOverview()],
   [/^\/search\/([^/]*)(?:\/([^/]*))?(?:\/(\d+))?$/,
    (q, k, off) => viewSearch(decodeURIComponent(q), k, off)],
-  [/^\/entity\/(.+)$/, (k) => viewEntity(decodeURIComponent(k))],
-  [/^\/officer\/(.+)$/, (e) => viewOfficer(decodeURIComponent(e))],
-  [/^\/agency\/(.+)$/, (n) => viewAgency(decodeURIComponent(n))],
+  [/^\/entity\/(.+)$/, (k, params) => viewEntity(decodeURIComponent(k), params)],
+  [/^\/officer\/(.+)$/, (e, params) => viewOfficer(decodeURIComponent(e), params)],
+  [/^\/agency\/(.+)$/, (n, params) => viewAgency(decodeURIComponent(n), params)],
   [/^\/contract\/(.+)$/, (c) => viewContract(decodeURIComponent(c))],
   [/^\/diff\/([^/]+)\/([^/]+)(?:\/([^/]+))?$/,
    (s, k, from, params) => viewDiff(decodeURIComponent(s), decodeURIComponent(k),
@@ -3246,8 +3730,10 @@ const ROUTES = [
   [/^\/rules$/, () => viewRules()],
   [/^\/portfolio$/, () => viewPortfolio()],
   [/^\/screening$/, () => viewScreening()],
+  [/^\/watchlists$/, () => viewWatchlists()],
   [/^\/adviser\/(\d+)$/, (crd) => viewAdviser(crd)],
   [/^\/screens\/(.+)$/, (id) => viewScreen(decodeURIComponent(id))],
+  [/^\/system$/, () => viewSystem()],
 ];
 
 async function route() {
@@ -3286,6 +3772,19 @@ async function route() {
  * look identical from here, and only one of them is the reader's fault. */
 let storageIsEphemeral = false;
 
+/* On a site open to anyone, nobody needs a key to use it; the key the
+ * button asks for is the one for the few actions kept for whoever looks
+ * after the site. */
+function showPublicKeyLabels() {
+  document.getElementById("key-button").textContent = "Admin key";
+  document.getElementById("key-title").textContent = "Admin key";
+  document.getElementById("key-explain").textContent =
+    "Nobody needs a key to use this site. The admin key is only for deleting a "
+    + "screen or an alert list, changing the screening rules, and "
+    + "approving or rejecting a notice. It is kept in this browser's local storage; "
+    + "treat it like a password, and leave it off a shared computer.";
+}
+
 async function refreshHealth() {
   const banner = document.getElementById("config-banner");
   if (!banner) return;
@@ -3298,6 +3797,7 @@ async function refreshHealth() {
     return;   // unreachable server; the view's own error already says so
   }
   storageIsEphemeral = health.ephemeral_storage === true;
+  if (health.public) showPublicKeyLabels();
   const warnings = health.warnings || [];
   if (!warnings.length) {
     banner.hidden = true;
