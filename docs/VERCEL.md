@@ -178,6 +178,21 @@ the Watchlists page at 10:30 UTC, one at a time, so its notices are in that day'
 Nothing on Vercel runs in the background, so without it a watchlist runs only when someone
 presses **Run now**. Each screen stops after four minutes and keeps what it finished.
 
+**The backup: Vercel's own daily job.** `vercel.json` has Vercel ask the site for the same
+check once a day, at 15:00 UTC — some time within that hour on the free plan — so alerts go
+out on a day the GitHub workflow does not run (GitHub pauses the schedules of a repository
+with no commits for 60 days, and can run them late). It needs nothing set up. Nobody gets the
+same thing twice: a workspace checked in the last 12 hours, by either job or by someone
+opening the Portfolio page, is skipped, and an alert never repeats something it has sent — a
+second check only ever finds what is new since. It checks alerts only; re-screening
+watchlists stays with the GitHub workflow, as one screen can take most of the five minutes
+Vercel allows a request.
+
+Optional: add `CRON_SECRET` in Vercel (**Settings** → **Environment Variables**, any long
+random string) and the daily check answers only Vercel's job. Vercel sends it by itself. To
+see that it ran: Vercel → the project → **Settings** → **Cron Jobs**, or the logs for
+`/v1/schedule/daily`.
+
 ## 7. Sending notices
 
 A notice is the email the screen drafts to the contracting officer on an award. It goes

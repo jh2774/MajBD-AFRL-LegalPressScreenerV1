@@ -255,6 +255,10 @@ class Config:
     # are no drafts there, so it is the deliberate act GMAIL_SEND is for Gmail.
     # A copy to an address the reviewer chooses needs only the mail service.
     notices_send: bool = field(default_factory=lambda: _flag("NOTICES_SEND", False))
+    # Vercel sends it, as a bearer token, with the requests its daily job makes
+    # (vercel.json "crons"), once it is set on the project. Optional on a public
+    # site; on one that needs a key it is how the daily job gets in.
+    cron_secret: str = field(default_factory=lambda: _env("CRON_SECRET"))
 
     def ensure_dirs(self) -> None:
         for d in (self.cache_dir, self.out_dir):

@@ -8,10 +8,12 @@ No test talks to a mail service: `requests.post` is replaced with a recorder.
 from __future__ import annotations
 
 import importlib
+import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from test_mailer import Post
+from test_mailer import Post, flagged_list
 from test_notice_delivery import _notice
 
 from foci_screen import accounts
@@ -24,7 +26,7 @@ STRANGER = "stranger@elsewhere.example"
 ONE = pf.encode(pf.from_entity_keys("Watch", ["UEI1"]))
 ENV = ("DATABASE_URL", "REDIS_URL", "GMAIL_ENABLED", "FOCI_EMAIL_REDIRECT_TO", "BREVO_API_KEY",
        "MAIL_PROVIDER", "SMTP_HOST", "ALERTS_SEND", "ALERTS_REPLY_TO", "NOTICES_SEND",
-       "FOCI_PUBLIC_URL", "VERCEL_PROJECT_PRODUCTION_URL", "FOCI_SIGNUP")
+       "FOCI_PUBLIC_URL", "VERCEL_PROJECT_PRODUCTION_URL", "FOCI_SIGNUP", "CRON_SECRET")
 
 
 @pytest.fixture()
@@ -228,3 +230,55 @@ def test_the_daily_watchlist_sweep_covers_every_workspace(site, monkeypatch):
     assert anyone.post("/v1/schedule/watchlists").json() == {"status": "queued", "left": 0}
     assert anyone.post("/v1/schedule/watchlists").json()["status"] == "nothing due"
     assert set(started) == made
+
+
+# ------------------------------------------------- Vercel's daily job, too
+
+def test_vercel_asks_for_the_daily_check_once_a_day(site):
+    _, app_module = site()
+    crons = json.loads((Path(__file__).resolve().parent.parent / "vercel.json")
+                       .read_text(encoding="utf-8"))["crons"]
+    assert [c["schedule"].split()[2:] for c in crons] == [["*", "*", "*"]], "daily"
+    gets = {r.path for r in app_module.app.routes if "GET" in getattr(r, "methods", ())}
+    assert [c["path"] for c in crons] == ["/v1/schedule/daily"]
+    assert "/v1/schedule/daily" in gets, "Vercel's scheduler sends a GET"
+
+
+def test_the_daily_check_emails_what_is_new_and_nothing_twice(site, monkeypatch):
+    """GitHub's workflow, Vercel's job, and someone opening the Portfolio page
+    may all ask on the same day. Only the first finds anything to send."""
+    post = Post(monkeypatch)
+    c, app_module = site()
+    flagged_list(app_module.store_for("default"), ["reader@firm.example"])
+    anyone = TestClient(app_module.app)
+
+    first = anyone.get("/v1/schedule/daily").json()
+    assert first == {"status": "checked", "workspaces": 1, "emails": 1, "left": 0}
+    assert len(sent_to(post, "reader@firm.example")) == 1
+
+    assert anyone.post("/v1/schedule/alerts").json()["status"] == "nothing due"
+    assert anyone.get("/v1/schedule/daily").json()["emails"] == 0
+
+    # Due again — as if a day had passed — the check runs, and finds nothing new.
+    monkeypatch.setattr(app_module, "SWEEP_ALERTS_HOURS", -1)
+    again = anyone.get("/v1/schedule/daily").json()
+    assert (again["status"], again["emails"]) == ("checked", 0)
+    assert len(sent_to(post, "reader@firm.example")) == 1, "never the same item twice"
+
+
+def test_with_cron_secret_set_only_vercel_gets_in(site, monkeypatch):
+    Post(monkeypatch)
+    c, _ = site(CRON_SECRET="test-cron-secret")
+    assert c.get("/v1/schedule/daily").status_code == 401
+    assert c.get("/v1/schedule/daily",
+                 headers={"Authorization": "Bearer wrong"}).status_code == 401
+    assert c.get("/v1/schedule/daily",
+                 headers={"Authorization": "Bearer test-cron-secret"}).status_code == 200
+
+
+def test_a_site_that_needs_a_key_needs_one_for_the_daily_check(site, monkeypatch):
+    Post(monkeypatch)
+    c, _ = site(FOCI_PUBLIC="")
+    assert c.get("/v1/schedule/daily").status_code == 401
+    assert c.get("/v1/schedule/daily",
+                 headers={"Authorization": "Bearer admin-key"}).status_code == 200

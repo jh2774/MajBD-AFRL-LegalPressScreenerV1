@@ -5,5 +5,11 @@
       "maxDuration": 300,
       "excludeFiles": "{tests/**,docs/**,tools/**,.github/**,Dockerfile*,render.yaml,ROADMAP.md}"
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/v1/schedule/daily",
+      "schedule": "0 15 * * *"
+    }
+  ]
 }

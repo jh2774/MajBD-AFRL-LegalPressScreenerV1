@@ -2164,6 +2164,12 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
 # that is due and says how many are left, so no one request runs for long.
 # Calling early only does due work sooner — each list at most every few hours,
 # each watchlist once a day — so a public site needs no key for them.
+#
+# Vercel's own daily job (vercel.json) is the backup, for a day the workflow
+# does not run: GitHub pauses a quiet repository's schedules, and can run them
+# late. It asks for the same check. Neither sends anything twice: a workspace
+# checked in the last SWEEP_ALERTS_HOURS is skipped, whoever checked it, and an
+# alert never repeats an item it has sent — a second check finds nothing new.
 
 SWEEP_ALERTS_HOURS = 12           # a workspace checked more recently is skipped
 SWEEP_WATCHLISTS_HOURS = 20
@@ -2177,7 +2183,12 @@ def _hours_ago(hours: float) -> str:
 @app.post("/v1/schedule/alerts", tags=["alerts"])
 def scheduled_alerts(request: Request, _tenant: str = Depends(require_tenant)) -> dict:
     """Check the next workspace whose alert lists are due, and email what is
-    new. `left` is how many more are due; ask again until it is 0."""
+    new. `left` is how many more are due; ask again until it is 0. `emails` is
+    how many lists had something new and were emailed."""
+    return _check_next_workspace(request)
+
+
+def _check_next_workspace(request: Request) -> dict:
     if cfg.alerts_paused:
         return {"status": "paused", "left": 0, "detail": ALERTS_PAUSED_NOTE}
     due = store_for(auth.DEFAULT_TENANT).alert_workspaces_due(
@@ -2201,7 +2212,52 @@ def scheduled_alerts(request: Request, _tenant: str = Depends(require_tenant)) -
     finally:
         _alerts_running.release()
     # Counts only: the caller may be anyone, and the workspace is not theirs.
-    return {"status": "checked", "left": len(due) - 1, "emails": len(result["emails"])}
+    emailed = sum(1 for e in result["emails"] if e.get("status") in ("sent", "partial"))
+    return {"status": "checked", "left": len(due) - 1, "emails": emailed}
+
+
+# How long the daily job starts new checks for. Vercel stops a function at
+# maxDuration (vercel.json: 300 seconds); a check begun near the end is left
+# room to finish, and what is not reached is due again tomorrow.
+DAILY_BUDGET_SECONDS = 200
+
+
+@app.get("/v1/schedule/daily", tags=["alerts"])
+def daily_check(request: Request, authorization: str = Header(default=""),
+                x_api_key: str = Header(default="")) -> dict:
+    """The daily check for new updates, for Vercel's own scheduler (a GET, as
+    it sends). Every workspace whose alert lists are due, one after another,
+    for as long as one request may run; each emails only what is new.
+
+    With CRON_SECRET set, only a request bearing it — Vercel's — is let in.
+    Without it, a public site lets anyone ask, as for the routes above: all it
+    does is work that is due. A site that needs a key needs one here, or
+    CRON_SECRET.
+    """
+    if cfg.cron_secret:
+        if not secrets.compare_digest(authorization.encode(),
+                                      f"Bearer {cfg.cron_secret}".encode()):
+            raise HTTPException(401, "This is the site's daily job.")
+    elif not cfg.public:
+        presented = _key_presented(authorization, x_api_key)
+        if not (presented and auth.resolve_tenant(keymap, presented)):
+            raise HTTPException(401, "Set CRON_SECRET on the site for its daily job, or "
+                                     "send an API key.")
+    started = time.monotonic()
+    checked = emails = 0
+    last: dict = {"status": "nothing due", "left": 0}
+    while time.monotonic() - started < DAILY_BUDGET_SECONDS:
+        last = _check_next_workspace(request)
+        if last["status"] != "checked":
+            break
+        checked += 1
+        emails += last["emails"]
+        if not last["left"]:
+            break
+    log.info("daily check: %d workspace(s) checked, %d list(s) emailed, %s left",
+             checked, emails, last.get("left", 0))
+    return {"status": last["status"] if not checked else "checked",
+            "workspaces": checked, "emails": emails, "left": last.get("left", 0)}
 
 
 @app.post("/v1/schedule/watchlists", tags=["watchlists"])
