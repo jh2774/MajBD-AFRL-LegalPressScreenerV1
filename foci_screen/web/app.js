@@ -5121,6 +5121,44 @@ document.getElementById("search-form").onsubmit = (e) => {
   location.hash = `#/search/${encodeURIComponent(q)}`;
 };
 
+/* -------------------------------------------------------------- the theme */
+
+/* Light, dark, or whatever the device is set to, remembered in this browser.
+ * The page head applies a saved choice before anything is drawn; this keeps the
+ * button's label in step and changes it. */
+const THEME_STORAGE = "foci.theme";
+const THEMES = ["", "light", "dark"];
+const THEME_NAME = { "": "Auto", light: "Light", dark: "Dark" };
+const THEME_MARK = { "": "◐", light: "☀", dark: "☾" };
+let colourTheme = (() => {
+  try {
+    const t = localStorage.getItem(THEME_STORAGE) || "";
+    return THEMES.includes(t) ? t : "";
+  } catch {
+    return "";
+  }
+})();
+
+function applyTheme() {
+  if (colourTheme) document.documentElement.dataset.theme = colourTheme;
+  else delete document.documentElement.dataset.theme;
+  const button = document.getElementById("theme-button");
+  if (button) {
+    button.innerHTML = `<span aria-hidden="true">${THEME_MARK[colourTheme]}</span>
+      <span class="sr-only">Colour theme: </span>${THEME_NAME[colourTheme]}`;
+  }
+}
+
+document.getElementById("theme-button").onclick = () => {
+  colourTheme = THEMES[(THEMES.indexOf(colourTheme) + 1) % THEMES.length];
+  try {
+    if (colourTheme) localStorage.setItem(THEME_STORAGE, colourTheme);
+    else localStorage.removeItem(THEME_STORAGE);
+  } catch { /* not remembered; this page still changes */ }
+  applyTheme();
+};
+applyTheme();
+
 function openKeyDialog() {
   document.getElementById("key-input").value = apiKey;
   keyDialog.showModal();

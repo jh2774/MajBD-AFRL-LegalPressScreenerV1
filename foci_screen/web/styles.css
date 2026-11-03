@@ -1,5 +1,10 @@
-/* Always dark: the background is Concord's #1c1c1c, and the Concord logo is
-   white and gold, so it has no light-background version to switch to. */
+/* Concord's colours: its #1c1c1c, and the gold of its logo as the one accent —
+   buttons, links, the chart line, the focus ring. Blue is left to mean "low".
+
+   Dark by default, light where the device asks for it or the reader picks it
+   (the header's theme button, remembered in this browser as data-theme). The
+   header stays dark in both: the Concord logo is white and gold, and has no
+   version for a light background. */
 :root {
   color-scheme: dark;
 
@@ -9,9 +14,12 @@
   --border: #3a3a3a;
   --text: #e8ecf1;
   --muted: #9aa5b1;
-  --accent: #6ba4e8;
-  --accent-soft: #1e2a3a;
-  --link: #ffffff;
+  --accent: #c8a24a;          /* Concord gold */
+  --accent-text: #e3c777;     /* gold for words and links on a dark page */
+  --on-accent: #1c1c1c;       /* text on a gold button: white on gold is unreadable */
+  --accent-soft: #3a3220;
+  --focus: #c8a24a;
+  --link: #e3c777;
 
   --critical: #f2685f;
   --high: #f0913f;
@@ -21,6 +29,55 @@
 
   --radius: 10px;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #f6f4ef;
+    --surface: #ffffff;
+    --surface-2: #efece4;
+    --border: #dcd6c8;
+    --text: #1c1c1c;
+    --muted: #5d636b;
+    /* Concord's gold fills buttons and charts on a light page too; words, links
+       and the focus ring take a deeper gold, which reads against white. */
+    --accent: #c8a24a;
+    --accent-text: #7a5c14;
+    --on-accent: #1c1c1c;
+    --accent-soft: #f3ead3;
+    --focus: #7a5c14;
+    --link: #7a5c14;
+
+    --critical: #c9372c;
+    --high: #c2621a;
+    --medium: #a07c0e;
+    --low: #2f6fbf;
+    --info: #6b7480;
+  }
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f4ef;
+  --surface: #ffffff;
+  --surface-2: #efece4;
+  --border: #dcd6c8;
+  --text: #1c1c1c;
+  --muted: #5d636b;
+  /* Concord's gold fills buttons and charts on a light page too; words, links
+     and the focus ring take a deeper gold, which reads against white. */
+  --accent: #c8a24a;
+  --accent-text: #7a5c14;
+  --on-accent: #1c1c1c;
+  --accent-soft: #f3ead3;
+  --focus: #7a5c14;
+  --link: #7a5c14;
+
+  --critical: #c9372c;
+  --high: #c2621a;
+  --medium: #a07c0e;
+  --low: #2f6fbf;
+  --info: #6b7480;
 }
 
 * { box-sizing: border-box; }
@@ -38,11 +95,27 @@ body {
 }
 
 a { color: var(--link); text-decoration: none; }
+a:focus-visible, button:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
 a:hover { text-decoration: underline; }
 
 /* ------------------------------------------------------------------ topbar */
 
 .topbar {
+  color-scheme: dark;
+  --bg: #1c1c1c;
+  --surface: #252525;
+  --surface-2: #2e2e2e;
+  --border: #3a3a3a;
+  --text: #e8ecf1;
+  --muted: #9aa5b1;
+  --accent: #c8a24a;
+  --accent-text: #e3c777;
+  --focus: #c8a24a;
+  --link: #ffffff;
+  color: var(--text);
   display: flex;
   align-items: center;
   gap: 20px;
@@ -111,7 +184,7 @@ a:hover { text-decoration: underline; }
   font-size: 11px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  color: var(--accent);
+  color: var(--accent-text);
   white-space: nowrap;
 }
 .suggest-detail { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
@@ -123,7 +196,7 @@ a:hover { text-decoration: underline; }
   letter-spacing: 0.05em;
   color: var(--muted);
 }
-.suggest-row mark { background: none; color: var(--accent); font-weight: 650; }
+.suggest-row mark { background: none; color: var(--accent-text); font-weight: 650; }
 .suggest-row.active { outline: 1px solid var(--accent); outline-offset: -1px; }
 
 /* Read by screen readers, not shown. */
@@ -164,7 +237,7 @@ details.everything[open] > summary { margin-bottom: 4px; }
   font-size: 14px;
 }
 .searchbar input:focus {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus);
   outline-offset: -1px;
 }
 
@@ -178,7 +251,7 @@ button {
   padding: 8px 14px;
 }
 button:hover { border-color: var(--accent); }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 button.ghost { background: transparent; }
 button.linkish {
   border: none; background: none; color: var(--link); padding: 6px 4px;
@@ -193,11 +266,15 @@ a.button {
   padding: 8px 14px;
 }
 a.button:hover { border-color: var(--accent); text-decoration: none; }
-a.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+a.button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
 .topnav { display: flex; align-items: center; gap: 14px; }
 /* The signed-in address is the account button's label; a long one is cut
    short, never allowed to push the header wider. The full one is its title. */
+/* In the dark header: the nav and its buttons stay white, gold on hover. */
+.topnav a:hover, .topnav button.linkish:hover { color: var(--accent-text); }
+#theme-button { white-space: nowrap; }
+
 #account-button {
   max-width: 240px;
   overflow: hidden;
@@ -399,13 +476,13 @@ td.num + td, th.num + th { padding-left: 18px; }
   color: var(--muted);
   margin: 2px 4px 2px 0;
 }
-.pill.warn { background: var(--accent-soft); color: var(--accent); border-color: transparent; }
+.pill.warn { background: var(--accent-soft); color: var(--accent-text); border-color: transparent; }
 
 .tabs { display: flex; gap: 4px; margin-bottom: 16px; flex-wrap: wrap; }
 
 /* Paging on a search tab: where you are, then the way back and the way on. */
 .pager { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin: 4px 0 16px; }
-.tabs button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.tabs button.active { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
 
 .empty { color: var(--muted); padding: 28px 0; text-align: center; }
 
@@ -435,7 +512,7 @@ textarea {
   padding: 10px 12px;
   resize: vertical;
 }
-textarea:focus, input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+textarea:focus, input:focus { outline: 2px solid var(--focus); outline-offset: -1px; }
 
 /* Single-line fields and selects outside a dialog: the same look as the
    portfolio's name box, rather than the browser's. */
@@ -560,7 +637,7 @@ tr.rule-off .rule-toggle { opacity: 1; }
   font: inherit;
   resize: vertical;
 }
-.decide-note:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.decide-note:focus { outline: 2px solid var(--focus); outline-offset: -1px; }
 
 /* ------------------------------------------------------------------- diff */
 

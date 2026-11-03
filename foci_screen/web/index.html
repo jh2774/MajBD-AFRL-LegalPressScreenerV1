@@ -4,6 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>FOCI-Screener</title>
+<meta name="color-scheme" content="dark light">
+<script>
+  // The theme picked in this browser, before anything is drawn, so a light
+  // page never flashes dark first (or the reverse).
+  (function () {
+    try {
+      var saved = localStorage.getItem("foci.theme");
+      if (saved === "light" || saved === "dark") document.documentElement.dataset.theme = saved;
+    } catch (e) { /* storage blocked: follow the device */ }
+  })();
+</script>
 <link rel="icon" type="image/png" href="./concord-icon.png">
 <link rel="stylesheet" href="./styles.css">
 </head>
@@ -35,6 +46,8 @@
     <a href="#/watchlists">Watchlists</a>
     <a href="#/screening">Screening</a>
     <a href="#/rules">Rules</a>
+    <button id="theme-button" type="button" class="linkish"
+            title="Colour theme: your device's setting, light, or dark">Theme</button>
     <button id="account-button" type="button" class="linkish">Sign in</button>
     <button id="key-button" type="button" class="linkish">API key</button>
   </nav>
