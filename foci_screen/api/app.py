@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from .. import accounts, consent, fund_managers, portfolio_mail, syscheck
+from .. import accounts, aliases, consent, fund_managers, portfolio_mail, syscheck
 from .. import alerts as alerts_engine
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
@@ -42,7 +42,7 @@ from ..connectors.formd import FormDConnector
 from ..connectors.usaspending import USASpendingConnector
 from ..connectors.vehicles import VehicleConnector, default_phrase, phrase_problem
 from ..jobs import HOLD_SECONDS, JobQueue, _hold_open
-from ..notify import bounces
+from ..notify import bounces, names
 from ..notify import notices as notice_sending
 from ..notify import render as render_notice
 from ..notify.gmail import GmailNotifier
@@ -59,6 +59,7 @@ from .schemas import (
     IdentityDecision,
     InviteRequest,
     ManagerRequest,
+    NameChange,
     NoticeDecision,
     NoticeSend,
     OrganisationRename,
@@ -517,7 +518,8 @@ def _start_session(request: Request, response: Response, user: dict) -> None:
 def _account(user: dict) -> dict:
     """What the page is told about the signed-in account. Never the hash."""
     org = store_for(auth.DEFAULT_TENANT).organisation(user["tenant_id"]) or {}
-    return {"email": user["email"], "workspace": user["tenant_id"],
+    return {"email": user["email"], "name": user.get("name") or "",
+            "workspace": user["tenant_id"],
             "organisation": org.get("name") or user["tenant_id"],
             "role": user.get("role") or "owner",
             "email_verified": bool(user.get("email_verified_at")),
@@ -539,6 +541,8 @@ def _send_account_email(request: Request, to: str, subject: str, text: str,
     the log.
     """
     mailer = Mailer(cfg)
+    text, _ = names.greet(text, None,
+                          names.first_name_for(store_for(auth.DEFAULT_TENANT), to))
     delivery = mailer.send([to], subject, text, redirectable=False)
     if delivery.status != "sent":
         if not mailer.transport:
@@ -634,7 +638,7 @@ def signup(body: Credentials, request: Request, response: Response,
                                  password_hash=accounts.hash_password(body.password),
                                  tenant_id=key_tenant or accounts.new_tenant_id(),
                                  role="owner", organisation=body.organisation,
-                                 self_made=not key_tenant)
+                                 self_made=not key_tenant, name=body.name)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     store.record_login(user["user_id"], True, max_failures=accounts.MAX_FAILURES,
@@ -780,7 +784,7 @@ def join_organisation(body: TokenPassword, request: Request, response: Response)
     user = store.create_user(email=row["email"],
                              password_hash=accounts.hash_password(body.password),
                              tenant_id=row["tenant_id"], role=row.get("role") or "member",
-                             verified=True)
+                             verified=True, name=body.name)
     store.record_login(user["user_id"], True, max_failures=accounts.MAX_FAILURES,
                        lock_minutes=accounts.LOCK_MINUTES)
     _start_session(request, response, user)
@@ -838,6 +842,62 @@ def _signed_in(request: Request) -> dict:
 def me(request: Request) -> dict:
     """The signed-in account: its address, workspace and saved portfolio."""
     return {"account": _account(_signed_in(request))}
+
+
+@app.put("/v1/me/name", tags=["accounts"])
+def set_my_name(body: NameChange, request: Request) -> dict:
+    """What the site's emails call you ("Hello Jordan,"). Empty: no name."""
+    user = _signed_in(request)
+    store = store_for(auth.DEFAULT_TENANT)
+    store.set_user_name(user["user_id"], body.name)
+    return {"account": _account(store.user_by_id(user["user_id"]))}
+
+
+# --------------------------------------------------- what you have been doing
+# The signed-in dashboard: searches, contractors opened and screens started by
+# this account — not everything its workspace has ever screened. Recorded as
+# they happen, seen by the account alone, and cleared by it.
+
+def _remember(request: Request, kind: str, target: str, label: str = "") -> None:
+    user = session_user(request)
+    if user is None:
+        return
+    try:
+        store_for(auth.DEFAULT_TENANT).remember_activity(user["user_id"], kind, target,
+                                                         label)
+    except Exception as exc:          # noqa: BLE001 - never fail the search over it
+        log.warning("could not note %s for the dashboard: %s", kind, exc)
+
+
+@app.get("/v1/me/activity", tags=["accounts"])
+def my_activity(request: Request) -> dict:
+    """What this account has searched for, opened and screened, newest first,
+    with where each contractor and screen stands now."""
+    user = _signed_in(request)
+    site = store_for(auth.DEFAULT_TENANT)
+    store = store_for(user["tenant_id"])
+    companies = []
+    for row in site.activity(user["user_id"], "company", 10):
+        latest = store.latest_severity(row["target"])
+        companies.append({"key": row["target"], "name": row["label"], "at": row["at"],
+                          "severity": latest.get("severity"),
+                          "last_screened": latest.get("created_at")})
+    screens = []
+    for row in site.activity(user["user_id"], "screen", 8):
+        run = store.get_run(row["target"]) or {}
+        screens.append({"run_id": row["target"], "subject": row["label"], "at": row["at"],
+                        "status": run.get("status") or "removed"})
+    return {"searches": [{"query": r["label"], "at": r["at"]}
+                         for r in site.activity(user["user_id"], "search", 12)],
+            "companies": companies, "screens": screens}
+
+
+@app.delete("/v1/me/activity", status_code=204, tags=["accounts"])
+def clear_my_activity(request: Request) -> Response:
+    """Forget this account's searches and what it opened. Nothing screened goes."""
+    user = _signed_in(request)
+    store_for(auth.DEFAULT_TENANT).clear_activity(user["user_id"])
+    return Response(status_code=204)
 
 
 @app.put("/v1/me/portfolio", tags=["accounts"])
@@ -1002,14 +1062,19 @@ def email_portfolio(body: PortfolioEmailRequest, request: Request) -> dict:
     base = _base_url(request)
     mailer = Mailer(cfg)
     outcomes = []
+    site = store_for(auth.DEFAULT_TENANT)
     if who in body.to:
         subject, text, html = portfolio_mail.compose(view, body.key, base, note=body.note)
+        text, html = names.greet(text, html, names.first_name_for(site, who))
         outcomes.append(mailer.send([who], subject, text, html, redirectable=False))
     others = [a for a in body.to if a != who]
     if others:
         subject, text, html = portfolio_mail.compose(view, body.key, base, sent_by=who,
                                                      note=body.note)
-        outcomes.append(mailer.send(others, subject, text, html, reply_to=who))
+        outcomes.append(mailer.send(
+            others, subject, text, html, reply_to=who,
+            personalize=lambda address: (
+                *names.greet(text, html, names.first_name_for(site, address)), {})))
     statuses = {d.status for d in outcomes}
     status = statuses.pop() if len(statuses) == 1 else "partial"
     detail = " ".join(d.detail for d in outcomes if d.detail)
@@ -1160,6 +1225,7 @@ def create_screen(body: ScreenRequest, request: Request,
     subject = body.recipient or body.agency
     run_id = store.start_run(subject, options, status="queued")
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
+    _remember(request, "screen", run_id, subject)
     return {"run_id": run_id, "status": "queued", "backend": queue.backend,
             **_execute_link(run_id)}
 
@@ -1316,7 +1382,7 @@ def _paged(fetch, limit: int, offset: int) -> tuple[list[dict], bool]:
 
 
 @app.get("/v1/entities/{entity_key}", tags=["findings"])
-def get_entity(entity_key: str,
+def get_entity(entity_key: str, request: Request,
                offset: int = Query(0, ge=0, le=1_000_000),
                limit: int = Query(PAGE_ROWS, ge=1, le=500),
                store: Store = Depends(tenant_store)) -> dict:
@@ -1342,6 +1408,8 @@ def get_entity(entity_key: str,
         entity = {"name": contracts[0]["entity_name"], "uei": contracts[0]["recipient_uei"]}
     else:
         entity = {"name": store.departed_entity_name(key, departed) or key, "uei": key}
+    if offset == 0:
+        _remember(request, "company", key, entity.get("name") or key)
     return {
         "entity_key": key,
         "entity": entity,
@@ -2423,6 +2491,11 @@ def _remote_suggestions(q: str) -> list[str]:
     return names
 
 
+def _awards(n) -> str:
+    n = int(n or 0)
+    return f"{n} award{'' if n == 1 else 's'}"
+
+
 @app.get("/v1/suggest", tags=["search"])
 def suggest(q: str = Query("", max_length=120),
             store: Store = Depends(tenant_store)) -> dict:
@@ -2442,10 +2515,21 @@ def suggest(q: str = Query("", max_length=120),
         return {"query": q, "local": [], "remote": [], "remote_checked": False}
 
     local: list[dict] = []
-    for row in store.search_entities(q, limit=5):
+    for row in store.search_entities(q, limit=6):
         local.append({"kind": "entity", "label": row["entity_name"],
                       "key": row["entity_key"], "severity": row.get("severity"),
-                      "detail": f"{row.get('contract_count') or 0} award(s)"})
+                      "detail": _awards(row.get("contract_count"))})
+    if len(local) < 6:
+        # A name typed with a slip — "lockhed", "raythoen" — finds nothing
+        # word for word. The nearest screened names are offered instead, and
+        # say that they are a guess.
+        seen = {item["key"] for item in local}
+        named = {r["entity_key"]: r for r in store.entity_names()}
+        for key, name, _score in aliases.close_matches(
+                q, [(k, r["entity_name"]) for k, r in named.items() if k not in seen],
+                limit=6 - len(local)):
+            local.append({"kind": "entity", "label": name, "key": key, "close": True,
+                          "detail": "close match · " + _awards(named[key]["contract_count"])})
     for row in store.search_officers(q, limit=3):
         local.append({"kind": "officer", "label": row.get("ko_name") or row["ko_email"],
                       "key": row["ko_email"], "detail": row.get("agency") or ""})
@@ -2457,7 +2541,7 @@ def suggest(q: str = Query("", max_length=120),
     known = {(item["label"] or "").upper() for item in local}
     remote = [{"kind": "unscreened", "label": name, "key": name,
                "detail": "not screened here yet"}
-              for name in _remote_suggestions(q)
+              for name in _remote_suggestions(q.strip(".,;: "))
               if name.upper() not in known]
 
     return {"query": q, "local": local, "remote": remote[:6],
@@ -2471,7 +2555,7 @@ SEARCH_KINDS = {"entity": "entities", "contract": "contracts",
 
 
 @app.get("/v1/search", tags=["search"])
-def search(q: str = Query("", max_length=200),
+def search(request: Request, q: str = Query("", max_length=200),
            kind: str = Query("all", pattern="^(all|entity|contract|officer|agency)$"),
            limit: int = Query(10, ge=1, le=100),
            offset: int = Query(0, ge=0, le=100_000),
@@ -2488,6 +2572,8 @@ def search(q: str = Query("", max_length=200),
     asked for one row beyond `limit`, and that row is how `more` is known.
     """
     q = q.strip()
+    if q and offset == 0:
+        _remember(request, "search", q.lower(), q)
     searches = {
         "entities": store.search_entities,
         "contracts": store.search_contracts,

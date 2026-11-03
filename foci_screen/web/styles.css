@@ -116,6 +116,39 @@ a:hover { text-decoration: underline; }
 }
 .suggest-detail { font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 .suggest-foot { padding: 6px 10px; font-size: 11.5px; border-top: 1px solid var(--border); }
+.suggest-group {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+.suggest-row mark { background: none; color: var(--accent); font-weight: 650; }
+.suggest-row.active { outline: 1px solid var(--accent); outline-offset: -1px; }
+
+/* Read by screen readers, not shown. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+/* Recent searches on the dashboard. */
+.chips { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; padding: 0; margin: 0; }
+.chip {
+  display: inline-block; padding: 5px 12px; border: 1px solid var(--border);
+  border-radius: 20px; background: var(--surface-2); font-size: 13px;
+}
+.chip:hover { border-color: var(--accent); text-decoration: none; }
+
+/* Everything screened, folded away on the dashboard. */
+details.everything {
+  margin: 16px 0;
+  padding: 12px 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+}
+details.everything > summary { cursor: pointer; font-weight: 600; }
+details.everything[open] > summary { margin-bottom: 4px; }
 
 @media (max-width: 720px) {
   .suggest { right: 0; }
@@ -150,6 +183,17 @@ button.ghost { background: transparent; }
 button.linkish {
   border: none; background: none; color: var(--link); padding: 6px 4px;
 }
+/* A link that does what a button looks like it does: go to a page. */
+a.button {
+  display: inline-block;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text);
+  padding: 8px 14px;
+}
+a.button:hover { border-color: var(--accent); text-decoration: none; }
+a.button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 .topnav { display: flex; align-items: center; gap: 14px; }
 /* The signed-in address is the account button's label; a long one is cut

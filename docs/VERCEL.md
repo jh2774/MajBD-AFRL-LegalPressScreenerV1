@@ -251,6 +251,15 @@ invitation, and the form asks for the admin key to make the site's owner); a lis
 
 **What an account gives you**
 
+* **A dashboard of your own work.** Signed in, the Overview is what you have searched for,
+  the contractors you opened and the screens you started, with your open portfolio — not
+  everything ever screened, which is folded away under **Show everything screened**. Only
+  you see the list, and **Clear it** forgets it. Signed out, the Overview explains the site
+  and how to begin. The search box offers your recent searches when you click into it.
+* **Emails greet you by name.** "Your name" (when you sign up, or in the account box) makes
+  the site's emails open "Hello Jordan,". Without one, the name comes from an address like
+  jordan.smith@…, or the email opens "Hello,". First names, not Mr or Ms: a title would have
+  to be guessed. Notices to contracting officers keep "Dear Jordan Smith,".
 * **Your portfolios follow you.** They are kept on the account and open on any computer you
   sign in from. Keep as many as you like — one per client, say: **Your portfolios** on the
   Portfolio page lists them, and **Open**s, **Remove**s or **Start another**. A portfolio

@@ -42,7 +42,7 @@ from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
 from .connectors.formd import FormDConnector, FormDUnavailable, IssuerSnapshot
 from .connectors.vehicles import VehicleConnector
-from .notify import bounces
+from .notify import bounces, names
 from .notify.mailer import Mailer
 
 log = logging.getLogger("foci.alerts")
@@ -76,14 +76,14 @@ def personalizer(store, subscription: dict, base_url: str, build):
     `build(url)` returns (text, html) with that unsubscribe link in the footer.
     Only addresses on the list get a link: a redirected pilot copy goes to
     someone who is not on it, and a link minted for them would unsubscribe
-    nobody.
+    nobody. Each opens with a greeting by name (`names`).
     """
     on_list = {e.lower() for e in subscription["emails"]}
 
     def content(address: str):
         url = (unsubscribe_url(store, subscription["subscription_id"], address, base_url)
                if address.lower() in on_list else "")
-        text, html = build(url)
+        text, html = names.greet(*build(url), names.first_name_for(store, address))
         headers = {"List-Unsubscribe": f"<{url}>",
                    "List-Unsubscribe-Post": "List-Unsubscribe=One-Click"} if url else {}
         return text, html, headers

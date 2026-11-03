@@ -24,6 +24,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
+from .notify import names
+
 log = logging.getLogger("foci.consent")
 
 PENDING, CONFIRMED, UNSUBSCRIBED = "pending", "confirmed", "unsubscribed"
@@ -137,6 +139,7 @@ def ask(store, mailer, subscription: dict, row: dict, base_url: str) -> tuple[st
         return "held", ""
     subject, text, html = request_email(subscription["name"],
                                         confirm_url(base_url, row["token"]), base_url)
+    text, html = names.greet(text, html, names.first_name_for(store, row["email"]))
     delivery = mailer.send([row["email"]], subject, text, html)
     if delivery.status in ("sent", "partial"):
         store.mark_alert_recipient_asked(subscription["subscription_id"], row["email"])

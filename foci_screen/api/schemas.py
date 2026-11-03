@@ -259,6 +259,8 @@ class Credentials(BaseModel):
     # Signing up only: what to call the new organisation. Defaults to the
     # address's domain.
     organisation: str = Field("", max_length=120)
+    # Signing up only, and optional: what the site's emails call them.
+    name: str = Field("", max_length=120)
 
 
 class PasswordChange(BaseModel):
@@ -279,6 +281,12 @@ class TokenPassword(BaseModel):
     """A link's token, and the password chosen on the page it opened."""
     token: str = Field(..., min_length=10, max_length=200)
     password: str = Field(..., max_length=1024)
+    # Joining by invitation only, and optional: what the site's emails call them.
+    name: str = Field("", max_length=120)
+
+
+class NameChange(BaseModel):
+    name: str = Field("", max_length=120)
 
 
 class InviteRequest(BaseModel):

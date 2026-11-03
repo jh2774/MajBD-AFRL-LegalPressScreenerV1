@@ -18,9 +18,13 @@
   <form class="searchbar" id="search-form" role="search">
     <input id="search-input" type="search" autocomplete="off" spellcheck="false"
            placeholder="Search contractors, awards, contracting officers, agencies…"
-           aria-label="Search" role="combobox" aria-expanded="false"
-           aria-controls="suggest-box">
-    <div id="suggest-box" class="suggest" role="listbox" hidden></div>
+           aria-label="Search contractors, awards, contracting officers and agencies"
+           role="combobox" aria-expanded="false" aria-autocomplete="list"
+           aria-controls="suggest-box" aria-describedby="search-help">
+    <div id="suggest-box" class="suggest" role="listbox" aria-label="Suggestions" hidden></div>
+    <span id="search-help" class="sr-only">Suggestions appear as you type. Use the up and
+      down arrow keys to move through them, Enter to open one, and Escape to close them.</span>
+    <div id="suggest-status" class="sr-only" role="status" aria-live="polite"></div>
     <button type="submit">Search</button>
   </form>
 
@@ -63,6 +67,11 @@
       portfolio, screens, notices, watchlists, screening settings and alert lists.</p>
     <label class="field" for="account-email">Email address</label>
     <input id="account-email" type="email" autocomplete="username" required>
+    <div id="account-name-row" hidden>
+      <label class="field" for="account-name" style="margin-top:10px;display:block">Your name
+        <span class="muted">(optional — emails from the site will greet you by it)</span></label>
+      <input id="account-name" type="text" autocomplete="name">
+    </div>
     <div id="account-org-row" hidden>
       <label class="field" for="account-org" style="margin-top:10px;display:block">Organisation</label>
       <input id="account-org" type="text" autocomplete="organization"
@@ -100,6 +109,13 @@
       reset by email.<span id="account-unverified-more"></span>
       <button type="button" class="linkish" id="account-resend">Send the
       link again</button> <span id="account-resend-status"></span></div>
+    <label class="field" for="account-name-edit" style="display:block;margin-top:8px">Your
+      name <span class="muted">— emails from the site greet you by it</span></label>
+    <div style="display:flex;gap:8px;align-items:center;margin-top:4px">
+      <input id="account-name-edit" type="text" autocomplete="name" style="flex:1">
+      <button type="button" id="account-name-save">Save</button>
+    </div>
+    <div class="muted" id="account-name-status" role="status" style="font-size:12.5px"></div>
     <p style="font-size:13.5px"><a href="#/organisation" id="account-org-link">Organisation
       and people →</a></p>
     <p class="muted" style="font-size:13px">Your portfolios are saved to this account, so

@@ -150,3 +150,73 @@ def tokens(query: str) -> list[str]:
     # part of the name and stays, which is what keeps "space_systems" one
     # token rather than two that also match "spacexsystems".
     return [t for t in (w.strip(_EDGE_PUNCTUATION) for w in text.split(" ")) if t]
+
+
+# ------------------------------------------------------------- company names
+# The legal-form word on the end of a company's name is written every way there
+# is — Corp, Corp., Corporation, L.L.C., LLC — and an award records one of them.
+# A search that demands the one typed misses "Acme Corporation" when the record
+# says ACME CORP. When other words were typed, these are left out of the match.
+CORPORATE_SUFFIXES = frozenset("""
+    co company companies corp corporation inc incorporated llc l.l.c lp l.p llp
+    l.l.p ltd limited plc pllc the
+""".split())
+
+
+def company_tokens(query: str) -> list[str]:
+    """`tokens`, less legal-form words — unless nothing else was typed."""
+    words = tokens(query)
+    kept = [w for w in words if w not in CORPORATE_SUFFIXES]
+    return kept or words
+
+
+def company_query(query: str) -> str:
+    return " ".join(company_tokens(query))
+
+
+def _name_words(name: str) -> list[str]:
+    return [w for w in tokens(name.replace("-", " ").replace("&", " "))
+            if w not in CORPORATE_SUFFIXES]
+
+
+def close_matches(query: str, names: list[tuple[str, str]], limit: int = 5,
+                  cutoff: float = 0.78) -> list[tuple[str, str, float]]:
+    """Names that are what was typed, give or take a typo: "lockhed martn"
+    finds LOCKHEED MARTIN CORP. `names` is (key, name); returns
+    (key, name, score), best first.
+
+    Word by word, so order does not matter, and any word may be the start of
+    one — still being typed, or shortened, as "gen dyn". Words under three
+    letters must match the start of a word exactly: a one-letter difference in
+    a two-letter word is a different word.
+    """
+    from difflib import SequenceMatcher
+
+    wanted = company_tokens(query)
+    if not wanted or sum(len(w) for w in wanted) < 3:
+        return []
+    found: list[tuple[str, str, float]] = []
+    for key, name in names:
+        words = _name_words(name or "")
+        if not words:
+            continue
+        total = 0.0
+        for typed in wanted:
+            best = 0.0
+            for word in words:
+                if word.startswith(typed):
+                    best = 1.0
+                    break
+                if len(typed) < 3:
+                    continue
+                # Against the whole word, and against its start one letter
+                # longer than what was typed, which allows a dropped letter.
+                best = max(best, SequenceMatcher(None, typed, word).ratio(),
+                           SequenceMatcher(None, typed, word[:len(typed) + 1]).ratio())
+            if best < cutoff:
+                break
+            total += best
+        else:
+            found.append((key, name, total / len(wanted)))
+    found.sort(key=lambda f: -f[2])
+    return found[:limit]

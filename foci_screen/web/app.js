@@ -131,6 +131,7 @@ function setAccountMode(mode) {
     creating ? "Create account" : forgot ? "Email me a link" : "Sign in";
   document.getElementById("account-hint").hidden = !creating;
   document.getElementById("account-org-row").hidden = !creating;
+  document.getElementById("account-name-row").hidden = !creating;
   document.getElementById("account-password-row").hidden = forgot;
   document.getElementById("account-forgot-row").hidden = mode !== "signin";
   document.getElementById("account-note").hidden = true;
@@ -189,6 +190,8 @@ function openAccountDialog() {
     document.getElementById("account-who").textContent = account.email;
     document.getElementById("account-org-name").textContent = account.organisation;
     document.getElementById("account-role").textContent = `(${account.role})`;
+    document.getElementById("account-name-edit").value = account.name || "";
+    document.getElementById("account-name-status").textContent = "";
     document.getElementById("account-unverified").hidden = account.email_verified;
     document.getElementById("account-unverified-more").textContent = account.vouched ? ""
       : " Nor can a portfolio, a notice or an invitation be emailed from this account.";
@@ -225,6 +228,17 @@ function wireAccountDialog() {
     setAccountMode(accountMode === "signin" ? "signup" : "signin");
   document.getElementById("account-forgot").onclick = () => setAccountMode("forgot");
   document.getElementById("account-org-link").onclick = () => dialog.close();
+  document.getElementById("account-name-save").onclick = async () => {
+    const status = document.getElementById("account-name-status");
+    try {
+      const r = await apiSend("PUT", "/v1/me/name",
+                              { name: document.getElementById("account-name-edit").value });
+      account = r.account;
+      status.textContent = account.name ? "Saved." : "Saved — emails will say “Hello,”.";
+    } catch (err) {
+      status.textContent = err.message || String(err);
+    }
+  };
   document.getElementById("account-resend").onclick = async () => {
     const status = document.getElementById("account-resend-status");
     try {
@@ -265,7 +279,8 @@ function wireAccountDialog() {
         email,
         password: password.value,
         ...(accountMode === "signup"
-          ? { organisation: document.getElementById("account-org").value.trim() } : {}),
+          ? { organisation: document.getElementById("account-org").value.trim(),
+              name: document.getElementById("account-name").value.trim() } : {}),
       }, accountMode !== "signup" ? ""
         : document.getElementById("account-key-row").hidden ? apiKey
           : document.getElementById("account-key").value.trim());
@@ -383,6 +398,9 @@ async function viewJoin(token) {
       <p class="muted">You will share ${esc(invite.organisation)}'s workspace: its
       portfolio, screens, notices, watchlists and settings. Choose a password to sign in
       with.</p>
+      <label class="field" for="join-name">Your name (optional)</label>
+      <input id="join-name" type="text" autocomplete="name" class="text-input"
+             style="width:100%;max-width:360px;display:block;margin:6px 0 12px">
       ${passwordForm("join-password", "Password")}
       <div id="join-error" class="error" hidden></div>
       <div class="actions"><button class="primary" id="join-go">Join and sign in</button></div>
@@ -394,7 +412,8 @@ async function viewJoin(token) {
     box.hidden = true;
     try {
       await postAccount("/v1/auth/join", {
-        token, password: document.getElementById("join-password").value });
+        token, password: document.getElementById("join-password").value,
+        name: document.getElementById("join-name").value.trim() });
       await refreshAccount();
       location.hash = "#/";
     } catch (err) {
@@ -1014,14 +1033,20 @@ function firstRunPanel() {
     </div>`}`;
 }
 
-/* With a portfolio saved, the overview is that portfolio. Without one it shows
- * everything in the database. */
+/* The first page.
+ *
+ * Signed in, it is yours: what you have searched for, the contractors you opened,
+ * the screens you started, and your open portfolio. Everything screened in the
+ * workspace is a click away rather than the default — on a site anyone can use,
+ * most of it is somebody else's work, and the page you land on should be about
+ * yours. Signed out on such a site, it says what the site does and how to begin.
+ * A site that needs a key for everything shows the whole workspace, as before:
+ * every visitor holds a key to it, and it is theirs. */
 async function viewOverview() {
+  if (account) return viewMyDashboard();
+  if (authStatus && authStatus.public) return viewWelcome();
   const portfolioKey = savedPortfolioKey();
-  if (portfolioKey) {
-    // The portfolio *is* the dashboard now.
-    return viewPortfolio();
-  }
+  if (portfolioKey) return viewPortfolio();
 
   setBusy("Loading overview…");
   const d = await api("/v1/overview");
@@ -1038,15 +1063,8 @@ async function viewOverview() {
   renderFullDatabase(d);
 }
 
-function renderFullDatabase(d) {
-  const t = d.totals;
-
-  view.innerHTML = `
-    <div class="page-head">
-      <h1>Overview</h1>
-      <div class="sub">What has been screened, and what changed.</div>
-    </div>
-
+function aboutCard() {
+  return `
     <div class="card about">
       <h2>What FOCI-Screener does</h2>
       <p class="muted">FOCI-Screener watches the companies that hold federal
@@ -1077,6 +1095,12 @@ function renderFullDatabase(d) {
       drawn from public records, not a FOCI determination.</p>
     </div>
 
+`;
+}
+
+function databaseHtml(d) {
+  const t = d.totals;
+  return `
     <div class="grid cols-4">
       ${statCard("Obligated", money(t.obligated))}
       ${statCard("Awards", num(t.contracts))}
@@ -1136,8 +1160,200 @@ function renderFullDatabase(d) {
         }))
       )}
     </div>`;
+}
 
+function renderFullDatabase(d) {
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Overview</h1>
+      <div class="sub">What has been screened, and what changed.</div>
+    </div>
+    ${aboutCard()}
+    ${databaseHtml(d)}`;
   loadRecentRuns();
+}
+
+/* Everything screened, folded away until asked for, and only then fetched. */
+function everythingSection(where) {
+  return `<details class="everything" id="everything">
+      <summary>Show everything screened ${esc(where)}</summary>
+      <p class="muted" style="font-size:12.5px;margin:8px 0 0">Not only your own searches
+        and screens: every contractor and finding recorded ${esc(where)}.</p>
+      <div id="everything-body" class="muted" style="margin-top:10px">Loading…</div>
+    </details>`;
+}
+
+function wireEverything() {
+  const box = document.getElementById("everything");
+  if (!box) return;
+  box.addEventListener("toggle", async () => {
+    if (!box.open || box.dataset.loaded) return;
+    box.dataset.loaded = "1";
+    const body = document.getElementById("everything-body");
+    try {
+      const d = await api("/v1/overview");
+      const t = d.totals;
+      if (!t.contracts && !t.entities && !t.notices_pending) {
+        body.textContent = "Nothing has been screened here yet.";
+        return;
+      }
+      body.classList.remove("muted");
+      body.innerHTML = databaseHtml(d);
+      loadRecentRuns();
+    } catch (e) {
+      body.textContent = e.message || String(e);
+    }
+  });
+}
+
+function startCard(title) {
+  return `<div class="card">
+      <h2>${esc(title)}</h2>
+      <ul class="muted">
+        <li><strong>One contractor:</strong> type its name in the search box at the top.
+        Suggestions appear as you type; if it has not been screened, the results offer
+        to screen it now.</li>
+        <li><strong>A whole agency, on a schedule:</strong> add it on the
+        <a href="#/watchlists">Watchlists</a> page.</li>
+        <li><strong>Companies you already follow:</strong> build a
+        <a href="#/portfolio">portfolio</a>, and have changes emailed to you.</li>
+      </ul>
+      <p class="muted">A screen takes minutes, not seconds. The first one is a
+      <strong>baseline</strong>: it records what each document looks like now. From the
+      second on, findings are about what changed.</p>
+    </div>`;
+}
+
+async function viewMyDashboard() {
+  setBusy("Loading your dashboard…");
+  const [act, mine] = await Promise.all([
+    api("/v1/me/activity").catch(() => null), myPortfolios()]);
+  const first = (account.name || "").trim().split(/\s+/)[0];
+  const open = mine && mine.portfolios.find((p) => p.portfolio_id === mine.open);
+  const others = mine ? mine.portfolios.length - (open ? 1 : 0) : 0;
+  const nothing = !act || (!act.searches.length && !act.companies.length
+                           && !act.screens.length);
+  const where = account.workspace === "default" ? "on this site" : "in your workspace";
+
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${first ? `Hello, ${esc(first)}` : "Your dashboard"}</h1>
+      <div class="sub">What you have searched for, opened and screened.</div>
+    </div>
+
+    ${open ? `<div class="card">
+      <h2>Your portfolio: ${esc(open.name)}</h2>
+      <p class="muted">${open.companies === null ? "" : `${num(open.companies)} compan${
+        open.companies === 1 ? "y" : "ies"}. `}${others ? `${num(others)} more saved to your
+        account.` : ""}</p>
+      <div class="actions"><a class="button primary" href="#/portfolio">Open the portfolio</a></div>
+    </div>` : mine && mine.portfolios.length ? `<div class="card">
+      <h2>Your portfolios</h2>
+      <p class="muted">${num(mine.portfolios.length)} saved to your account; none is open.</p>
+      <div class="actions"><a class="button" href="#/portfolio">Choose one</a></div>
+    </div>` : ""}
+
+    ${nothing ? startCard("Start here") : ""}
+
+    ${act && act.searches.length ? `<div class="card">
+      <h2>Your recent searches</h2>
+      <ul class="chips" aria-label="Your recent searches">${act.searches.map((s) => `
+        <li><a class="chip" href="#/search/${encodeURIComponent(s.query)}">${esc(s.query)}</a></li>`
+      ).join("")}</ul>
+    </div>` : ""}
+
+    ${act && act.companies.length ? `<div class="card">
+      <h2>Contractors you opened</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Contractor</th><th>Latest severity</th><th>You opened it</th></tr></thead>
+        <tbody>${act.companies.map((c) => `<tr>
+          <td>${linkEntity(c.key, c.name)}</td>
+          <td>${c.severity ? sevTag(c.severity) : '<span class="muted">nothing found yet</span>'}</td>
+          <td>${day(c.at)}</td></tr>`).join("")}</tbody>
+      </table></div>
+    </div>` : ""}
+
+    ${act && act.screens.length ? `<div class="card">
+      <h2>Screens you started</h2>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Screen</th><th>Status</th><th>Started</th></tr></thead>
+        <tbody>${act.screens.map((r) => `<tr>
+          <td>${r.status === "removed" ? esc(r.subject)
+            : `<a href="#/screens/${encodeURIComponent(r.run_id)}">${esc(r.subject || r.run_id)}</a>`}</td>
+          <td>${esc(r.status)}</td><td>${day(r.at)}</td></tr>`).join("")}</tbody>
+      </table></div>
+    </div>` : ""}
+
+    ${nothing ? "" : `<p class="muted" style="font-size:12.5px">Only you see this list.
+      <button type="button" class="linkish" id="activity-clear">Clear it</button></p>`}
+
+    ${everythingSection(where)}`;
+
+  wireEverything();
+  const clear = document.getElementById("activity-clear");
+  if (clear) {
+    clear.onclick = async () => {
+      if (!confirm("Clear your recent searches, and the lists of contractors you opened "
+                   + "and screens you started? Nothing screened is removed.")) return;
+      await apiSend("DELETE", "/v1/me/activity");
+      recentCache = null;
+      viewMyDashboard();
+    };
+  }
+}
+
+/* Signed out, on a site anyone can use. */
+function viewWelcome() {
+  const browserPortfolio = savedPortfolioKey();
+  const closed = authStatus && authStatus.signup === "closed";
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Welcome to FOCI-Screener</h1>
+      <div class="sub">Screening the companies that hold federal contracts for foreign
+        ownership, control or influence.</div>
+    </div>
+
+    <div class="card">
+      <h2>Start with a company</h2>
+      <p class="muted">Type a company's name in the search box at the top of the page.
+      Suggestions appear as you type: companies already screened here first, then any
+      company that holds federal contracts. Choose one to see what has been found, or to
+      screen it.</p>
+      <div class="actions"><button type="button" class="primary" id="welcome-search">Go to
+        the search box</button></div>
+    </div>
+
+    <div class="card">
+      <h2>Keep track of your work</h2>
+      <p class="muted">${closed ? "With an account" : "With a free account"}, this page shows
+      what you have searched for, the contractors you opened and the screens you started,
+      and your portfolios, watchlists and email alerts are kept in a workspace of your own.</p>
+      <div class="actions">
+        ${closed ? "" : '<button type="button" class="primary" id="welcome-signup">Create an account</button>'}
+        <button type="button" id="welcome-signin">Sign in</button>
+      </div>
+    </div>
+
+    ${browserPortfolio ? `<div class="card">
+      <h2>Your portfolio in this browser</h2>
+      <p class="muted">Saved in this browser only. Sign in and it is kept on your account.</p>
+      <div class="actions"><a class="button" href="#/portfolio">Open it</a></div>
+    </div>` : ""}
+
+    ${aboutCard()}
+
+    ${everythingSection("on this site")}`;
+
+  document.getElementById("welcome-search").onclick = () => searchInput.focus();
+  document.getElementById("welcome-signin").onclick = () => openAccountDialog();
+  const signup = document.getElementById("welcome-signup");
+  if (signup) {
+    signup.onclick = () => {
+      openAccountDialog();
+      setAccountMode("signup");
+    };
+  }
+  wireEverything();
 }
 
 /* Loaded after the page so a slow history call cannot hold up the dashboard. */
@@ -4665,14 +4881,28 @@ async function refreshBadge() {
  * what a type-ahead wants, so it is debounced, capped, cached per prefix on
  * the server, and allowed to come back empty. The box never waits on it. */
 const SUGGEST_DEBOUNCE_MS = 220;
+const RECENT_MAX_AGE_MS = 30000;
 
 let suggestTimer = null;
+let blurTimer = null;
 let suggestSeq = 0;
 let suggestItems = [];
 let suggestActive = -1;
+let recentCache = null;          // { at, items } — this account's recent searches
+let recentAt = 0;
 
 const searchInput = document.getElementById("search-input");
 const suggestBox = document.getElementById("suggest-box");
+const suggestStatus = document.getElementById("suggest-status");
+
+/* Said aloud by a screen reader, without moving focus: how many suggestions
+ * there are, or that there are none. */
+function announce(text) {
+  if (!suggestStatus) return;
+  suggestStatus.textContent = "";
+  // A change after a tick, so the same message twice is still read.
+  setTimeout(() => { suggestStatus.textContent = text; }, 30);
+}
 
 function hideSuggestions() {
   suggestItems = [];
@@ -4681,31 +4911,98 @@ function hideSuggestions() {
     suggestBox.hidden = true;
     suggestBox.innerHTML = "";
   }
+  if (searchInput) {
+    searchInput.setAttribute("aria-expanded", "false");
+    searchInput.removeAttribute("aria-activedescendant");
+  }
 }
 
-function renderSuggestions(items, query) {
+/* The typed words marked in a suggestion, so the eye finds why it matched. */
+function markMatches(label, query) {
+  const text = label || "";
+  const lower = text.toLowerCase();
+  const ranges = [];
+  for (const word of (query || "").toLowerCase().split(/[\s,;]+/).filter((w) => w.length > 1)) {
+    let at = lower.indexOf(word);
+    while (at >= 0) {
+      ranges.push([at, at + word.length]);
+      at = lower.indexOf(word, at + word.length);
+    }
+  }
+  if (!ranges.length) return esc(text);
+  ranges.sort((a, b) => a[0] - b[0]);
+  const merged = [ranges[0]];
+  for (const r of ranges.slice(1)) {
+    const last = merged[merged.length - 1];
+    if (r[0] <= last[1]) last[1] = Math.max(last[1], r[1]);
+    else merged.push(r);
+  }
+  let out = "";
+  let pos = 0;
+  for (const [a, b] of merged) {
+    out += esc(text.slice(pos, a)) + `<mark>${esc(text.slice(a, b))}</mark>`;
+    pos = b;
+  }
+  return out + esc(text.slice(pos));
+}
+
+const SUGGEST_KIND = { entity: "contractor", officer: "contracting officer", agency: "agency",
+                       unscreened: "not screened yet", recent: "recent search" };
+const SUGGEST_GROUPS = [
+  ["recent", "You searched for and opened lately"],
+  ["local", "Screened here"],
+  ["remote", "Not screened here yet — choose one to screen it"],
+];
+
+/* `groups` maps a group name above to its items. The list is an ARIA listbox
+ * the search box points at: arrow keys move through it while focus stays in
+ * the box, and the highlighted option is the box's active descendant, so a
+ * screen reader reads each one as it is reached. */
+function renderSuggestions(groups, query) {
+  const items = [];
+  let html = "";
+  for (const [name, title] of SUGGEST_GROUPS) {
+    const list = groups[name] || [];
+    if (!list.length) continue;
+    html += `<div role="group" aria-labelledby="suggest-h-${name}">
+      <div class="suggest-group" id="suggest-h-${name}" role="presentation">${esc(title)}</div>`;
+    for (const item of list) {
+      const i = items.length;
+      items.push(item);
+      const kind = SUGGEST_KIND[item.kind] || item.kind;
+      const spoken = [item.label, kind, item.detail].filter(Boolean).join(", ");
+      html += `<div class="suggest-row" id="suggest-opt-${i}" role="option"
+          aria-selected="false" data-i="${i}" aria-label="${esc(spoken)}">
+        <span class="suggest-label">${item.kind === "recent" ? esc(item.label)
+          : markMatches(item.label, query)}</span>
+        <span class="suggest-kind">${esc(kind)}</span>
+        ${item.detail ? `<span class="suggest-detail">${esc(item.detail)}</span>` : ""}
+      </div>`;
+    }
+    html += "</div>";
+  }
   suggestItems = items;
   suggestActive = -1;
   if (!items.length) {
     hideSuggestions();
+    if (query) announce("No suggestions. Press Enter to search.");
     return;
   }
-  const icon = { entity: "contractor", officer: "officer", agency: "agency",
-                 unscreened: "screen this" };
-  suggestBox.innerHTML = items.map((item, i) => `
-    <div class="suggest-row" data-i="${i}" role="option">
-      <span class="suggest-label">${esc(item.label)}</span>
-      <span class="suggest-kind">${esc(icon[item.kind] || item.kind)}</span>
-      <span class="suggest-detail">${esc(item.detail || "")}</span>
-    </div>`).join("") +
-    `<div class="suggest-foot muted">Enter to search “${esc(query)}”</div>`;
+  suggestBox.innerHTML = html + (query
+    ? `<div class="suggest-foot muted" aria-hidden="true">Enter searches for “${esc(query)}”</div>`
+    : "");
   suggestBox.hidden = false;
+  searchInput.setAttribute("aria-expanded", "true");
+  searchInput.removeAttribute("aria-activedescendant");
+  announce(`${items.length} suggestion${items.length === 1 ? "" : "s"}. `
+           + "Use the up and down arrows to choose.");
 
   suggestBox.querySelectorAll(".suggest-row").forEach((row) => {
-    row.onmousedown = (e) => {      // mousedown: blur would close it first
-      e.preventDefault();
-      chooseSuggestion(Number(row.dataset.i));
-    };
+    const i = Number(row.dataset.i);
+    // Mousedown would take focus from the box and close the list first.
+    row.onmousedown = (e) => e.preventDefault();
+    row.onclick = () => chooseSuggestion(i);
+    row.onmousemove = () => { if (suggestActive !== i) highlightSuggestion(i); };
   });
 }
 
@@ -4713,7 +5010,13 @@ function highlightSuggestion(next) {
   const rows = suggestBox.querySelectorAll(".suggest-row");
   if (!rows.length) return;
   suggestActive = (next + rows.length) % rows.length;
-  rows.forEach((r, i) => r.classList.toggle("active", i === suggestActive));
+  rows.forEach((r, i) => {
+    const on = i === suggestActive;
+    r.classList.toggle("active", on);
+    r.setAttribute("aria-selected", on ? "true" : "false");
+    if (on) r.scrollIntoView({ block: "nearest" });
+  });
+  searchInput.setAttribute("aria-activedescendant", `suggest-opt-${suggestActive}`);
 }
 
 function chooseSuggestion(index) {
@@ -4724,9 +5027,33 @@ function chooseSuggestion(index) {
   if (item.kind === "entity") location.hash = `#/entity/${encodeURIComponent(item.key)}`;
   else if (item.kind === "officer") location.hash = `#/officer/${encodeURIComponent(item.key)}`;
   else if (item.kind === "agency") location.hash = `#/agency/${encodeURIComponent(item.key)}`;
-  // An unscreened contractor goes to the search page, which is where the
-  // offer to screen it lives. Still a choice, not a screen.
+  // A recent search runs again; an unscreened contractor goes to the search
+  // page, which is where the offer to screen it lives. Still a choice, not a
+  // screen.
   else location.hash = `#/search/${encodeURIComponent(item.key)}`;
+}
+
+/* Signed in, an empty box offers what this account searched for and opened
+ * lately: most searches are a return to something. */
+async function showRecent() {
+  if (!account) return;
+  const seq = ++suggestSeq;
+  if (!recentCache || Date.now() - recentAt > RECENT_MAX_AGE_MS) {
+    try {
+      const d = await api("/v1/me/activity");
+      recentCache = [
+        ...d.searches.slice(0, 5).map((s) => ({ kind: "recent", label: s.query, key: s.query })),
+        ...d.companies.slice(0, 3).map((c) => ({ kind: "entity", label: c.name, key: c.key,
+                                                 detail: "you opened this" })),
+      ];
+      recentAt = Date.now();
+    } catch {
+      return;
+    }
+  }
+  if (seq !== suggestSeq || searchInput.value.trim().length >= 2
+      || document.activeElement !== searchInput) return;
+  renderSuggestions({ recent: recentCache }, "");
 }
 
 async function fetchSuggestions(q) {
@@ -4735,7 +5062,7 @@ async function fetchSuggestions(q) {
     const d = await api(`/v1/suggest?q=${encodeURIComponent(q)}`);
     // A slower earlier request must not overwrite a newer answer.
     if (seq !== suggestSeq) return;
-    renderSuggestions([...(d.local || []), ...(d.remote || [])], q);
+    renderSuggestions({ local: d.local || [], remote: d.remote || [] }, q);
   } catch {
     if (seq === suggestSeq) hideSuggestions();
   }
@@ -4748,23 +5075,38 @@ if (searchInput && suggestBox) {
     if (suggestTimer) clearTimeout(suggestTimer);
     if (q.length < 2) {
       hideSuggestions();
+      if (!q) showRecent();
       return;
     }
     suggestTimer = setTimeout(() => fetchSuggestions(q), SUGGEST_DEBOUNCE_MS);
   };
+  searchInput.onfocus = () => {
+    clearTimeout(blurTimer);        // back before the list closed: keep it
+    if (searchInput.value.trim().length < 2) showRecent();
+  };
 
   searchInput.onkeydown = (e) => {
-    if (suggestBox.hidden) return;
+    if (suggestBox.hidden) {
+      if (e.key === "ArrowDown") {
+        const q = searchInput.value.trim();
+        e.preventDefault();
+        if (q.length >= 2) fetchSuggestions(q);
+        else showRecent();
+      } else if (e.key === "Escape" && searchInput.value) {
+        searchInput.value = "";
+      }
+      return;
+    }
     if (e.key === "ArrowDown") { e.preventDefault(); highlightSuggestion(suggestActive + 1); }
     else if (e.key === "ArrowUp") { e.preventDefault(); highlightSuggestion(suggestActive - 1); }
-    else if (e.key === "Escape") hideSuggestions();
+    else if (e.key === "Escape") { e.preventDefault(); hideSuggestions(); }
     else if (e.key === "Enter" && suggestActive >= 0) {
       e.preventDefault();
       chooseSuggestion(suggestActive);
     }
   };
 
-  searchInput.onblur = () => setTimeout(hideSuggestions, 120);
+  searchInput.onblur = () => { blurTimer = setTimeout(hideSuggestions, 120); };
 }
 
 document.getElementById("search-form").onsubmit = (e) => {
@@ -4774,6 +5116,7 @@ document.getElementById("search-form").onsubmit = (e) => {
     return;
   }
   hideSuggestions();
+  recentCache = null;              // this search is now the most recent
   const q = document.getElementById("search-input").value.trim();
   location.hash = `#/search/${encodeURIComponent(q)}`;
 };

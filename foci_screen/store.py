@@ -289,6 +289,8 @@ CREATE TABLE IF NOT EXISTS organisations (
 CREATE TABLE IF NOT EXISTS users (
     user_id      TEXT PRIMARY KEY,
     email        TEXT NOT NULL UNIQUE,
+    -- What to call them: "Hello Jordan," in what the site emails. Optional.
+    name         TEXT,
     password_hash TEXT NOT NULL,
     tenant_id    TEXT NOT NULL,
     role         TEXT NOT NULL DEFAULT 'owner',
@@ -326,6 +328,17 @@ CREATE TABLE IF NOT EXISTS account_portfolios (
     portfolio_key TEXT NOT NULL,
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
+);
+-- What each account has searched for, opened and screened, newest first: the
+-- signed-in dashboard is this, not everything ever screened. Seen by that
+-- account only, and trimmed to the most recent few of each kind.
+CREATE TABLE IF NOT EXISTS account_activity (
+    user_id      TEXT NOT NULL,
+    kind         TEXT NOT NULL,     -- search | company | screen
+    target       TEXT NOT NULL,     -- the query, the contractor's key, the run id
+    label        TEXT NOT NULL,
+    at           TEXT NOT NULL,
+    PRIMARY KEY (user_id, kind, target)
 );
 -- Signed-in sessions, by a hash of the cookie's token, never the token.
 CREATE TABLE IF NOT EXISTS user_sessions (
@@ -551,6 +564,7 @@ COLUMN_ADDITIONS = [
     ("alert_recipients", "restorable", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "portfolio_id", "TEXT"),
     ("organisations", "self_made", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "name", "TEXT"),
 ]
 
 
@@ -1664,7 +1678,8 @@ class Store:
 
     def create_user(self, *, email: str, password_hash: str, tenant_id: str,
                     role: str = "owner", organisation: str = "",
-                    verified: bool = False, self_made: bool = False) -> dict:
+                    verified: bool = False, self_made: bool = False,
+                    name: str = "") -> dict:
         """Returns the new account. Raises ValueError if the address is taken.
 
         The organisation is created with the account when it does not exist
@@ -1682,10 +1697,54 @@ class Store:
                           (tenant_id, organisation.strip()
                            or email.rsplit("@", 1)[-1], now, 1 if self_made else 0))
             c.execute("INSERT INTO users (user_id, email, password_hash, tenant_id, role,"
-                      " created_at, email_verified_at) VALUES (?,?,?,?,?,?,?)",
+                      " created_at, email_verified_at, name) VALUES (?,?,?,?,?,?,?,?)",
                       (user_id, email, password_hash, tenant_id, role, now,
-                       now if verified else None))
+                       now if verified else None, name.strip() or None))
         return self.user_by_id(user_id)
+
+    def set_user_name(self, user_id: str, name: str) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE users SET name=? WHERE user_id=?",
+                      (name.strip() or None, user_id))
+
+    def known_name(self, email: str) -> str:
+        """A name this site has for an address: its account's, or a contracting
+        officer's from the awards that name them. "" if none."""
+        email = (email or "").strip().lower()
+        row = self._one("SELECT name FROM users WHERE email=? AND name IS NOT NULL",
+                        (email,))
+        if row and row.get("name"):
+            return row["name"]
+        row = self._one("SELECT MAX(ko_name) AS n FROM contracts WHERE LOWER(ko_email)=?",
+                        (email,))
+        return (row or {}).get("n") or ""
+
+    # What an account has searched for, opened and screened (account_activity).
+    ACTIVITY_KEPT = 30
+
+    def remember_activity(self, user_id: str, kind: str, target: str, label: str) -> None:
+        """Note it, or move it to the top if it is already there."""
+        target, label = target.strip()[:300], (label.strip() or target.strip())[:300]
+        if not target:
+            return
+        with self._tx() as c:
+            c.execute("INSERT INTO account_activity (user_id, kind, target, label, at)"
+                      " VALUES (?,?,?,?,?) ON CONFLICT (user_id, kind, target) DO UPDATE"
+                      " SET label=excluded.label, at=excluded.at",
+                      (user_id, kind, target, label, _now()))
+            c.execute("DELETE FROM account_activity WHERE user_id=? AND kind=? AND target"
+                      " NOT IN (SELECT target FROM account_activity WHERE user_id=? AND"
+                      " kind=? ORDER BY at DESC, target LIMIT ?)",
+                      (user_id, kind, user_id, kind, self.ACTIVITY_KEPT))
+
+    def activity(self, user_id: str, kind: str, limit: int = 10) -> list[dict]:
+        return self._query("SELECT target, label, at FROM account_activity WHERE user_id=?"
+                           " AND kind=? ORDER BY at DESC, target LIMIT ?",
+                           (user_id, kind, limit))
+
+    def clear_activity(self, user_id: str) -> None:
+        with self._tx() as c:
+            c.execute("DELETE FROM account_activity WHERE user_id=?", (user_id,))
 
     def organisation(self, tenant_id: str) -> dict | None:
         return self._one("SELECT * FROM organisations WHERE tenant_id=?", (tenant_id,))
@@ -1706,6 +1765,7 @@ class Store:
             c.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
             c.execute("DELETE FROM account_tokens WHERE user_id=?", (user_id,))
             c.execute("DELETE FROM account_portfolios WHERE user_id=?", (user_id,))
+            c.execute("DELETE FROM account_activity WHERE user_id=?", (user_id,))
             c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
 
     def mark_email_verified(self, user_id: str) -> None:
@@ -2906,6 +2966,9 @@ class Store:
                " MAX(country_of_incorporation) AS country_of_incorporation,"
                " MAX(foreign_owned) AS foreign_owned"
                " FROM contracts WHERE tenant_id=?")
+        # "Acme Corporation" finds ACME CORP: the legal-form word is left out of
+        # the match when anything else was typed (aliases.company_tokens).
+        q = aliases.company_query(q) if q else q
         if q:
             clause, token_params = self._all_tokens_clause(
                 q, ("entity_name", "entity_key"))
@@ -2913,12 +2976,14 @@ class Store:
                 sql += f" AND ({clause})"
                 params += token_params
         sql += " GROUP BY entity_key"
-        # A name that starts with what was typed comes first: typing "lock"
-        # should offer Lockheed before a company that merely contains it.
+        # A name that starts with what was typed comes first, then one with a
+        # word that does: typing "lock" offers Lockheed before Sherlock
+        # Holdings, and "martin" offers Lockheed Martin before Dartmartin.
         if q:
-            sql += f" ORDER BY (CASE WHEN LOWER(MAX(entity_name)) LIKE ? {ESC}" \
-                   " THEN 0 ELSE 1 END), SUM(amount) DESC"
-            params.append(_prefix(q))
+            sql += (f" ORDER BY (CASE WHEN LOWER(MAX(entity_name)) LIKE ? {ESC} THEN 0"
+                    f" WHEN LOWER(MAX(entity_name)) LIKE ? {ESC} THEN 1 ELSE 2 END),"
+                    " SUM(amount) DESC")
+            params += [_prefix(q), "% " + _prefix(q)]
         else:
             sql += " ORDER BY SUM(amount) DESC"
         sql += ", entity_key LIMIT ? OFFSET ?"
@@ -2934,6 +2999,20 @@ class Store:
             r["score"] = latest["score"] if latest else None
             r["last_screened"] = latest["created_at"] if latest else None
         return rows
+
+    def entity_names(self, limit: int = 5000) -> list[dict]:
+        """Every contractor's key, name and award count, largest first — what a
+        close match to a mistyped name is looked for among."""
+        return self._query(
+            "SELECT entity_key, MAX(entity_name) AS entity_name, COUNT(*) AS contract_count"
+            " FROM contracts WHERE tenant_id=? GROUP BY entity_key ORDER BY SUM(amount) DESC,"
+            " entity_key LIMIT ?", (self.tenant_id, limit))
+
+    def latest_severity(self, entity_key: str) -> dict:
+        """The latest finding's severity and date for one contractor, or {}."""
+        return self._one("SELECT severity, created_at FROM findings WHERE tenant_id=? AND"
+                         " entity_key=? ORDER BY id DESC LIMIT 1",
+                         (self.tenant_id, entity_key)) or {}
 
     def search_officers(self, q: str = "", limit: int = 25, offset: int = 0) -> list[dict]:
         params: list = [self.tenant_id]
