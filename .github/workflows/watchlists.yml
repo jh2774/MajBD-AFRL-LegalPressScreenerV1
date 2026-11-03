@@ -1,11 +1,13 @@
-# Once a day, re-screen every active watchlist on the deployed site.
+# Once a day, re-screen every active watchlist on the deployed site, in every
+# workspace — the site's own and each account's.
 #
 # A site on Vercel cannot sweep its own watchlists: nothing there runs in the
 # background, and a screen runs inside the request that asks for it. So this
-# asks, one watchlist at a time, and waits for each screen to finish — up to
-# FOCI_SCREEN_SECONDS, four minutes there, after which a screen stops and keeps
-# what it finished. It runs before the daily alert check, so a notice a sweep
-# raises is in that day's alerts.
+# asks for one watchlist at a time (POST /v1/schedule/watchlists), which runs
+# in that request — up to FOCI_SCREEN_SECONDS, four minutes there, after which
+# a screen stops and keeps what it finished — until the site says none is left.
+# It runs before the daily alert check, so a notice a sweep raises is in that
+# day's alerts.
 #
 # Uses the same settings as the daily alerts (Settings → Secrets and variables
 # → Actions): the variable FOCI_SITE_URL, and the secret FOCI_ALERTS_KEY only
@@ -22,7 +24,7 @@ on:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     steps:
       - name: Re-screen each active watchlist
         env:
@@ -39,24 +41,24 @@ jobs:
           fi
           curl -sS --retry 4 --retry-delay 20 --retry-all-errors --max-time 90 \
             "$SITE/health" > /dev/null || true
-          # `active` is 1 or 0, and jq counts 0 as true: compare, do not test.
-          ids=$(curl -fsS "${auth[@]}" "$SITE/v1/watchlists" \
-                | jq -r '.watchlists[] | select(.active == 1 or .active == true)
-                         | .watchlist_id')
-          if [ -z "$ids" ]; then
-            echo "No active watchlists."
-            exit 0
-          fi
-          for id in $ids; do
-            started=$(curl -fsS -X POST "${auth[@]}" -H "Content-Type: application/json" \
-                      -d '{}' "$SITE/v1/watchlists/$id/run") || { echo "$id: not started"; continue; }
-            echo "$id: run $(echo "$started" | jq -r .run_id)"
-            execute=$(echo "$started" | jq -r '.execute // empty')
-            # Where screens run inside requests (Vercel), this request is the
-            # screen: wait for it. Elsewhere the site runs it in the background.
-            if [ -n "$execute" ]; then
-              curl -sS --max-time 330 -X POST "${auth[@]}" -H "X-FOCI-Session: 1" \
-                -H "Content-Type: application/json" -d '{}' "$SITE$execute" \
-                | jq -c '{status}' || echo "  no answer; the run keeps what it finished"
+          # Each request takes the next watchlist due and marks it run before
+          # screening, so one that times out here is not screened again today.
+          fails=0
+          for _ in $(seq 1 300); do
+            if r=$(curl -fsS --max-time 330 -X POST "${auth[@]}" \
+                   -H "Content-Type: application/json" -d '{}' \
+                   "$SITE/v1/schedule/watchlists"); then
+              fails=0
+              echo "$r" | jq -c '{status, left}'
+              if [ "$(echo "$r" | jq -r .left)" = "0" ]; then
+                exit 0
+              fi
+            else
+              fails=$((fails + 1))
+              echo "No answer; the screen keeps what it finished."
+              if [ "$fails" -ge 3 ]; then
+                echo "Three in a row; stopping."
+                exit 1
+              fi
             fi
           done

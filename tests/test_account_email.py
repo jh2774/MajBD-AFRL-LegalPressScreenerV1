@@ -156,6 +156,15 @@ def test_a_reset_reaches_the_person_even_during_a_pilot_redirect(make_client, mo
 
 # --------------------------------------------------------- organisation
 
+def owner_signup(app_module, c, **extra):
+    """Sign up and confirm the address: an account made by signing up invites
+    nobody until it has (test_open_signup.py)."""
+    r = signup(c, **extra)
+    store = app_module.store_for("default")
+    store.mark_email_verified(store.user_by_email("owner@agency.gov")["user_id"])
+    return r
+
+
 def invite(c, email="colleague@agency.gov", role="member"):
     return c.post("/v1/org/invites", headers=WEB, json={"email": email, "role": role})
 
@@ -163,7 +172,8 @@ def invite(c, email="colleague@agency.gov", role="member"):
 def test_an_invited_colleague_joins_the_same_workspace(make_client, monkeypatch):
     app_module = make_client(**MAIL)
     owner = client(app_module)
-    workspace = signup(owner, organisation="Concord").json()["account"]["workspace"]
+    workspace = owner_signup(app_module, owner,
+                             organisation="Concord").json()["account"]["workspace"]
     app_module.store_for(workspace).create_notice(
         run_id="r1", entity_key="UEI1", entity_name="SHARED LLC", severity="high",
         recipient="ko@mail.mil", officer_confidence="high", subject="s", body_text="b")
@@ -198,7 +208,7 @@ def test_an_invited_colleague_joins_the_same_workspace(make_client, monkeypatch)
 def test_an_account_belongs_to_one_organisation(make_client):
     app_module = make_client()
     owner = client(app_module)
-    signup(owner)
+    owner_signup(app_module, owner)
     signup(client(app_module), "elsewhere@other.example")
     r = invite(owner, "elsewhere@other.example")
     assert r.status_code == 409 and "one organisation" in r.json()["detail"]
@@ -207,7 +217,7 @@ def test_an_account_belongs_to_one_organisation(make_client):
 def test_only_owners_manage_the_organisation(make_client):
     app_module = make_client()
     owner = client(app_module)
-    signup(owner)
+    owner_signup(app_module, owner)
     token = token_of(invite(owner).json()["link"])
     member = client(app_module)
     member.post("/v1/auth/join", headers=WEB,
@@ -227,7 +237,7 @@ def test_only_owners_manage_the_organisation(make_client):
 def test_without_a_mail_service_the_owner_gets_the_link_to_pass_on(make_client):
     app_module = make_client()
     owner = client(app_module)
-    signup(owner)
+    owner_signup(app_module, owner)
     r = invite(owner).json()
     assert r["delivery"]["sent"] is False
     assert "/#/join/" in r["link"]
@@ -236,7 +246,7 @@ def test_without_a_mail_service_the_owner_gets_the_link_to_pass_on(make_client):
 def test_a_withdrawn_invitation_cannot_be_used(make_client):
     app_module = make_client()
     owner = client(app_module)
-    signup(owner)
+    owner_signup(app_module, owner)
     token = token_of(invite(owner).json()["link"])
     assert owner.delete("/v1/org/invites/colleague@agency.gov", headers=WEB).status_code == 204
     assert client(app_module).post("/v1/auth/join", headers=WEB, json={

@@ -2,6 +2,9 @@
 # is new. Vercel's free plan runs a schedule only once a day and a free Render
 # instance has none, so this does it, and costs nothing.
 #
+# Every workspace on the site, not only its own: one per request, until the
+# site says none is left (POST /v1/schedule/alerts).
+#
 # Does nothing until the site's address is set in the repository
 # (Settings → Secrets and variables → Actions):
 #   variable  FOCI_SITE_URL    e.g. https://contractscreener.com
@@ -19,7 +22,7 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 60
     steps:
       - name: Check portfolios and send alerts
         env:
@@ -38,5 +41,17 @@ jobs:
           # take the better part of a minute.
           curl -sS --retry 4 --retry-delay 20 --retry-all-errors --max-time 90 \
             "$SITE/health" > /dev/null || true
-          curl -fsS --max-time 600 -X POST "$SITE/v1/alerts/run" \
-            "${auth[@]}" -H "Content-Type: application/json" -d '{}'
+          for _ in $(seq 1 200); do
+            r=$(curl -fsS --max-time 600 -X POST "$SITE/v1/schedule/alerts" \
+                "${auth[@]}" -H "Content-Type: application/json" -d '{}') \
+              || { echo "The check failed; stopping."; exit 1; }
+            echo "$r" | jq -c '{status, left, emails}'
+            status=$(echo "$r" | jq -r .status)
+            if [ "$status" = "already running" ]; then
+              sleep 60
+              continue
+            fi
+            if [ "$(echo "$r" | jq -r .left)" = "0" ]; then
+              exit 0
+            fi
+          done

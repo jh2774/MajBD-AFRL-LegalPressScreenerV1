@@ -213,28 +213,41 @@ screened on contractscreener.com so far, is called `default`.
 
 **Make the account that owns the site's workspace** (about two minutes):
 
-1. On contractscreener.com, click **Sign in** at the top right, then **Create an account**
-   at the bottom of the box.
-2. Enter your address, a password of at least 10 characters, the organisation's name (for
-   example `Concord`), and the admin key in the **Admin key** box — the part *after*
-   `default:`. (If you entered the key under **Admin key** at the top right earlier, the box
-   is filled in already.) **Create account**.
+1. On contractscreener.com, click **Admin key** at the top right and enter the admin key —
+   the part *after* `default:`. This is what makes the account the site's own rather than a
+   stranger's.
+2. Click **Sign in**, then **Create an account** at the bottom of the box. It says the account
+   will join this site's own workspace. Enter your address, a password of at least 10
+   characters, and the organisation's name (for example `Concord`). **Create account**.
 3. You are signed in, as the owner of the `default` workspace. Everything the admin key could
    do, you can now do under your own name.
 4. **Invite colleagues** from **Organisation and people** (in the account box, or
    `#/organisation`). Each gets an email with a link to choose a password, and joins the same
    workspace. An owner can invite another owner.
 
-**Who else may create an account** is `FOCI_SIGNUP` in Vercel, closed by default:
+**Anyone may create an account.** On a public site (`FOCI_PUBLIC`) **Sign in** → **Create an
+account** needs only an address and a password. The account gets a **new, empty workspace of
+its own**, not the site's, with everything the site does: screens, portfolios, notices,
+watchlists, screening settings and email alerts. Nobody else sees what is in it. For your own
+colleagues, use invitations instead, so they share the site's workspace.
 
-* unset — nobody creates one from the site; people join by invitation;
-* `@concordgroup.com` (addresses or domains, separated by commas) — those may;
-* `open` — anyone may.
+What such an account has the site *email* is held to people who asked for it, because the
+site's name is on every email and it does not know them:
 
-An account made this way gets a **new, empty workspace of its own**, not the site's. For
-colleagues, use invitations instead. **Create an account** is always in the sign-in box; while
-sign-ups are closed it says to ask for an invitation, and asks whoever looks after the site for
-the admin key.
+* an address it puts on an alert list is asked to confirm first, as a visitor's is — except the
+  account's own, once confirmed;
+* portfolios, copies of notices and invitations go only from a confirmed address, and
+  portfolios and copies only to the account's own organisation;
+* a notice never goes from this site to a contracting officer for it: the person sends
+  themselves a copy and forwards it from their own mailbox;
+* the site takes at most 50 new accounts a day, an organisation sends at most 10 invitations a
+  day, and an address is sent at most 3 confirmation links a day — so sign-ups cannot use up the
+  day's email (Resend's free plan allows 100).
+
+`FOCI_SIGNUP` in Vercel changes who may sign up: `closed` stops sign-ups (people then join by
+invitation, and the form asks for the admin key to make the site's owner); a list such as
+`@concordgroup.com` (addresses or domains, separated by commas) allows only those; unset or
+`open`, anyone.
 
 **What an account gives you**
 
@@ -252,7 +265,9 @@ the admin key.
 * **Forgot password?** emails a reset link; confirmation, reset and invitation emails go to
   the person themselves, never through `FOCI_EMAIL_REDIRECT_TO`.
 
-The admin key keeps working alongside accounts, for the daily workflows and as a way in.
+The admin key keeps working alongside accounts, as a way in. The daily workflows need no
+key: they ask the site to check each workspace's alert lists and watchlists in turn, its own and
+every account's.
 
 ## Who can do what
 
@@ -273,8 +288,9 @@ watchlists and set their own policies, read notices, and start or add to an aler
 * seeing alert-list addresses, and where notices were sent, in full; taking an address off a
   list; "Mail again" for a bounced address.
 
-An account in a workspace of its own (one made through `FOCI_SIGNUP`) can do all of this in its
-own workspace, and nothing in the site's.
+An account in a workspace of its own (anyone who signs up) can do all of this in its own
+workspace, and nothing in the site's — with what it emails held to people who asked for it
+(section 8).
 
 **Email addresses are protected.** Visitors see the addresses on a list masked
 (`j•••@agency.gov`). An address a visitor adds is sent one email asking it to confirm, and

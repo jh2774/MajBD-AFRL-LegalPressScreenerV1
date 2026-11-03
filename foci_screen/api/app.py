@@ -110,7 +110,7 @@ def _session_tenant(request: Request) -> str:
 
 def _accounts_possible() -> bool:
     """Whether anyone could be signed in: an account exists or may be made."""
-    return bool(cfg.signup.strip()) or store_for(auth.DEFAULT_TENANT).count_users() > 0
+    return bool(_signup()) or store_for(auth.DEFAULT_TENANT).count_users() > 0
 
 
 def _accounts_possible_quietly() -> bool:
@@ -119,7 +119,7 @@ def _accounts_possible_quietly() -> bool:
     try:
         return _accounts_possible()
     except Exception:            # noqa: BLE001 - reported elsewhere
-        return bool(cfg.signup.strip())
+        return bool(_signup())
 
 
 require_tenant = auth.make_dependency(keymap, public=cfg.public, session=_session_tenant,
@@ -138,6 +138,82 @@ def signed_in(request: Request) -> str:
     """Who the request is signed in as, or "" — to record who decided or sent."""
     user = session_user(request)
     return user["email"] if user else ""
+
+
+def _signup() -> str:
+    """FOCI_SIGNUP as it applies here: unset, a public site takes anyone."""
+    return accounts.signup_setting(cfg.signup, cfg.public)
+
+
+def _key_presented(authorization: str, x_api_key: str) -> str:
+    return x_api_key.strip() or (authorization[7:].strip()
+                                 if authorization.lower().startswith("bearer ") else "")
+
+
+def _vouched_account(user: dict) -> bool:
+    """Whether the people who run the site stand behind this account: it is
+    in a workspace a key opens, or one they or an invitation made — not one
+    someone made for themselves by signing up."""
+    if user["tenant_id"] in set(keymap.values()):
+        return True
+    org = store_for(auth.DEFAULT_TENANT).organisation(user["tenant_id"]) or {}
+    return not org.get("self_made")
+
+
+async def vouched(request: Request, authorization: str = Header(default=""),
+                  x_api_key: str = Header(default="")) -> bool:
+    """Whether this request may have the site email people who have not asked
+    to hear from it: add addresses to an alert list without their confirming,
+    send a notice to a contracting officer, email a portfolio or a notice to
+    anyone at all.
+
+    Someone holding a key the site knows may, and an account it stands behind
+    (`_vouched_account`). A visitor to a public site may not, and nor may an
+    account someone made for themselves: the site does not know them, and
+    its name is on every email. They have every feature for their own work;
+    what they send goes to their own organisation's confirmed addresses, and
+    to people who agree to it.
+    """
+    presented = _key_presented(authorization, x_api_key)
+    if presented and auth.resolve_tenant(keymap, presented):
+        return True
+    user = session_user(request)
+    if user is not None:
+        return _vouched_account(user)
+    return not cfg.public
+
+
+def _own_people(user: dict) -> set[str]:
+    """Addresses an account not vouched for may have the site email: its
+    organisation's members who have confirmed theirs, itself included."""
+    return {m["email"].lower()
+            for m in store_for(auth.DEFAULT_TENANT).organisation_members(user["tenant_id"])
+            if m.get("email_verified_at")}
+
+
+def _only_own_people(user: dict, addresses: list[str], what: str) -> None:
+    """Refuse, saying why, to email anyone outside `_own_people`."""
+    allowed = _own_people(user)
+    if user["email"].lower() not in allowed:
+        raise HTTPException(
+            403, f"Confirm your email address first: an account made by signing up sends "
+                 f"{what} only from a confirmed address. Use the link we emailed you when "
+                 f"you made your account, or “Send the link again” under your account at "
+                 f"the top right.")
+    outside = [a for a in addresses if a.strip().lower() not in allowed]
+    if outside:
+        raise HTTPException(
+            403, f"An account made by signing up can send {what} only to people in its "
+                 f"own organisation who have confirmed their address: {', '.join(outside)} "
+                 f"is not one. Invite them under Organisation and people, or send it "
+                 f"yourself.")
+
+
+def _today() -> str:
+    """Midnight UTC, as the timestamps are stored."""
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0,
+                       tzinfo=None).isoformat() + "Z"
 queue = JobQueue(cfg)
 
 app = FastAPI(
@@ -447,6 +523,9 @@ def _account(user: dict) -> dict:
             "email_verified": bool(user.get("email_verified_at")),
             "portfolio_key": user.get("portfolio_key") or "",
             "portfolio_id": user.get("portfolio_id") or "",
+            # False for an account made by signing up: what it sends goes to its
+            # own organisation's confirmed addresses, and to people who agree.
+            "vouched": _vouched_account(user),
             "created_at": user["created_at"], "last_login_at": user.get("last_login_at")}
 
 
@@ -498,7 +577,7 @@ def auth_status(request: Request) -> dict:
     user = session_user(request)
     return {"signed_in": user is not None,
             "account": _account(user) if user else None,
-            "signup": accounts.signup_mode(cfg.signup),
+            "signup": accounts.signup_mode(_signup()),
             # Whether anyone has an account yet, so the sign-up form can say how
             # the first is made.
             "accounts": _accounts_exist(),
@@ -518,6 +597,10 @@ def signup(body: Credentials, request: Request, response: Response,
            x_api_key: str = Header(default="")) -> dict:
     """Create an account with its own empty workspace, and sign it in.
 
+    On a public site anyone may (FOCI_SIGNUP, `accounts.signup_setting`), and
+    the workspace has everything the site does, for that person's own work.
+    What it emails is held to people who asked for it (`vouched`).
+
     Made by someone holding an API key, the account belongs to that key's
     workspace instead, as an owner, whatever FOCI_SIGNUP says. The key already
     does everything there; this gives it a name. It is how the people who look
@@ -530,24 +613,28 @@ def signup(body: Credentials, request: Request, response: Response,
         accounts.check_password(body.password)
     except accounts.AccountError as exc:
         raise HTTPException(422, str(exc)) from exc
-    presented = x_api_key.strip() or (authorization[7:].strip()
-                                      if authorization.lower().startswith("bearer ") else "")
+    presented = _key_presented(authorization, x_api_key)
     key_tenant = auth.resolve_tenant(keymap, presented) if presented else ""
     if presented and not key_tenant:
         raise HTTPException(401, "That API key is not one this site knows.")
-    if not key_tenant and not accounts.signup_allowed(cfg.signup, email):
+    setting = _signup()
+    if not key_tenant and not accounts.signup_allowed(setting, email):
         raise HTTPException(
             403, "New accounts are not being taken here"
-                 + ("" if accounts.signup_mode(cfg.signup) == "closed"
+                 + ("" if accounts.signup_mode(setting) == "closed"
                     else " for that address") + ". Ask the site's owner to invite you"
                  + (" — or, if you look after the site, give its admin key in the form."
                     if keymap else "."))
     store = store_for(auth.DEFAULT_TENANT)
+    if not key_tenant and store.users_created_since(_today()) >= accounts.SIGNUPS_PER_DAY:
+        raise HTTPException(429, "This site has taken as many new accounts as it can today. "
+                                 "Please try again tomorrow.")
     try:
         user = store.create_user(email=email,
                                  password_hash=accounts.hash_password(body.password),
                                  tenant_id=key_tenant or accounts.new_tenant_id(),
-                                 role="owner", organisation=body.organisation)
+                                 role="owner", organisation=body.organisation,
+                                 self_made=not key_tenant)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
     store.record_login(user["user_id"], True, max_failures=accounts.MAX_FAILURES,
@@ -592,6 +679,10 @@ def resend_verification(request: Request) -> dict:
     if accounts.too_soon(store.last_account_token(user["email"], "verify")):
         raise HTTPException(429, "A link was sent a moment ago. Give it a couple of "
                                  "minutes to arrive, and check the spam folder.")
+    if store.account_tokens_since("verify", _today(), email=user["email"]) \
+            >= accounts.VERIFY_EMAILS_PER_DAY:
+        raise HTTPException(429, "Several links have gone to this address today. Check the "
+                                 "spam folder, or try again tomorrow.")
     return {"email": _send_verification(request, user)}
 
 
@@ -889,7 +980,8 @@ def email_portfolio(body: PortfolioEmailRequest, request: Request) -> dict:
 
     Only for someone signed in, who is named in the email to anyone else and
     gets their replies. Copies to others go through the pilot redirect, as
-    alerts do; a copy to yourself does not.
+    alerts do; a copy to yourself does not. An account made by signing up
+    sends only to its own organisation's confirmed addresses (`vouched`).
     """
     user = _signed_in(request)
     who = user["email"]
@@ -897,6 +989,8 @@ def email_portfolio(body: PortfolioEmailRequest, request: Request) -> dict:
         portfolio_keys.decode(body.key)
     except portfolio_keys.PortfolioKeyError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if not _vouched_account(user):
+        _only_own_people(user, body.to, "a portfolio by email")
     since = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
         microsecond=0, tzinfo=None).isoformat() + "Z"
     log_store = store_for(auth.DEFAULT_TENANT)
@@ -987,6 +1081,18 @@ def invite_member(body: InviteRequest, request: Request) -> dict:
     except accounts.AccountError as exc:
         raise HTTPException(422, str(exc)) from exc
     store = store_for(auth.DEFAULT_TENANT)
+    if not _vouched_account(user):
+        # The invitation carries the organisation's name, which its owner
+        # chose, to an address they typed.
+        if not user.get("email_verified_at"):
+            raise HTTPException(403, "Confirm your own email address before inviting "
+                                     "anyone: use the link we emailed you, or “Send the "
+                                     "link again” under your account.")
+        if store.account_tokens_since("invite", _today(), tenant_id=user["tenant_id"]) \
+                >= accounts.INVITES_PER_DAY:
+            raise HTTPException(429, f"{accounts.INVITES_PER_DAY} invitations have gone "
+                                     f"out from this organisation today, the most it can "
+                                     f"send in a day. Try again tomorrow.")
     if store.user_by_email(email):
         raise HTTPException(409, "That address already has an account. An account "
                                  "belongs to one organisation, so it cannot be invited.")
@@ -1818,7 +1924,8 @@ async def resend_report(request: Request) -> Response:
 @app.post("/v1/alerts/subscriptions", tags=["alerts"])
 def save_subscription(body: AlertSubscriptionRequest, request: Request,
                       store: Store = Depends(tenant_store),
-                      admin: bool = Depends(is_admin)) -> dict:
+                      admin: bool = Depends(is_admin),
+                      trusted: bool = Depends(vouched)) -> dict:
     """Create or update who is emailed about a portfolio.
 
     Whatever is already known about the portfolio's companies is marked as
@@ -1829,6 +1936,8 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
     confirm and nothing else until it does (`consent`). Such a visitor adds
     to a list; taking an address off is for the address itself, through the
     link in every email, or for someone holding the admin key or signed in.
+    The same request to confirm goes to an address added from an account made
+    by signing up — except the account's own, once it has confirmed it.
     """
     try:
         loaded = portfolio_keys.decode(body.portfolio_key)
@@ -1865,8 +1974,10 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
         emails=emails, companies=companies, portfolio_key=body.portfolio_key,
         active=body.active if admin or not existing else existing["active"])
     sub = store.alert_subscription(sub_id)
+    user = session_user(request)
     asked = consent.add(store, Mailer(cfg), sub, [e for e in emails if e not in had],
-                        _base_url(request), trusted=admin)
+                        _base_url(request), trusted=trusted,
+                        own=user["email"] if user and user.get("email_verified_at") else "")
     if not admin:
         asked = {k: [consent.mask(a) if isinstance(a, str)
                      else {**a, "email": consent.mask(a["email"])} for a in v]
@@ -1933,7 +2044,8 @@ def _minutes_ago(stamp: str) -> float:
 @app.post("/v1/alerts/run", tags=["alerts"])
 def run_alerts(request: Request, only_if_due: bool = Query(False),
                store: Store = Depends(tenant_store),
-               admin: bool = Depends(is_admin)) -> dict:
+               admin: bool = Depends(is_admin),
+               trusted: bool = Depends(vouched)) -> dict:
     """Check every watched firm and company now and email what is new.
 
     A free instance has no scheduler, so something has to ask. Two things do:
@@ -1950,7 +2062,7 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
         return {"status": "paused", "emails": [], "detail": ALERTS_PAUSED_NOTE}
     if only_if_due and not alerts_engine.is_due(store):
         return {"status": "not due", "emails": []}
-    if not admin and not alerts_engine.is_due(store, hours=CHECK_AGAIN_MINUTES / 60):
+    if not trusted and not alerts_engine.is_due(store, hours=CHECK_AGAIN_MINUTES / 60):
         return {"status": "recently checked", "emails": [],
                 "detail": f"Every list was checked within the last {CHECK_AGAIN_MINUTES} "
                           f"minutes. Try again in a few minutes."}
@@ -1978,10 +2090,85 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
     return {"status": "checked", **result}
 
 
+# ------------------------------------------------------------- the daily runs
+# For the daily workflows (.github/workflows): every workspace's alert lists and
+# watchlists, not only the site's own. Each call does the next piece of work
+# that is due and says how many are left, so no one request runs for long.
+# Calling early only does due work sooner — each list at most every few hours,
+# each watchlist once a day — so a public site needs no key for them.
+
+SWEEP_ALERTS_HOURS = 12           # a workspace checked more recently is skipped
+SWEEP_WATCHLISTS_HOURS = 20
+
+
+def _hours_ago(hours: float) -> str:
+    when = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return when.replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+
+
+@app.post("/v1/schedule/alerts", tags=["alerts"])
+def scheduled_alerts(request: Request, _tenant: str = Depends(require_tenant)) -> dict:
+    """Check the next workspace whose alert lists are due, and email what is
+    new. `left` is how many more are due; ask again until it is 0."""
+    if cfg.alerts_paused:
+        return {"status": "paused", "left": 0, "detail": ALERTS_PAUSED_NOTE}
+    due = store_for(auth.DEFAULT_TENANT).alert_workspaces_due(
+        _hours_ago(SWEEP_ALERTS_HOURS))
+    if not due:
+        return {"status": "nothing due", "left": 0}
+    store = store_for(due[0])
+    busy = {"status": "already running", "left": len(due)}
+    if not _alerts_running.acquire(blocking=False):
+        return busy
+    try:
+        if not store.try_lock("alerts"):
+            return busy
+        try:
+            _keep_awake_for_alerts(request)
+            result = alerts_engine.run_alerts(store, _adv(), Mailer(cfg),
+                                              _base_url(request), formd=_formd(),
+                                              vehicles=_vehicles())
+        finally:
+            store.unlock("alerts")
+    finally:
+        _alerts_running.release()
+    # Counts only: the caller may be anyone, and the workspace is not theirs.
+    return {"status": "checked", "left": len(due) - 1, "emails": len(result["emails"])}
+
+
+@app.post("/v1/schedule/watchlists", tags=["watchlists"])
+def scheduled_watchlist(request: Request, _tenant: str = Depends(require_tenant)) -> dict:
+    """Re-screen the next active watchlist, in any workspace, not run for most
+    of a day. Where screens run inside requests (Vercel) it runs in this one,
+    up to FOCI_SCREEN_SECONDS. `left` is how many more are due."""
+    before = _hours_ago(SWEEP_WATCHLISTS_HOURS)
+    site = store_for(auth.DEFAULT_TENANT)
+    due = site.watchlists_due(before)
+    for n, row in enumerate(due):
+        if not site.claim_watchlist_run(row["watchlist_id"], before):
+            continue                    # another sweep took it
+        tenant = row["tenant_id"]
+        store = store_for(tenant)
+        options = {**_json(row["params"]), "watchlist_id": row["watchlist_id"]}
+        run_id = store.start_run(options.get("agency", ""), options, status="queued")
+        store.mark_watchlist_run(row["watchlist_id"], run_id)
+        left = len(due) - n - 1
+        if queue.backend != "request":
+            queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
+            return {"status": "queued", "left": left}
+        if not store.claim_run(run_id):
+            return {"status": "already running", "left": left}
+        from .. import jobs as jobs_mod
+        jobs_mod.run_screen_job(tenant, run_id, options, limit_seconds=cfg.screen_seconds)
+        return {"status": (store.get_run(run_id) or {}).get("status", ""), "left": left}
+    return {"status": "nothing due", "left": 0}
+
+
 @app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])
 def test_subscription(subscription_id: str, request: Request,
                       store: Store = Depends(tenant_store),
-                      admin: bool = Depends(is_admin)) -> dict:
+                      admin: bool = Depends(is_admin),
+                      trusted: bool = Depends(vouched)) -> dict:
     """Send one short test email to a list, to prove delivery works.
 
     To the addresses that have confirmed, each with its own unsubscribe link.
@@ -1990,7 +2177,7 @@ def test_subscription(subscription_id: str, request: Request,
     if not sub:
         raise HTTPException(404, "No such alert list.")
     subject = f"FOCI-Screener: test alert for \"{sub['name']}\""
-    if not admin:
+    if not trusted:
         last = next((d for d in store.alert_deliveries(subscription_id, limit=10)
                      if d["subject"] == subject), None)
         if last and _minutes_ago(last["created_at"]) < TEST_AGAIN_MINUTES:
@@ -2812,12 +2999,13 @@ NOTICE_STATUS = "^(|pending|approved|rejected|drafted|sent|suppressed|superseded
 def list_notices(status: str = Query("", pattern=NOTICE_STATUS),
                  limit: int = Query(50, ge=1, le=200),
                  store: Store = Depends(tenant_store),
-                 admin: bool = Depends(is_admin)) -> dict:
+                 admin: bool = Depends(is_admin),
+                 trusted: bool = Depends(vouched)) -> dict:
     notices = store.list_notices(status=status, limit=limit)
     sends = store.notice_sends([n["notice_id"] for n in notices])
     return {"notices": [_shown_notice(store, n, sends.get(n["notice_id"], []), admin)
                         for n in notices],
-            "sending": {k: v for k, v in notice_sending.state(cfg).items()
+            "sending": {k: v for k, v in _notice_state(trusted or not admin).items()
                         if admin or k != "detail"},
             "reply_to": bool(Mailer(cfg).reply_to), "can_decide": admin}
 
@@ -2886,9 +3074,10 @@ def _decision_error(outcome: str) -> None:
 
 
 @app.post("/v1/notices/{notice_id}/approve", tags=["notices"])
-def approve_notice(notice_id: str, body: NoticeDecision,
+def approve_notice(notice_id: str, body: NoticeDecision, request: Request,
                    tenant: str = Depends(require_admin),
-                   who: str = Depends(signed_in)) -> dict:
+                   who: str = Depends(signed_in),
+                   trusted: bool = Depends(vouched)) -> dict:
     """Approve a notice, optionally with an edited body, then send it.
 
     Approval is the decision; sending follows it, to whoever `send_to` names:
@@ -2896,6 +3085,9 @@ def approve_notice(notice_id: str, body: NoticeDecision,
     address the reviewer chooses (`copy_to`), both, or nobody yet. Where it
     can go and how is `notify.notices`: Gmail, or the site's mail service
     once NOTICES_SEND allows officers, and FOCI_EMAIL_REDIRECT_TO over both.
+    From a workspace someone made by signing up, the site sends nothing to an
+    officer — a notice from them goes from their own mailbox — and copies go
+    only to their organisation's confirmed addresses (`vouched`).
     If sending does not happen — switched off, refused — the approval still
     stands and `POST /v1/notices/{id}/deliver` tries again.
 
@@ -2912,6 +3104,7 @@ def approve_notice(notice_id: str, body: NoticeDecision,
             409, "This notice has no resolved contracting officer, so it cannot be sent "
                  "to one. Approve it with a copy to an address you choose, or download "
                  "the .eml and route it yourself.")
+    _check_copy(request, body, trusted)
     if body.body_text and not render_notice.has_disclaimer(body.body_text):
         raise HTTPException(
             422, "The edited notice no longer contains the limitations statement. "
@@ -2923,14 +3116,15 @@ def approve_notice(notice_id: str, body: NoticeDecision,
         notice_id, "approved", decided_by=decider, note=body.note,
         body_text=body.body_text))
     edited = bool((store.get_notice(notice_id) or {}).get("original_body_text"))
-    sent = _send(store, notice_id, body, sent_by=decider)
+    sent = _send(store, notice_id, body, sent_by=decider, officers=trusted)
     return {"notice_id": notice_id, "edited": edited, **sent}
 
 
 @app.post("/v1/notices/{notice_id}/deliver", tags=["notices"])
-def deliver_notice(notice_id: str, body: NoticeSend | None = None,
+def deliver_notice(notice_id: str, request: Request, body: NoticeSend | None = None,
                    tenant: str = Depends(require_admin),
-                   who: str = Depends(signed_in)) -> dict:
+                   who: str = Depends(signed_in),
+                   trusted: bool = Depends(vouched)) -> dict:
     """Send an approved notice: to the officer, an address you choose, or both.
 
     To the officer only once: for a notice approved while sending was off,
@@ -2957,8 +3151,10 @@ def deliver_notice(notice_id: str, body: NoticeSend | None = None,
                                  "copy to an address you choose instead.")
     if body.send_to == "none":
         raise HTTPException(400, "Say who to send it to.")
+    _check_copy(request, body, trusted)
     return {"notice_id": notice_id,
-            **_send(store, notice_id, body, sent_by=_decider(NoticeDecision(), tenant, who))}
+            **_send(store, notice_id, body, sent_by=_decider(NoticeDecision(), tenant, who),
+                    officers=trusted)}
 
 
 # One notifier for the process, so a Gmail connection is made once rather than
@@ -2966,15 +3162,44 @@ def deliver_notice(notice_id: str, body: NoticeSend | None = None,
 _gmail = GmailNotifier(cfg)
 
 
-def _send(store: Store, notice_id: str, body: NoticeSend, *, sent_by: str) -> dict:
+OWN_MAILBOX = (
+    "This site does not email contracting officers for a workspace made by signing up, "
+    "because its name would be on the email. Send yourself a copy and forward it from "
+    "your own mailbox, or download the .eml.")
+
+
+def _notice_state(officers: bool) -> dict:
+    """What sending does, for this workspace: the site's own state, or — where
+    the site sends nothing to officers for it — how a notice goes instead."""
+    state = notice_sending.state(cfg)
+    if officers:
+        return state
+    return {"mode": "own_mailbox", "detail": OWN_MAILBOX, "copies": state["copies"],
+            "via": state["via"]}
+
+
+def _check_copy(request: Request, body: NoticeSend, trusted: bool) -> None:
+    """A copy from a workspace not vouched for goes to its own people only.
+    Checked before a decision is recorded, so a refusal changes nothing."""
+    if trusted or not body.copy_to:
+        return
+    user = session_user(request)
+    if user is None:
+        raise HTTPException(403, "Sign in to send a copy of a notice.")
+    _only_own_people(user, [body.copy_to], "a copy of a notice")
+
+
+def _send(store: Store, notice_id: str, body: NoticeSend, *, sent_by: str,
+          officers: bool = True) -> dict:
     """Send an approved notice where `body` says, recording each attempt.
 
     `delivery` is the officer's copy, as it always was — `outcome` says what
     happened, "not_requested" when it was not asked for — and `copy` the copy
-    to a chosen address, if any.
+    to a chosen address, if any. Without `officers`, the officer's copy is
+    not sent, and says why (OWN_MAILBOX).
     """
     notice = store.get_notice(notice_id) or {}
-    state = notice_sending.state(cfg)
+    state = _notice_state(officers)
     delivery = {**state, "outcome": "not_requested", "to": "",
                 "detail": "Not sent to the contracting officer."}
     copy = None
@@ -2984,7 +3209,12 @@ def _send(store: Store, notice_id: str, body: NoticeSend, *, sent_by: str) -> di
     if body.copy_to:
         targets.append((notice_sending.COPY, body.copy_to))
     for role, address in targets:
-        out = notice_sending.send(cfg, _gmail, notice, role=role, address=address)
+        if role == notice_sending.OFFICER and not officers:
+            out = notice_sending.Outcome(role, address, "rendered",
+                                         "Nothing was sent to the contracting officer. "
+                                         + OWN_MAILBOX)
+        else:
+            out = notice_sending.send(cfg, _gmail, notice, role=role, address=address)
         store.log_notice_send(notice_id, role=role, recipient=out.to, via=out.via,
                               status=out.status, detail=out.detail, sent_by=sent_by)
         if role == notice_sending.OFFICER:

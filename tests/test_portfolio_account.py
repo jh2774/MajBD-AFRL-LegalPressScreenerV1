@@ -78,7 +78,7 @@ def test_the_page_is_told_whether_anyone_has_an_account(site, monkeypatch):
 
 def test_closed_sign_ups_say_how_to_get_in(site, monkeypatch):
     Post(monkeypatch)
-    c, _ = site(FOCI_SIGNUP="")
+    c, _ = site(FOCI_SIGNUP="closed")
     detail = signup(c).json()["detail"]
     assert "invite" in detail and "admin key" in detail
 
@@ -207,7 +207,7 @@ def test_each_portfolios_alert_list_stays_with_it(site, monkeypatch):
 def test_the_admin_key_makes_the_owner_of_the_sites_workspace(site, monkeypatch):
     """On Vercel there is no command line for `add-user --workspace default`."""
     Post(monkeypatch)
-    c, app_module = site(FOCI_SIGNUP="")
+    c, app_module = site(FOCI_SIGNUP="closed")
     assert signup(c).status_code == 403, "sign-ups are closed"
     r = signup(c, Authorization="Bearer admin-key")
     assert r.status_code == 201
@@ -266,10 +266,16 @@ def test_an_alert_list_follows_the_accounts_portfolio(site, monkeypatch):
 
 # ------------------------------------------------------------ emailing one
 
+def confirm(app_module, email=ME):
+    store = app_module.store_for("default")
+    store.mark_email_verified(store.user_by_email(email)["user_id"])
+
+
 def test_emailing_your_portfolio_to_yourself(site, monkeypatch):
     post = Post(monkeypatch)
-    c, _ = site(FOCI_EMAIL_REDIRECT_TO="pilot@concord.example")
+    c, app_module = site(FOCI_EMAIL_REDIRECT_TO="pilot@concord.example")
     signup(c)
+    confirm(app_module)
     r = c.post("/v1/portfolio/email", headers=WEB,
                json={"key": ONE, "to": [ME], "note": "for Monday"}).json()
     assert r["status"] == "sent" and r["recipients"] == [ME]
@@ -282,9 +288,10 @@ def test_emailing_your_portfolio_to_yourself(site, monkeypatch):
 
 
 def test_emailing_a_portfolio_to_colleagues(site, monkeypatch):
+    """From an account the site stands behind — here, the site's own."""
     post = Post(monkeypatch)
     c, _ = site()
-    signup(c)
+    signup(c, Authorization="Bearer admin-key")
     r = c.post("/v1/portfolio/email", headers=WEB,
                json={"key": ONE, "to": ["a@example.com, b@example.com"]}).json()
     assert r["status"] == "sent"
@@ -299,7 +306,7 @@ def test_emailing_needs_a_sign_in_and_is_rationed(site, monkeypatch):
     c, app_module = site()
     assert c.post("/v1/portfolio/email", headers=WEB,
                   json={"key": ONE, "to": [ME]}).status_code == 401
-    signup(c)
+    signup(c, Authorization="Bearer admin-key")
     monkeypatch.setattr(app_module, "PORTFOLIO_EMAILS_PER_DAY", 3)
     assert c.post("/v1/portfolio/email", headers=WEB,
                   json={"key": ONE, "to": ["a@example.com, b@example.com"]}).status_code == 200

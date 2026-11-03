@@ -498,19 +498,26 @@ def test_the_daily_check_needs_only_the_sites_address():
     assert '[ -z "$KEY" ]' not in workflow, "a key is sent only where one is set"
 
 
-def test_the_daily_sweep_runs_only_active_watchlists_and_waits_for_each(site):
-    """Nothing on Vercel sweeps watchlists in the background; the workflow does.
-    `active` comes back as 1 or 0 — and jq counts 0 as true."""
+def test_the_daily_sweep_runs_only_active_watchlists_and_waits_for_each(site, monkeypatch):
+    """Nothing on Vercel sweeps watchlists in the background; the workflow asks
+    the site for one at a time, and there the request is the screen."""
     workflow = (Path(__file__).resolve().parent.parent / ".github" / "workflows"
                 / "watchlists.yml").read_text(encoding="utf-8")
-    assert "select(.active == 1 or .active == true)" in workflow
-    assert "$SITE$execute" in workflow, "on Vercel the request is the screen"
+    assert '"$SITE/v1/schedule/watchlists"' in workflow
+    assert "--max-time 330" in workflow, "waits out a four-minute screen"
 
     c, app_module = site(FOCI_PUBLIC="true")
     store = app_module.store_for("default")
     live = store.create_watchlist("live", {"agency": "DoD"})
     paused = store.create_watchlist("paused", {"agency": "DoD"})
     store.set_watchlist_active(paused, False)
-    listed = {w["watchlist_id"]: w["active"] for w in c.get("/v1/watchlists").json()[
-        "watchlists"]}
-    assert listed[live] in (1, True) and listed[paused] in (0, False)
+
+    from foci_screen import jobs
+    ran = []
+    monkeypatch.setattr(app_module.queue, "_in_request", True)      # as on Vercel
+    monkeypatch.setattr(jobs, "run_screen_job", lambda tenant, run_id, options, **kw:
+                        ran.append((tenant, options["watchlist_id"], kw)))
+    r = c.post("/v1/schedule/watchlists").json()
+    assert r["left"] == 0
+    assert ran == [("default", live, {"limit_seconds": app_module.cfg.screen_seconds})]
+    assert c.post("/v1/schedule/watchlists").json()["status"] == "nothing due"

@@ -97,7 +97,8 @@
       <span class="muted" id="account-role"></span>.</p>
     <div id="account-unverified" class="muted" style="font-size:13px" hidden>
       Your email address is not confirmed yet, so a forgotten password cannot be
-      reset by email. <button type="button" class="linkish" id="account-resend">Send the
+      reset by email.<span id="account-unverified-more"></span>
+      <button type="button" class="linkish" id="account-resend">Send the
       link again</button> <span id="account-resend-status"></span></div>
     <p style="font-size:13.5px"><a href="#/organisation" id="account-org-link">Organisation
       and people →</a></p>
@@ -105,6 +106,11 @@
       they are there on any computer you sign in from; switch between them on the
       Portfolio page. Screens, notices, watchlists, screening settings and alert lists
       are your workspace's own.</p>
+    <p class="muted" style="font-size:13px" id="account-limits" hidden>Because the site's
+      name is on every email it sends, an account made by signing up has it email only
+      people who agree to it: an address on an alert list confirms first; portfolios and
+      copies of notices go to you and colleagues in your organisation; and a notice
+      reaches a contracting officer from your own mailbox, not this site's.</p>
     <details style="margin-top:8px">
       <summary class="muted" style="cursor:pointer">Change password</summary>
       <input id="account-current" type="password" placeholder="Current password"

@@ -567,13 +567,26 @@ connected, links never reach the log.
 
 | Setting | Effect |
 |---|---|
-| `FOCI_SIGNUP` unset (default) | Nobody can create an account from the site. Accounts are made with `foci-screen add-user` |
+| `FOCI_SIGNUP` unset (default) | On a public site (`FOCI_PUBLIC`), anyone can. Elsewhere nobody can: accounts are made with `foci-screen add-user` |
+| `FOCI_SIGNUP=closed` | Nobody can, public site or not |
 | `FOCI_SIGNUP=you@agency.gov,@navy.mil` | Only those addresses, or anyone at those domains, can create one |
 | `FOCI_SIGNUP=open` | Anyone who finds the site can |
 
-Closed by default for the reason the keys live in the environment: a self-service sign-up page
-is the most attacked surface a tool like this has, and an open one lets a stranger run screens
-and set up alert emails on your deployment.
+A site that needs a key is closed by default for the reason the keys live in the environment:
+a self-service sign-up page is the most attacked surface a tool like this has. A public site
+already lets anyone screen and start alert lists; an account adds a workspace of their own, so
+it is open by default.
+
+**What a stranger's account may send.** An account made by signing up (its organisation is
+`self_made`) is not vouched for by whoever runs the site, whose name is on every email, so
+`app.vouched` holds what it sends to people who asked for it: addresses it puts on an alert list
+are asked to confirm (`consent`), except its own once confirmed; portfolio emails and notice
+copies go only from a confirmed address, to its own organisation's confirmed members; its
+notices are never sent to an officer by the site (`OWN_MAILBOX`); invitations need a confirmed
+address and are limited per organisation per day; and the site takes `SIGNUPS_PER_DAY` new
+accounts a day, with `VERIFY_EMAILS_PER_DAY` confirmation links per address (`accounts.py`).
+An account in a workspace a key opens, or made by the operator or an invitation into one of
+theirs, is vouched for, as before.
 
 **The first account.** Either list your own address in `FOCI_SIGNUP` and sign up, or, with
 the site's `DATABASE_URL` set locally:

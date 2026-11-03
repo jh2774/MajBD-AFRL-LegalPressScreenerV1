@@ -277,7 +277,11 @@ CREATE TABLE IF NOT EXISTS mail_suppressions (
 CREATE TABLE IF NOT EXISTS organisations (
     tenant_id    TEXT PRIMARY KEY,
     name         TEXT NOT NULL,
-    created_at   TEXT NOT NULL
+    created_at   TEXT NOT NULL,
+    -- 1 when someone made it for themselves by signing up, rather than the
+    -- site's operator (a key, the command line) or an invitation into one of
+    -- theirs. What such a workspace sends is held to people who asked for it.
+    self_made    INTEGER NOT NULL DEFAULT 0
 );
 -- Sign-in accounts (accounts.py). Not tenant-scoped: an account is what
 -- selects the tenant. Each belongs to exactly one organisation, and holds the
@@ -546,6 +550,7 @@ COLUMN_ADDITIONS = [
     ("contracts", "prime_recipient_name", "TEXT"),
     ("alert_recipients", "restorable", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "portfolio_id", "TEXT"),
+    ("organisations", "self_made", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -1659,11 +1664,12 @@ class Store:
 
     def create_user(self, *, email: str, password_hash: str, tenant_id: str,
                     role: str = "owner", organisation: str = "",
-                    verified: bool = False) -> dict:
+                    verified: bool = False, self_made: bool = False) -> dict:
         """Returns the new account. Raises ValueError if the address is taken.
 
         The organisation is created with the account when it does not exist
-        yet, named `organisation` (or after the address's domain).
+        yet, named `organisation` (or after the address's domain); `self_made`
+        records that it came from a sign-up.
         """
         if self.user_by_email(email):
             raise ValueError("An account with that email address already exists.")
@@ -1671,10 +1677,10 @@ class Store:
         now = _now()
         with self._tx() as c:
             if self.organisation(tenant_id) is None:
-                c.execute("INSERT INTO organisations (tenant_id, name, created_at)"
-                          " VALUES (?,?,?) ON CONFLICT (tenant_id) DO NOTHING",
+                c.execute("INSERT INTO organisations (tenant_id, name, created_at,"
+                          " self_made) VALUES (?,?,?,?) ON CONFLICT (tenant_id) DO NOTHING",
                           (tenant_id, organisation.strip()
-                           or email.rsplit("@", 1)[-1], now))
+                           or email.rsplit("@", 1)[-1], now, 1 if self_made else 0))
             c.execute("INSERT INTO users (user_id, email, password_hash, tenant_id, role,"
                       " created_at, email_verified_at) VALUES (?,?,?,?,?,?,?)",
                       (user_id, email, password_hash, tenant_id, role, now,
@@ -1734,6 +1740,24 @@ class Store:
             c.execute("UPDATE account_tokens SET used_at=? WHERE token_hash=?"
                       " AND used_at IS NULL", (_now(), token_hash))
             return c.rowcount() == 1
+
+    def account_tokens_since(self, purpose: str, when: str, *, email: str = "",
+                             tenant_id: str = "") -> int:
+        """Links of one kind made since `when` — for one address, one
+        organisation, or the whole site."""
+        sql, args = "SELECT COUNT(*) AS n FROM account_tokens WHERE purpose=? AND" \
+                    " created_at >= ?", [purpose, when]
+        if email:
+            sql += " AND email=?"
+            args.append(email)
+        if tenant_id:
+            sql += " AND tenant_id=?"
+            args.append(tenant_id)
+        return int((self._one(sql, tuple(args)) or {}).get("n") or 0)
+
+    def users_created_since(self, when: str) -> int:
+        return int((self._one("SELECT COUNT(*) AS n FROM users WHERE created_at >= ?",
+                              (when,)) or {}).get("n") or 0)
 
     def last_account_token(self, email: str, purpose: str) -> dict | None:
         return self._one("SELECT * FROM account_tokens WHERE email=? AND purpose=?"
@@ -2493,6 +2517,31 @@ class Store:
     def all_active_watchlists(self) -> list[dict]:
         """Every tenant's active watchlists — for the scheduler, not the API."""
         return self._query("SELECT * FROM watchlists WHERE active=1 ORDER BY tenant_id")
+
+    def watchlists_due(self, before: str) -> list[dict]:
+        """Every tenant's active watchlists not run since `before`, oldest
+        first — for the daily sweep, which covers every workspace."""
+        return self._query(
+            "SELECT * FROM watchlists WHERE active=1 AND (last_run_at IS NULL OR"
+            " last_run_at < ?) ORDER BY last_run_at IS NOT NULL, last_run_at, watchlist_id",
+            (before,))
+
+    def claim_watchlist_run(self, watchlist_id: str, before: str) -> bool:
+        """Mark a watchlist as run now, unless something ran it since `before`:
+        two sweeps at once must not screen the same list twice."""
+        with self._tx() as c:
+            c.execute("UPDATE watchlists SET last_run_at=? WHERE watchlist_id=? AND"
+                      " (last_run_at IS NULL OR last_run_at < ?)",
+                      (_now(), watchlist_id, before))
+            return c.rowcount() == 1
+
+    def alert_workspaces_due(self, before: str) -> list[str]:
+        """Workspaces with an active alert list not checked since `before`."""
+        rows = self._query(
+            "SELECT tenant_id, MIN(COALESCE(last_run_at, '')) AS oldest FROM"
+            " alert_subscriptions WHERE active=1 AND (last_run_at IS NULL OR"
+            " last_run_at < ?) GROUP BY tenant_id ORDER BY oldest, tenant_id", (before,))
+        return [r["tenant_id"] for r in rows]
 
     def set_watchlist_active(self, watchlist_id: str, active: bool) -> bool:
         if self._one("SELECT watchlist_id FROM watchlists WHERE watchlist_id=?"

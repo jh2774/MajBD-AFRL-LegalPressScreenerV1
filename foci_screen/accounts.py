@@ -23,10 +23,15 @@ Choices worth knowing:
   * **Guessing** is slowed per account: ten wrong passwords lock it for
     fifteen minutes. An unknown address costs the same time as a known one,
     so the sign-in form does not reveal who has an account.
-  * **Who may sign up** is a setting (`FOCI_SIGNUP`), closed by default.
-    The auth module's own note applies: a self-service credential endpoint
-    is the most attacked surface a tool like this has, and a deployment
-    should not take sign-ups from whoever finds it first.
+  * **Who may sign up** is a setting (`FOCI_SIGNUP`). A public site
+    (FOCI_PUBLIC) takes them from anyone unless it says `closed`: anyone may
+    already use it, and an account only adds a workspace of their own. A
+    site that needs a key is closed unless it says otherwise — the auth
+    module's note applies there: a deployment kept private should not take
+    sign-ups from whoever finds it first.
+  * **A stranger's account is not a way to email strangers.** Accounts made
+    by signing up are not vouched for by whoever runs the site, so what they
+    send is held to the people who asked for it (see `app._vouched`).
 """
 from __future__ import annotations
 
@@ -122,8 +127,32 @@ def new_tenant_id() -> str:
     return "u-" + secrets.token_hex(6)
 
 
+# FOCI_SIGNUP values that close sign-ups even on a public site.
+CLOSED_WORDS = ("closed", "none", "off", "no", "false")
+# New accounts the whole site takes in a day (UTC) from sign-ups without a key.
+# Each is sent a confirmation email, and the mail service's allowance is the
+# site's: a burst of sign-ups must not use up the day's alerts.
+SIGNUPS_PER_DAY = 50
+# Confirmation emails one address is sent in a day, however often it asks.
+VERIFY_EMAILS_PER_DAY = 3
+# Invitations one organisation not vouched for by the site may send in a day.
+INVITES_PER_DAY = 10
+
+
+def signup_setting(raw: str, public: bool) -> str:
+    """FOCI_SIGNUP as it applies: "open", a list of addresses and domains, or
+    "" for closed. Unset on a public site means open."""
+    setting = (raw or "").strip().lower()
+    if setting in CLOSED_WORDS:
+        return ""
+    if not setting and public:
+        return "open"
+    return setting
+
+
 def signup_allowed(setting: str, email: str) -> bool:
-    """Whether `email` may create an account under FOCI_SIGNUP."""
+    """Whether `email` may create an account under FOCI_SIGNUP (as applied by
+    `signup_setting`)."""
     setting = (setting or "").strip().lower()
     if not setting:
         return False

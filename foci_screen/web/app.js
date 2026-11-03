@@ -140,13 +140,14 @@ function setAccountMode(mode) {
   const sw = document.getElementById("account-switch");
   sw.textContent = creating || forgot ? "Back to sign in" : "Create an account";
   // Always offered. Where the site takes no sign-ups, the form says how in:
-  // an invitation, or — for whoever looks after the site — the admin key.
+  // an invitation, or — for whoever looks after the site — the admin key, which
+  // then has a box of its own. Elsewhere nobody needs one.
   sw.hidden = false;
   const first = authStatus && authStatus.accounts === false;
-  document.getElementById("account-key-row").hidden = !creating || !authStatus || !authStatus.keys;
+  document.getElementById("account-key-row").hidden =
+    !creating || signup !== "closed" || !authStatus || !authStatus.keys;
   document.getElementById("account-key").value = apiKey;
-  document.getElementById("account-key-label").textContent =
-    signup === "closed" ? "Admin key" : "Admin key (optional)";
+  document.getElementById("account-key-label").textContent = "Admin key";
   document.getElementById("account-explain").textContent = forgot
     ? "Enter the address you sign in with. If it has an account, we will email it a "
       + "link to choose a new password."
@@ -157,12 +158,18 @@ function setAccountMode(mode) {
              : "This site does not take sign-ups. Ask its owner to invite you — they do "
                + "it under Organisation and people. If you look after the site, the admin "
                + "key makes an owner of this site's workspace.")
+    : creating && apiKey
+    ? "With the admin key entered in this browser, the account joins this site's own "
+      + "workspace — what has been screened here — as its owner, and you can invite "
+      + "colleagues to it."
     : creating
     ? (signup === "restricted"
         ? "This site takes new accounts only for addresses its administrator has listed. "
         : "")
-      + "A new account starts a workspace of its own. With the site's admin key, it "
-      + "joins this site's workspace as its owner instead."
+      + "Your account gets a workspace of its own, with everything the site does: "
+      + "screens, portfolios, notices, watchlists, screening settings and email alerts. "
+      + "We will email you a link to confirm your address; until you use it, portfolios, "
+      + "notices and invitations cannot be emailed from your account."
     : signup === "closed"
       ? "Accounts on this site are made by invitation. Your account has its own "
         + "workspace: your portfolio, screens, notices, watchlists, screening settings "
@@ -183,6 +190,9 @@ function openAccountDialog() {
     document.getElementById("account-org-name").textContent = account.organisation;
     document.getElementById("account-role").textContent = `(${account.role})`;
     document.getElementById("account-unverified").hidden = account.email_verified;
+    document.getElementById("account-unverified-more").textContent = account.vouched ? ""
+      : " Nor can a portfolio, a notice or an invitation be emailed from this account.";
+    document.getElementById("account-limits").hidden = account.vouched;
     document.getElementById("account-resend-status").textContent = "";
     document.getElementById("account-password-error").hidden = true;
   } else {
@@ -256,7 +266,9 @@ function wireAccountDialog() {
         password: password.value,
         ...(accountMode === "signup"
           ? { organisation: document.getElementById("account-org").value.trim() } : {}),
-      }, accountMode === "signup" ? document.getElementById("account-key").value.trim() : "");
+      }, accountMode !== "signup" ? ""
+        : document.getElementById("account-key-row").hidden ? apiKey
+          : document.getElementById("account-key").value.trim());
       password.value = "";
       await refreshAccount();
       await adoptBrowserPortfolio();
@@ -2864,9 +2876,12 @@ function rememberedCopyTo() {
 function sendChoice(n, d, approving) {
   const sending = d.sending || {};
   const name = `send-${n.notice_id}-${approving ? "approve" : "later"}`;
+  const own = sending.mode === "own_mailbox";
   const officerWhy = !n.recipient ? "no contracting officer was resolved"
     : sending.mode === "render_only" ? "not switched on for this site (NOTICES_SEND)"
-      : !approving && n.status !== "approved" ? "already sent to the officer" : "";
+      : own ? "this site emails officials only for its own workspace; send yourself a "
+              + "copy and forward it from your own mailbox"
+        : !approving && n.status !== "approved" ? "already sent to the officer" : "";
   const copyWhy = sending.copies ? "" : "no mail service is connected";
   const pick = !officerWhy ? "officer" : !copyWhy ? "copy" : approving ? "none" : "";
   const opt = (value, label, why) => `<label class="check" style="display:block;margin:3px 0">
@@ -2877,11 +2892,13 @@ function sendChoice(n, d, approving) {
       <div class="decide-prompt">${approving ? "Once approved, send it to" : "Send it to"}</div>
       ${opt("officer", `the contracting officer${n.recipient
         ? ` · <span class="mono">${esc(n.recipient)}</span>` : ""}`, officerWhy)}
-      ${opt("copy", "an address I choose", copyWhy)}
+      ${opt("copy", own ? "me, or a colleague in my organisation" : "an address I choose",
+            copyWhy)}
       ${opt("both", "both", officerWhy || copyWhy)}
       ${approving ? opt("none", "nobody yet — I will send it later", "") : ""}
       <input type="email" class="copy-to" placeholder="you@example.com" autocomplete="email"
-        value="${esc(rememberedCopyTo())}" style="margin-top:6px;width:100%;max-width:340px"
+        value="${esc(rememberedCopyTo() || (account ? account.email : ""))}"
+        style="margin-top:6px;width:100%;max-width:340px"
         ${["copy", "both"].includes(pick) ? "" : "hidden"}>
       ${!officerWhy && !d.reply_to ? `<div class="muted" style="font-size:12px;margin-top:6px">
         Replies from the officer will go to the address this site sends from, which nobody
@@ -3321,7 +3338,9 @@ async function alertsCard(key, portfolioName) {
         <textarea id="alert-emails" rows="2" style="width:100%;margin-top:4px"
           placeholder="name@agency.gov, colleague@example.com">${esc(list && editable ? list.emails.join(", ") : "")}</textarea>
       </label>
-      ${!editable ? `<p class="muted" style="font-size:12.5px">Each new address is first
+      ${!editable || (account && !account.vouched) ? `<p class="muted"
+        style="font-size:12.5px">Each new address${account && !account.vouched
+          ? ", apart from your own once you have confirmed it," : ""} is first
         sent an email asking it to confirm. Nothing else is sent to it until it does, and
         every alert ends with a link to unsubscribe.</p>` : ""}
       ${list && (list.opted_out || []).length ? `<p class="muted" style="font-size:12.5px">
@@ -3841,7 +3860,11 @@ function emailCard() {
     <h2>Email this portfolio</h2>
     <p class="muted" style="font-size:12.5px">Sends the companies, the latest severity of
       each, a link that opens this portfolio, and its key. To someone else it says it came
-      from you, and their replies come to you. Up to 10 addresses at a time.</p>
+      from you, and their replies come to you. Up to 10 addresses at a time.${account.vouched
+        ? "" : ` From an account made by signing up it goes to you, and to colleagues in
+        your organisation who have confirmed their address${account.email_verified ? ""
+          : " — once you have confirmed yours"}. To share it with anyone else, copy the
+        key below and send it yourself.`}</p>
     <label class="field" style="display:block">To
       <input id="pf-mail-to" type="text" value="${esc(account.email)}" autocomplete="email"
         style="width:100%;margin-top:4px"></label>
