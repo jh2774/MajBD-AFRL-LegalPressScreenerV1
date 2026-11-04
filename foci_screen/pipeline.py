@@ -181,6 +181,8 @@ class Screener:
                          f"since the last screen.")
             finding = self._screen_entity(entity, ent_contracts, run_id, opts,
                                           progress, record_changes)
+            # Screened, finding or not: screening it again is a second look.
+            self.store.mark_entity_screened(entity.key())
             if finding:
                 # Saved here rather than after the loop. A screen takes minutes
                 # and, where there is no queue, runs inside a web process that

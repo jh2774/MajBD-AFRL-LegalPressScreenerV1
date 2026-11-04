@@ -1,7 +1,7 @@
 # Re-screen every active watchlist on the deployed site, in every workspace —
-# the site's own and each account's — at the site's screening times: 9 am,
-# 1 pm and 5 pm Eastern unless FOCI_SCREEN_TIMES and FOCI_TIMEZONE in Vercel
-# say otherwise. This asks every hour; outside those times the site answers
+# the site's own and each account's — at the site's screening times:
+# midnight and noon Eastern unless FOCI_SCREEN_TIMES and FOCI_TIMEZONE in
+# Vercel say otherwise. This asks every hour; outside those times the site answers
 # "not a screening time" and nothing runs, so the times are set in one place
 # and daylight saving takes care of itself.
 #

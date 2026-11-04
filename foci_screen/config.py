@@ -267,7 +267,7 @@ class Config:
     # When scheduled screens run: the hour after each of these times, in
     # FOCI_TIMEZONE. "any" for whenever the schedule asks (screen_times.py).
     screen_times: str = field(default_factory=lambda: _env(
-        "FOCI_SCREEN_TIMES", "09:00,13:00,17:00"))
+        "FOCI_SCREEN_TIMES", "00:00,12:00"))
     timezone: str = field(default_factory=lambda: _env("FOCI_TIMEZONE", "America/New_York"))
 
     def ensure_dirs(self) -> None:

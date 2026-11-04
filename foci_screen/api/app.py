@@ -177,6 +177,17 @@ async def vouched(request: Request, authorization: str = Header(default=""),
     what they send goes to their own organisation's confirmed addresses, and
     to people who agree to it.
     """
+    return _request_vouched(request, authorization, x_api_key)
+
+
+def _request_vouched(request: Request, authorization: str | None = None,
+                     x_api_key: str | None = None) -> bool:
+    """`vouched`, for a request in hand: the site's admin key, or an account
+    the site stands behind — what this site means by an admin."""
+    if authorization is None:
+        authorization = request.headers.get("authorization", "")
+    if x_api_key is None:
+        x_api_key = request.headers.get("x-api-key", "")
     presented = _key_presented(authorization, x_api_key)
     if presented and auth.resolve_tenant(keymap, presented):
         return True
@@ -587,7 +598,11 @@ def auth_status(request: Request) -> dict:
             # Whether anyone has an account yet, so the sign-up form can say how
             # the first is made.
             "accounts": _accounts_exist(),
-            "keys": bool(keymap), "public": cfg.public}
+            "keys": bool(keymap), "public": cfg.public,
+            # Whether a screen asked for now starts now, and if not, when.
+            "screening": {**{k: v for k, v in _screening_now().items()
+                             if k in ("open", "next", "times")},
+                          "instant": _run_later(request) is None}}
 
 
 def _accounts_exist() -> bool:
@@ -1219,15 +1234,48 @@ def configuration(tenant: str = Depends(require_tenant),
 
 # ---------------------------------------------------------------- screens
 
+def _run_later(request: Request, first: bool = False) -> dict | None:
+    """None when a screen asked for now may start now; otherwise when it will
+    start, for the reply.
+
+    A first screen — a firm, an agency or a watchlist never screened here —
+    starts now, whoever asks. Screening again is the routine's job, at the
+    screening times (FOCI_SCREEN_TIMES), except that an admin
+    (`_request_vouched`) can have it done at any time."""
+    window = _screening_now()
+    if first or window["open"] or _request_vouched(request):
+        return None
+    return {"status": "scheduled", "next": window["next"], "times": window["times"]}
+
+
+def _first_screen(store: Store, body: ScreenRequest) -> bool:
+    """Whether a screen is the first of its subject here: a contractor never
+    screened, an agency or office with nothing read yet."""
+    if body.recipient:
+        return not store.screened_before(store.resolve_entity_key(body.recipient))
+    if body.scope:
+        return not store.scope_index_rows(body.scope)
+    column, value = (("sub_agency", body.sub_agency) if body.sub_agency
+                     else ("agency", body.agency))
+    return not store.contracts_where(column, value, 1)
+
+
 @app.post("/v1/screens", status_code=202, tags=["screens"])
 def create_screen(body: ScreenRequest, request: Request,
                   tenant: str = Depends(require_tenant)) -> dict:
+    """Start a screen. An admin's starts at once; anyone else's at once during
+    a screening time, and otherwise waits for the next (`scheduled`)."""
     store = store_for(tenant)
     options = body.model_dump()
     # The run row's subject is what identifies it in the history and in the
     # page heading. A recipient screen has no agency, and labelling it with a
     # blank would leave a run nobody can tell apart from the next one.
     subject = body.recipient or body.agency
+    later = _run_later(request, first=_first_screen(store, body))
+    if later:
+        run_id = store.start_run(subject, options, status="scheduled")
+        _remember(request, "screen", run_id, subject)
+        return {"run_id": run_id, **later}
     run_id = store.start_run(subject, options, status="queued")
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
     _remember(request, "screen", run_id, subject)
@@ -1356,6 +1404,9 @@ def get_screen(run_id: str, store: Store = Depends(tenant_store)) -> dict:
         "stats": _json(run["stats"]),
         "error": run["error"] or None,
     }
+    if run["status"] == "scheduled":
+        window = _screening_now()
+        payload["screening"] = {"next": window.get("next"), "times": window["times"]}
     if run["status"] == "complete":
         payload["findings"] = store.findings_for_run(run_id)
     return payload
@@ -1720,10 +1771,11 @@ def watch_scope(body: ScopeWatch, request: Request,
         if not watch["active"]:
             store.set_watchlist_active(watchlist_id, True)
     store.set_watchlist_backlog(watchlist_id, True)
-    # At a screening time its first run starts now; otherwise at the next one.
-    window = _screening_now()
-    started = (run_watchlist(watchlist_id, request, tenant) if window["open"]
-               else {"status": "waiting", "next": window["next"]})
+    # A new watch's first run starts now. Asked for again, it runs now at a
+    # screening time or for an admin; otherwise its backlog brings it round.
+    later = _run_later(request, first=watch is None)
+    started = (run_watchlist(watchlist_id, request, tenant) if later is None
+               else {"status": "waiting", "next": later["next"]})
 
     key = portfolio_keys.encode(portfolio_keys.from_scope(scope))
     user = session_user(request)
@@ -2445,6 +2497,19 @@ def scheduled_watchlist(request: Request, _tenant: str = Depends(require_tenant)
             "catch_up_before": _hours_ago(CATCH_UP_MINUTES / 60), "today": _today()[:10],
             "runs_per_day": _screening_now()["runs_allowed"]}
 
+    def left() -> int:
+        before, catch_up = due_now()
+        return len(site.runs_scheduled()) + len(site.watchlists_due(before, **catch_up))
+
+    # Screens people asked for since the last screening time go first.
+    for row in site.runs_scheduled():
+        if not site.claim_scheduled_run(row["run_id"]):
+            continue
+        store = store_for(row["tenant_id"])
+        status = _start_queued(store, row["tenant_id"], row["run_id"],
+                               _json(row["params"]), request)
+        return {"status": status, "left": left()}
+
     before, catch_up = due_now()
     for row in site.watchlists_due(before, **catch_up):
         if not site.claim_watchlist_run(row["watchlist_id"], before, **catch_up):
@@ -2454,19 +2519,24 @@ def scheduled_watchlist(request: Request, _tenant: str = Depends(require_tenant)
         options = {**_json(row["params"]), "watchlist_id": row["watchlist_id"]}
         run_id = store.start_run(options.get("agency", ""), options, status="queued")
         store.mark_watchlist_run(row["watchlist_id"], run_id)
-        if queue.backend != "request":
-            queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
-            status = "queued"
-        elif not store.claim_run(run_id):
-            status = "already running"
-        else:
-            from .. import jobs as jobs_mod
-            jobs_mod.run_screen_job(tenant, run_id, options, limit_seconds=cfg.screen_seconds)
-            status = (store.get_run(run_id) or {}).get("status", "")
+        status = _start_queued(store, tenant, run_id, options, request)
         # Counted after the run: one still catching up may be due again.
-        before, catch_up = due_now()
-        return {"status": status, "left": len(site.watchlists_due(before, **catch_up))}
+        return {"status": status, "left": left()}
     return {"status": "nothing due", "left": 0}
+
+
+def _start_queued(store: Store, tenant: str, run_id: str, options: dict,
+                  request: Request) -> str:
+    """Start a queued run from the sweep: in this request where screens run
+    inside requests (Vercel), on the queue elsewhere."""
+    if queue.backend != "request":
+        queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
+        return "queued"
+    if not store.claim_run(run_id):
+        return "already running"
+    from .. import jobs as jobs_mod
+    jobs_mod.run_screen_job(tenant, run_id, options, limit_seconds=cfg.screen_seconds)
+    return (store.get_run(run_id) or {}).get("status", "")
 
 
 @app.post("/v1/alerts/subscriptions/{subscription_id}/test", tags=["alerts"])
@@ -3295,8 +3365,12 @@ def run_watchlist(watchlist_id: str, request: Request,
     if not rows:
         raise HTTPException(404, "No such watchlist.")
     options = {**_json(rows[0]["params"]), "watchlist_id": watchlist_id}
-    run_id = store.start_run(options.get("agency", ""), options, status="queued")
+    later = _run_later(request, first=not rows[0].get("last_run_at"))
+    run_id = store.start_run(options.get("agency", ""), options,
+                             status="scheduled" if later else "queued")
     store.mark_watchlist_run(watchlist_id, run_id)
+    if later:
+        return {"run_id": run_id, **later}
     queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
     return {"run_id": run_id, "status": "queued", **_execute_link(run_id)}
 

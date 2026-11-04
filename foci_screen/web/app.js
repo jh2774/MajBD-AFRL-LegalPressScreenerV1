@@ -1401,6 +1401,17 @@ function screenThisFirm(q) {
     </div>`;
 }
 
+/* A first screen runs at once. Running one again is the routine's job, at the
+ * screening times — an admin can do it whenever they like. Said where "Run
+ * now" is, for anyone it would make wait. */
+function rerunNote() {
+  const s = authStatus && authStatus.screening;
+  if (!s || s.instant || !s.next) return "";
+  return `<p class="muted" style="font-size:12.5px">A watchlist's first run starts at once.
+    After that it re-runs at ${esc(s.times)}; "Run now" on one that has run before starts at
+    the next of those, ${esc(s.next)}, unless an admin presses it.</p>`;
+}
+
 function wireScreenFirm(q) {
   const button = document.getElementById("screen-firm");
   if (!button) return;
@@ -1413,7 +1424,11 @@ function wireScreenFirm(q) {
         recipient: q, months_back: 12, max_awards: 25, max_entities: 3,
       });
       runScreenInRequest(d);
-      status.innerHTML = `Screening started (run <span class="mono">${esc(d.run_id)}</span>).
+      status.innerHTML = d.status === "scheduled"
+        ? `Screens run at ${esc(d.times)}; this one will start at ${esc(d.next)}.
+           <a href="#/screens/${encodeURIComponent(d.run_id)}">Its page</a> shows when it
+           has.`
+        : `Screening started (run <span class="mono">${esc(d.run_id)}</span>).
         This takes minutes — the contractor appears in search once it finishes.
         ${d.execute ? `Keep this page open until it ends; it stops after
           ${num(Math.round(d.time_limit_seconds / 60))} minutes at most.` : ""}
@@ -1523,6 +1538,7 @@ async function viewScreen(runId) {
   if (screenPollTimer) clearTimeout(screenPollTimer);
   const d = await api(`/v1/screens/${encodeURIComponent(runId)}`);
   const running = d.status === "running" || d.status === "queued";
+  const waiting = d.status === "scheduled";
   const stats = d.stats || {};
 
   view.innerHTML = `
@@ -1533,7 +1549,10 @@ async function viewScreen(runId) {
     </div>
 
     <div class="card">
-      <h2>${esc(d.status || "unknown")}</h2>
+      <h2>${waiting ? "Waiting for the next screening time" : esc(d.status || "unknown")}</h2>
+      ${waiting && d.screening ? `<p class="muted">Screens run at ${esc(d.screening.times)}.
+        This one starts at ${esc(d.screening.next)}; this page will show it running then.</p>`
+        : ""}
       ${running
         ? `<p class="muted">Running. This page refreshes itself; a screen
            usually takes a few minutes.</p>
@@ -1541,7 +1560,8 @@ async function viewScreen(runId) {
         : ""}
       ${d.error ? `<div class="error"><strong>${esc(d.status)}</strong>
         <div class="muted" style="margin-top:6px">${esc(d.error)}</div></div>` : ""}
-      ${!running && !d.error ? `<p class="muted">Finished ${day(d.finished_at)}.</p>` : ""}
+      ${!running && !waiting && !d.error
+        ? `<p class="muted">Finished ${day(d.finished_at)}.</p>` : ""}
     </div>
 
     ${Object.keys(stats).length ? `
@@ -1559,7 +1579,7 @@ async function viewScreen(runId) {
         ${stats.notes.map((n) => `<li>${esc(n)}</li>`).join("")}</ul>
     </div>` : ""}
 
-    ${!running ? `
+    ${!running && !waiting ? `
     <div class="card">
       <h2>Remove this screen</h2>
       <p class="muted">Everything this run put on the dashboard — its awards,
@@ -1577,6 +1597,7 @@ async function viewScreen(runId) {
 
   wireScreenRemove(runId);
   if (running) screenPollTimer = setTimeout(() => viewScreen(runId), 5000);
+  else if (waiting) screenPollTimer = setTimeout(() => viewScreen(runId), 60000);
 }
 
 /* Two steps on purpose: the first shows what would go, the second does it.
@@ -4787,10 +4808,11 @@ async function viewWatchlists(notes) {
   view.innerHTML = `
     <div class="page-head">
       <h1>Watchlists</h1>
-      <div class="sub">Screens that re-run on the nightly sweep. Each can raise
+      <div class="sub">Screens that re-run at the day's screening times. Each can raise
         notices on its own terms; anything it does not set follows the
         <a href="#/screening">Screening</a> page.</div>
     </div>
+    ${rerunNote()}
 
     ${policyNotes(notes)}
 

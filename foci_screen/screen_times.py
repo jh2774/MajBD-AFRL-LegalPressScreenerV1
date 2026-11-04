@@ -1,7 +1,7 @@
 """When scheduled screens run: a few set times a day, in the site's own time.
 
 Watchlists re-screen, and a watch on a whole office catches up, only in the
-hour after each time in FOCI_SCREEN_TIMES ("09:00,13:00,17:00" by default),
+hour after each time in FOCI_SCREEN_TIMES (midnight and noon by default),
 in FOCI_TIMEZONE (US Eastern by default). The daily workflow asks every hour;
 outside those hours the site says so and does nothing. A screen a person asks
 for — "Screen", "Run now" — still runs when they ask.
@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 from datetime import datetime, timedelta, timezone
 
-DEFAULT_TIMES = "09:00,13:00,17:00"
+DEFAULT_TIMES = "00:00,12:00"
 DEFAULT_ZONE = "America/New_York"
 # Screens run from each time until this many minutes after it.
 WINDOW_MINUTES = 59
@@ -45,7 +45,7 @@ class ScreenTimesError(ValueError):
 
 
 def parse_times(raw: str | None) -> list[tuple[int, int]] | None:
-    """[(9, 0), (13, 0), (17, 0)] from "09:00,13:00,17:00" — or "9am, 1pm, 5pm".
+    """[(0, 0), (12, 0)] from "00:00,12:00" — or "12am, 12pm", or "9am, 1pm, 5pm".
     None when screens may run at any time ("any")."""
     text = (DEFAULT_TIMES if raw is None else raw).strip().lower()
     if text in ALWAYS:
@@ -140,7 +140,7 @@ def clock(hour: int, minute: int) -> str:
 
 
 def describe(times: list[tuple[int, int]] | None, zone: str | None) -> str:
-    """"9:00 am, 1:00 pm and 5:00 pm Eastern time"."""
+    """"12:00 am and 12:00 pm Eastern time"."""
     if times is None:
         return "any time"
     words = [clock(h, m) for h, m in times]

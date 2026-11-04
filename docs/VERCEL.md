@@ -174,15 +174,21 @@ leave it set to the admin key.
 To try it: **Actions** → **Daily alerts** → **Run workflow**.
 
 The same setting also drives **Scheduled screens**, which re-screens each active watchlist on
-the Watchlists page, one at a time, at the site's **screening times**: 9 am, 1 pm and 5 pm
+the Watchlists page, one at a time, at the site's **screening times**: midnight and noon
 Eastern unless you say otherwise. It asks every hour; outside the hour after each screening
 time the site answers "not a screening time" and nothing runs. Each watchlist is screened
 once a day, at the first screening time it is due; a whole office still catching up uses a
 share of its daily runs at each one. Change the times with `FOCI_SCREEN_TIMES` in Vercel
 (for example `08:00,12:00,16:00`, or `any` for no restriction) and the time zone with
 `FOCI_TIMEZONE` (`America/New_York`, `America/Chicago`, `America/Denver`,
-`America/Los_Angeles`). A screen someone starts themselves — **Screen** or **Run now** —
-still runs straight away.
+`America/Los_Angeles`).
+
+**A first screen runs at once; screening again is the routine's.** The first time a firm is
+screened here — or an agency, or a watchlist's first run, or a new **Watch every contractor**
+— it starts straight away, whoever asks. Screening something again, outside the screening
+times, waits for the next one (its page says when), except for an **admin**: whoever holds
+the admin key, or is signed in to an account in the site's own workspace or one you invited
+them to. An admin's **Run now** or **Screen** starts at once, at any time.
 Nothing on Vercel runs in the background, so without it a watchlist runs only when someone
 presses **Run now**. Each screen stops after four minutes and keeps what it finished.
 
@@ -366,8 +372,9 @@ AFWERX is its two contracting offices, FA8649 (the Air Force SBIR/STTR office) a
 contractor's screen reads several registries. The watch runs with **Scheduled screens** at
 each screening time (section 6) and, while it has work left, again every few minutes after
 each run, up to **12 runs a day** shared across the screening times — each up to 4 minutes on
-Vercel, up to 10 contractors a run. Started outside a screening time, its first run waits for
-the next one. Change the number with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's
+Vercel, up to 10 contractors a run. Its first run starts as soon as it is set up; after that
+the screening times carry it on, and an admin can push another run at any time by pressing
+**Watch every contractor** again or **Run now** on its watchlist. Change the number with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's
 free-plan hours, so keep it modest there. The portfolio shows how far it has got.
 
 DoD publishes its contract actions about **90 days late**, so the four most recent months are

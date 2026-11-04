@@ -1011,6 +1011,22 @@ class Store:
                       (_now(), note, *params))
         return len(stuck)
 
+    # Screens asked for outside the screening times by someone who is not an
+    # admin: kept as `scheduled` until the next one (api: _run_later).
+    def runs_scheduled(self) -> list[dict]:
+        """Every tenant's screens waiting for a screening time, oldest first."""
+        return self._query("SELECT run_id, tenant_id, agency, params FROM runs WHERE"
+                           " status='scheduled' ORDER BY started_at, run_id")
+
+    def claim_scheduled_run(self, run_id: str) -> bool:
+        """Move a waiting screen to the queue, unless another sweep has. Its
+        start is now, not when it was asked for: a run that looked hours old
+        would be closed as abandoned while it ran."""
+        with self._tx() as c:
+            c.execute("UPDATE runs SET status='queued', started_at=? WHERE run_id=? AND"
+                      " status='scheduled'", (_now(), run_id))
+            return c.rowcount() == 1
+
     def claim_run(self, run_id: str) -> bool:
         """Move a queued run to running, unless something else already has.
 
@@ -2788,6 +2804,19 @@ class Store:
             c.execute("UPDATE scope_index SET next_start=0, done=0, awards=0 WHERE"
                       " tenant_id=? AND scope=? AND month=? AND query=?",
                       (self.tenant_id, scope_id, month, query))
+
+    def screened_before(self, entity_key: str) -> bool:
+        """Whether this contractor has had a full screen here: one recorded as
+        such, a finding, or a filing read for it. Awards read for a whole
+        office do not count — the firm has not been looked at yet."""
+        key = (entity_key or "").strip().upper()
+        if not key:
+            return False
+        for table in ("entity_screens", "findings", "entity_documents"):
+            if self._one(f"SELECT 1 AS found FROM {table} WHERE tenant_id=? AND"
+                         f" entity_key=? LIMIT 1", (self.tenant_id, key)):
+                return True
+        return False
 
     def mark_entity_screened(self, entity_key: str) -> None:
         with self._tx() as c:
