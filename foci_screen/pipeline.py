@@ -222,6 +222,9 @@ class Screener:
     RESCREEN_DAYS = 30
     AGENCY_PAGES = 20           # USAspending: an agency's 2,000 largest awards
     PAGES_PER_QUERY = 300       # a guard against a feed that never ends
+    # A run screens as many contractors as fit its time — about 30 in four
+    # minutes — up to this many, whatever its watch's `max_entities` says.
+    SCOPE_SCREEN_CAP = 100
 
     def _run_scope(self, opts: ScreenOptions, result: ScreenResult, progress,
                    run_id: str, owns_run: bool) -> ScreenResult:
@@ -241,7 +244,8 @@ class Screener:
         stale = (datetime.now(timezone.utc) - timedelta(days=self.RESCREEN_DAYS)) \
             .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
         screened = 0
-        for row in self.store.scope_candidates(scope, stale, opts.max_entities):
+        for row in self.store.scope_candidates(
+                scope, stale, max(opts.max_entities, self.SCOPE_SCREEN_CAP)):
             if time.monotonic() > stop_at - self.SCREEN_MARGIN:
                 break
             key = row["entity_key"]

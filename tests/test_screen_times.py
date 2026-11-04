@@ -181,6 +181,29 @@ def test_an_admin_screens_again_whenever_they_like(site):
     assert r["status"] == "queued" and len(started) == 1
 
 
+def test_the_page_hears_whether_its_key_is_the_admins(site):
+    c, app_module, started = site(EVENING)
+    nobody = c.get("/v1/auth/status").json()
+    assert nobody["key_accepted"] is None and nobody["screening"]["admin"] is False
+    admin = c.get("/v1/auth/status", headers=ADMIN).json()
+    assert admin["key_accepted"] is True and admin["screening"]["admin"] is True
+    wrong = c.get("/v1/auth/status", headers={"Authorization": "Bearer not-it"}).json()
+    assert wrong["key_accepted"] is False and wrong["screening"]["admin"] is False
+
+
+def test_the_page_keeps_the_key_it_is_given_and_asks_with_it():
+    """The key dialog's Save once did nothing (lost in a merge), so the site
+    never saw the key and nobody could act as an admin from the page."""
+    from pathlib import Path
+
+    import foci_screen
+    js = (Path(foci_screen.__file__).parent / "web" / "app.js").read_text(encoding="utf-8")
+    assert 'keyDialog.addEventListener("close"' in js
+    assert "localStorage.setItem(KEY_STORAGE, apiKey)" in js
+    status = js[js.index('fetch("/v1/auth/status"'):][:200]
+    assert "Authorization" in status
+
+
 def test_the_sites_own_accounts_are_admins_and_strangers_are_not(site):
     c, app_module, started = site(EVENING)
     screened_before(app_module)

@@ -14,7 +14,7 @@ record, can be searched by contracting office, so a scope is one of:
     awarding agency, with an optional sub-agency (USAspending).
 
 A watch on a scope collects its awards month by month, keeps every contractor
-in it, and screens them in turn, a few each run (`pipeline.Screener`). A
+in it, and screens them in turn, dozens each run (`pipeline.Screener`). A
 portfolio of a scope follows it: whoever the scope's awards name is in it.
 """
 from __future__ import annotations

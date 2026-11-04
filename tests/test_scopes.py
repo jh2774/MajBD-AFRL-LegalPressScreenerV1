@@ -188,6 +188,7 @@ def test_a_run_reads_every_award_and_screens_contractors_in_turn(tmp_path):
              ("FA8649", 10): [award("A3", "GAMMA", "UEI3", amount=100.0)],
              ("FA2280", 0): [award("A4", "DELTA", "UEI4", office="FA2280", amount=700.0)]}
     screener, store, asked = scope_screener(tmp_path, pages)
+    screener.SCOPE_SCREEN_CAP = 2           # time allowing, two a run
     opts = ScreenOptions(scope=AFWERX.id, months_back=1, max_entities=2, time_budget=600)
 
     first = screener.run(opts)
@@ -200,6 +201,36 @@ def test_a_run_reads_every_award_and_screens_contractors_in_turn(tmp_path):
     assert second.stats["backlog"] is False
     rows = {(r["month"], r["query"]): r for r in store.scope_index_rows(AFWERX.id)}
     assert all(r["done"] for r in rows.values())
+    store.close()
+
+
+def test_a_run_screens_as_many_as_its_time_allows(tmp_path):
+    """A watch made when runs screened ten keeps max_entities=10; its runs
+    screen as many as fit all the same."""
+    from foci_screen.pipeline import ScreenOptions
+    pages = {("FA8649", 0): [award(f"A{i}", f"CO{i}", f"UEI{i}") for i in range(10)],
+             ("FA8649", 10): [award(f"B{i}", f"CP{i}", f"VEI{i}") for i in range(10)]}
+    screener, store, asked = scope_screener(tmp_path, pages)
+    result = screener.run(ScreenOptions(scope=AFWERX.id, months_back=1, max_entities=10,
+                                        time_budget=600))
+    assert len(asked) == 20 and result.stats["backlog"] is False
+    store.close()
+
+
+def test_a_run_stops_screening_before_its_time_is_up(tmp_path, monkeypatch):
+    from foci_screen import pipeline
+    from foci_screen.pipeline import ScreenOptions
+    pages = {("FA8649", 0): [award(f"A{i}", f"CO{i}", f"UEI{i}") for i in range(10)]}
+    screener, store, asked = scope_screener(tmp_path, pages)
+    now = [0]                               # each contractor takes 20 seconds
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: now[0])
+    screen = screener._screen_entity
+    screener._screen_entity = lambda *a, **kw: now.__setitem__(0, now[0] + 20) or screen(*a)
+    result = screener.run(ScreenOptions(scope=AFWERX.id, months_back=1, max_entities=10,
+                                        time_budget=120))
+    # 120 seconds less the 45 kept in hand: those started by 75 seconds in.
+    assert len(asked) == 4, "the rest wait for the next run"
+    assert result.stats["backlog"] is True
     store.close()
 
 

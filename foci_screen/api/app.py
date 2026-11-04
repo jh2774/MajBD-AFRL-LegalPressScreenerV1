@@ -589,9 +589,12 @@ def _send_verification(request: Request, user: dict) -> dict:
 def auth_status(request: Request) -> dict:
     """Whether this browser is signed in, and whether accounts can be made.
 
-    No key needed: the sign-in page asks before anyone has signed in.
+    No key needed: the sign-in page asks before anyone has signed in. A page
+    holding the admin key sends it, and hears whether the site knows it.
     """
     user = session_user(request)
+    presented = _key_presented(request.headers.get("authorization", ""),
+                               request.headers.get("x-api-key", ""))
     return {"signed_in": user is not None,
             "account": _account(user) if user else None,
             "signup": accounts.signup_mode(_signup()),
@@ -599,10 +602,16 @@ def auth_status(request: Request) -> dict:
             # the first is made.
             "accounts": _accounts_exist(),
             "keys": bool(keymap), "public": cfg.public,
+            # None when no key was sent.
+            "key_accepted": (bool(auth.resolve_tenant(keymap, presented))
+                             if presented else None),
             # Whether a screen asked for now starts now, and if not, when.
             "screening": {**{k: v for k, v in _screening_now().items()
                              if k in ("open", "next", "times")},
-                          "instant": _run_later(request) is None}}
+                          "instant": _run_later(request) is None,
+                          # An admin can screen again at any time, and screen
+                          # a whole office now, run after run.
+                          "admin": _request_vouched(request)}}
 
 
 def _accounts_exist() -> bool:
@@ -1669,7 +1678,7 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
 # few at a time, a portfolio that is the office, and an alert list on it.
 
 SCOPE_PAGE = 100            # contractors a page, on a portfolio of a whole office
-SCOPE_PER_RUN = 10          # contractors screened per run of its watch
+SCOPE_PER_RUN = 100         # at most, per run of its watch; its time decides
 
 
 def _scope_or_400(text: str):
@@ -1749,7 +1758,7 @@ def watch_scope(body: ScopeWatch, request: Request,
                 trusted: bool = Depends(vouched)) -> dict:
     """Watch every contractor in an office or agency, in one step.
 
-    A watchlist reads its awards and screens its contractors, a few each run,
+    A watchlist reads its awards and screens its contractors, dozens each run,
     every day — several times a day until it has caught up — and its first run
     starts now. Its portfolio is the office: whoever its awards name. Given
     addresses, an alert list on that portfolio emails them when any of those

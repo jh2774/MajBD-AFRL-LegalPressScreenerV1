@@ -78,7 +78,9 @@ function notSignedIn() {
 
 async function refreshAccount() {
   try {
-    const res = await fetch("/v1/auth/status", { headers: CLIENT_HEADER });
+    const res = await fetch("/v1/auth/status", {
+      headers: { ...CLIENT_HEADER, ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
+    });
     if (!res.ok) return;
     authStatus = await res.json();
   } catch {
@@ -96,8 +98,14 @@ async function refreshAccount() {
   button.title = account ? `Your account: ${account.email}` : "Sign in or create an account";
   // A signed-in account needs no key, and on a site with no keys the button
   // could only ever be refused; either way it would only confuse.
-  document.getElementById("key-button").hidden =
-    !!account || (!authStatus.keys && !authStatus.public);
+  const keyButton = document.getElementById("key-button");
+  keyButton.hidden = !!account || (!authStatus.keys && !authStatus.public);
+  // Whether the key in this browser is one the site knows, said where it is set.
+  keyButton.textContent = !apiKey ? "API key"
+    : authStatus.key_accepted ? "Admin key ✓" : "Key not accepted";
+  keyButton.title = !apiKey ? "Enter the site's admin key"
+    : authStatus.key_accepted ? "This browser holds the site's admin key"
+    : "The site does not know the key saved in this browser";
 }
 
 /* `key`, when given, is the site's admin key: a new account made with it
@@ -3313,7 +3321,7 @@ function scopeProgressCard(d) {
       style="width:${pct}%;background:var(--accent)"></div></div>
     <p class="muted" style="font-size:12.5px;margin-top:10px">${watch
       ? `${watch.catching_up ? "Still catching up: its watch runs at each screening time, "
-                               + "reading awards and screening a few contractors each run."
+                               + "reading awards and screening dozens of contractors each run."
                              : "Caught up: its watch runs once a day for new awards and "
                                + "contractors, and screens each again every month."}
          ${s.screening && s.screening.next ? `Screens run at ${esc(s.screening.times)}; the
@@ -3323,7 +3331,89 @@ function scopeProgressCard(d) {
       : `Nobody is watching this office yet, so nothing new is read.
          <a href="#/scope/${encodeURIComponent(s.id)}">Start watching it</a>.`}
       Email alerts below go out when any of them is flagged.</p>
+    ${screenAllControls(watch, t.companies - t.screened_here)}
   </div>`;
+}
+
+/* An admin need not wait for the screening times: this runs the watch over
+ * and over, each run screening as many contractors as fit in it, until every
+ * one is done — for as long as this page stays open. */
+/* The loop in hand, if any: it carries on while the reader moves between
+ * pages, and the button and line on whichever page shows them follow it. */
+let screenAll = null;
+
+function screenAllControls(watch, left) {
+  const s = authStatus && authStatus.screening;
+  if (!watch || !s || !s.admin || left <= 0) return "";
+  return `<div class="actions"><button class="primary" id="screen-all"
+      data-watch="${esc(watch.watchlist_id)}">Screen all ${num(left)} now</button></div>
+    <p class="muted" id="screen-all-status" role="status" style="font-size:12.5px">For admins:
+      runs one batch after another — dozens of contractors every few minutes — until all
+      are screened. Keep this page open; stop at any time.</p>`;
+}
+
+function showScreenAll() {
+  const button = document.getElementById("screen-all");
+  const status = document.getElementById("screen-all-status");
+  if (!button || !screenAll || button.dataset.watch !== screenAll.watch) return;
+  button.textContent = !screenAll.running ? "Screen the rest now"
+    : screenAll.stop ? "Stopping after this batch…" : "Stop";
+  button.disabled = !!(screenAll.running && screenAll.stop);
+  button.hidden = !!screenAll.done;
+  if (status) status.textContent = screenAll.text;
+}
+
+function wireScreenAll(scopeId) {
+  const button = document.getElementById("screen-all");
+  if (!button) return;
+  showScreenAll();
+  button.onclick = async () => {
+    if (screenAll && screenAll.running) {
+      screenAll.stop = true;
+      showScreenAll();
+      return;
+    }
+    const run = { watch: button.dataset.watch, running: true, stop: false, done: false,
+                  text: "" };
+    screenAll = run;
+    const say = (text) => { run.text = text; showScreenAll(); };
+    let batch = 0;
+    try {
+      while (!run.stop) {
+        batch += 1;
+        say(`Batch ${batch}: screening…`);
+        const r = await apiPost(`/v1/watchlists/${encodeURIComponent(run.watch)}/run`, {});
+        if (r.status === "scheduled") {
+          say(`The site did not take this as an admin's run, so it waits for the next `
+            + `screening time, ${r.next}. Check the admin key at the top right.`);
+          break;
+        }
+        if (r.execute) await apiPost(r.execute, {}).catch(() => null);
+        else await waitForRun(r.run_id);
+        const p = (await api(`/v1/scopes/lookup?q=${encodeURIComponent(scopeId)}`)).progress;
+        const line = `${num(p.screened)} of ${num(p.contractors)} screened after batch ${batch}.`;
+        if (!p.watch || !p.watch.catching_up) {
+          run.done = true;
+          say(`${line} All done.`);
+          break;
+        }
+        say(run.stop ? `${line} Stopped; the screening times carry on from here.` : line);
+      }
+    } catch (e) {
+      say(e.message || String(e));
+    }
+    run.running = false;
+    showScreenAll();
+  };
+}
+
+/* Where screens run on a queue rather than inside the request: wait for it. */
+async function waitForRun(runId) {
+  for (;;) {
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const d = await api(`/v1/screens/${encodeURIComponent(runId)}`);
+    if (!["queued", "running", "scheduled"].includes(d.status)) return d;
+  }
 }
 
 function scopePager(d) {
@@ -3358,7 +3448,8 @@ async function viewScope(id) {
       <h2>Already watched</h2>
       <p>${num(p.contractors)} contractor${p.contractors === 1 ? "" : "s"} found so far;
         ${num(p.screened)} screened.</p>
-      <div class="actions"><button class="primary" id="scope-open">Open its portfolio</button></div>
+      <div class="actions"><button id="scope-open">Open its portfolio</button></div>
+      ${screenAllControls(p.watch, p.contractors - p.screened)}
     </div>` : ""}
 
     <div class="card">
@@ -3369,7 +3460,7 @@ async function viewScope(id) {
           ? "and other transaction this office awarded" : "this agency awarded"} in the period
           you choose, from the ${s.source === "fpds" ? "federal procurement record (FPDS)"
           : "USAspending record"} — whoever won them.</li>
-        <li><strong>Screen each contractor in turn.</strong> A few each run, several runs a
+        <li><strong>Screen each contractor in turn.</strong> Dozens each run, several runs a
           day until all are done, then each again every month. With hundreds of companies
           this takes days, not minutes; the portfolio shows how far it has got.${
           p.screening && p.screening.next ? ` Screens run at ${esc(p.screening.times)}; the
@@ -3406,6 +3497,7 @@ async function viewScope(id) {
   };
   const open = document.getElementById("scope-open");
   if (open) open.onclick = openPortfolio;
+  wireScreenAll(s.id);
 
   document.getElementById("scope-watch").onclick = async () => {
     const button = document.getElementById("scope-watch");
@@ -4144,6 +4236,7 @@ async function viewPortfolio(params) {
     </div>`;
   wirePortfolio(d.name);
   wireMyPortfolios();
+  if (d.scope) wireScreenAll(d.scope.id);
   wireAlerts(key, d.name);
   wireEmail(key);
   wireRemove(key);
@@ -5334,12 +5427,35 @@ document.getElementById("theme-button").onclick = () => {
 };
 applyTheme();
 
-function openKeyDialog() {
+function openKeyDialog(note = "") {
   document.getElementById("key-input").value = apiKey;
+  const status = document.getElementById("key-status");
+  status.textContent = note;
+  status.hidden = !note;
+  // Escape keeps the last returnValue; without this it would save again.
+  keyDialog.returnValue = "";
   keyDialog.showModal();
 }
 
-document.getElementById("key-button").onclick = openKeyDialog;
+document.getElementById("key-button").onclick = () => openKeyDialog();
+
+/* Save keeps the key in this browser and asks the site again with it, so the
+ * page at once offers what an admin may do — or says the key is not one the
+ * site knows. Saving an empty box forgets the key. */
+keyDialog.addEventListener("close", async () => {
+  if (keyDialog.returnValue !== "save") return;
+  apiKey = document.getElementById("key-input").value.trim();
+  try {
+    if (apiKey) localStorage.setItem(KEY_STORAGE, apiKey);
+    else localStorage.removeItem(KEY_STORAGE);
+  } catch { /* storage blocked: the key lasts as long as this page */ }
+  await refreshAccount();
+  route();
+  if (apiKey && authStatus && authStatus.key_accepted === false) {
+    openKeyDialog("The site did not accept that key. Check it against the key part of "
+      + "FOCI_API_KEYS in Vercel — the text after the colon.");
+  }
+});
 
 window.addEventListener("hashchange", route);
 wireAccountDialog();

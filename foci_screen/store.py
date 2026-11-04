@@ -346,7 +346,7 @@ CREATE TABLE IF NOT EXISTS scope_index (
     PRIMARY KEY (tenant_id, scope, month, query)
 );
 -- When each contractor was last screened in full, finding or not. A watch on
--- a whole office screens a few each run, those never screened first, then the
+-- a whole office screens dozens each run, those never screened first, then the
 -- longest ago.
 CREATE TABLE IF NOT EXISTS entity_screens (
     tenant_id    TEXT NOT NULL,

@@ -78,8 +78,10 @@ redeploy.
 
 Open **https://contractscreener.com**. No key is needed.
 
-1. Click **Admin key** at the top right and paste your admin key — the part *after*
-   `default:`. Only you need do this, on your own computer.
+1. Click **API key** at the top right, paste your admin key — the part *after*
+   `default:` — and press **Save**. The button then reads **Admin key ✓**; if it reads **Key
+   not accepted**, the site does not know that key (check it against `FOCI_API_KEYS`). Only
+   you need do this, on your own computer.
 2. Open **System check** (the link at the bottom of every page). Every line should say
    **working** or **note**. In particular:
    * **Database** should read *Postgres database postgres at aws-…pooler.supabase.com, tables
@@ -92,7 +94,7 @@ Open **https://contractscreener.com**. No key is needed.
    A line that says **not working** says what failed and how to fix it.
 3. The banner about the database is gone.
 4. In a private browser window, which holds no key, the site opens and works the same, with
-   **Admin key** at the top right where it used to say *API key*.
+   **API key** at the top right.
 
 ## 5. Email through Resend
 
@@ -358,8 +360,8 @@ choose it, give the addresses to email, and press **Watch every contractor**. Th
    and other transaction, whoever won it. An office comes from FPDS, the federal procurement
    record, because USAspending cannot narrow below the Department of the Air Force; an agency
    comes from USAspending (its 2,000 largest awards);
-2. **screens each contractor in turn**, a few each run, those never screened first — then
-   each again every month;
+2. **screens each contractor in turn**, as many each run as fit in its time — dozens —
+   those never screened first, then each again every month;
 3. **keeps a portfolio that is the office**: new contractors join it as their awards appear.
    Signed in, it is saved to your account; it lists the flagged contractors first, 100 a page;
 4. **sets up an email alert list** on it. An address is asked to confirm first, unless it is
@@ -372,10 +374,19 @@ AFWERX is its two contracting offices, FA8649 (the Air Force SBIR/STTR office) a
 contractor's screen reads several registries. The watch runs with **Scheduled screens** at
 each screening time (section 6) and, while it has work left, again every few minutes after
 each run, up to **12 runs a day** shared across the screening times — each up to 4 minutes on
-Vercel, up to 10 contractors a run. Its first run starts as soon as it is set up; after that
-the screening times carry it on, and an admin can push another run at any time by pressing
-**Watch every contractor** again or **Run now** on its watchlist. Change the number with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's
-free-plan hours, so keep it modest there. The portfolio shows how far it has got.
+Vercel, screening contractors until its time is nearly spent (at most 100). Its first run
+starts as soon as it is set up; after that the screening times carry it on. Change the number
+with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's free-plan hours,
+so keep it modest there. The portfolio shows how far it has got.
+
+**An admin can screen all of it now.** With the admin key saved in the browser (the button at
+the top right reads **Admin key ✓**), or signed in to the site's own workspace, the office's
+page and its portfolio show **Screen all … now**. It runs one batch after another, each up to
+4 minutes, until every contractor is screened, saying how many are done after each, and
+**Stop** ends it after the batch in hand. It runs from your open tab, so keep the page open;
+closing it stops after the batch in hand, and the screening times carry on from there. These
+runs do not use up the 12 a day, but they do count towards Vercel's hours: several hundred
+contractors take an hour or so.
 
 DoD publishes its contract actions about **90 days late**, so the four most recent months are
 read again each week as they fill in.
