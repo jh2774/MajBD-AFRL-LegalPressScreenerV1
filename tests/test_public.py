@@ -61,6 +61,8 @@ def site(tmp_path, monkeypatch):
     monkeypatch.setenv("FOCI_DB", str(tmp_path / "public.db"))
     monkeypatch.setenv("FOCI_CACHE", str(tmp_path / "cache"))
     monkeypatch.setenv("FOCI_OUT", str(tmp_path / "out"))
+    # Screens at any hour: these tests are not about when (test_screen_times.py).
+    monkeypatch.setenv("FOCI_SCREEN_TIMES", "any")
     for name in MAIL_ENV:
         monkeypatch.delenv(name, raising=False)
     # Set, empty, so a developer's own .env cannot supply a key.

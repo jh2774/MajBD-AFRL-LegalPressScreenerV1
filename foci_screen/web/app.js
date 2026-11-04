@@ -3291,10 +3291,12 @@ function scopeProgressCard(d) {
     <div class="bar-track" style="max-width:420px"><div class="bar-fill"
       style="width:${pct}%;background:var(--accent)"></div></div>
     <p class="muted" style="font-size:12.5px;margin-top:10px">${watch
-      ? `${watch.catching_up ? "Still catching up: its watch runs several times a day, "
+      ? `${watch.catching_up ? "Still catching up: its watch runs at each screening time, "
                                + "reading awards and screening a few contractors each run."
                              : "Caught up: its watch runs once a day for new awards and "
                                + "contractors, and screens each again every month."}
+         ${s.screening && s.screening.next ? `Screens run at ${esc(s.screening.times)}; the
+           next is at ${esc(s.screening.next)}.` : ""}
          ${watch.last_run_id ? `<a href="#/screens/${encodeURIComponent(watch.last_run_id)}">Its
            latest run</a>.` : ""}`
       : `Nobody is watching this office yet, so nothing new is read.
@@ -3348,7 +3350,9 @@ async function viewScope(id) {
           : "USAspending record"} — whoever won them.</li>
         <li><strong>Screen each contractor in turn.</strong> A few each run, several runs a
           day until all are done, then each again every month. With hundreds of companies
-          this takes days, not minutes; the portfolio shows how far it has got.</li>
+          this takes days, not minutes; the portfolio shows how far it has got.${
+          p.screening && p.screening.next ? ` Screens run at ${esc(p.screening.times)}; the
+          first starts then, at ${esc(p.screening.next)}.` : ""}</li>
         <li><strong>Keep a portfolio that is the office.</strong> New contractors join it as
           their awards appear.</li>
         <li><strong>Email alerts.</strong> Whoever you list hears when any of them is flagged.

@@ -27,7 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from .. import accounts, aliases, consent, fund_managers, portfolio_mail, syscheck
+from .. import accounts, aliases, consent, fund_managers, portfolio_mail, screen_times, syscheck
 from .. import alerts as alerts_engine
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
@@ -1642,7 +1642,9 @@ def _scope_progress(store: Store, scope) -> dict:
     summary = store.scope_summary(scope)
     watch = _scope_watch(store, scope)
     index = store.scope_index_rows(scope.id)
+    window = _screening_now()
     return {**summary,
+            "screening": {"times": window["times"], "next": window.get("next")},
             "months_read": sorted({r["month"] for r in index if r["done"]}),
             "watch": {"watchlist_id": watch["watchlist_id"], "active": bool(watch["active"]),
                       "last_run_at": watch.get("last_run_at"),
@@ -1672,7 +1674,8 @@ def _scope_portfolio(loaded, store: Store, offset: int) -> dict:
                    "screened_here": progress["screened"],
                    "obligated": progress["obligated"], "contracts": progress["awards"]},
         "severity": progress["severity"],
-        "scope": {**scope.to_dict(), **{k: progress[k] for k in ("months_read", "watch")},
+        "scope": {**scope.to_dict(),
+                  **{k: progress[k] for k in ("months_read", "watch", "screening")},
                   "offset": offset, "page": SCOPE_PAGE, "more": len(rows) > SCOPE_PAGE},
     }
 
@@ -1717,7 +1720,10 @@ def watch_scope(body: ScopeWatch, request: Request,
         if not watch["active"]:
             store.set_watchlist_active(watchlist_id, True)
     store.set_watchlist_backlog(watchlist_id, True)
-    started = run_watchlist(watchlist_id, request, tenant)
+    # At a screening time its first run starts now; otherwise at the next one.
+    window = _screening_now()
+    started = (run_watchlist(watchlist_id, request, tenant) if window["open"]
+               else {"status": "waiting", "next": window["next"]})
 
     key = portfolio_keys.encode(portfolio_keys.from_scope(scope))
     user = session_user(request)
@@ -2404,19 +2410,40 @@ def daily_check(request: Request, authorization: str = Header(default=""),
             "workspaces": checked, "emails": emails, "left": last.get("left", 0)}
 
 
+def _screening_now() -> dict:
+    """Whether scheduled screens may run now (FOCI_SCREEN_TIMES), and how many
+    runs a whole office's watch may have had by now today."""
+    times = screen_times.parse_times(cfg.screen_times)
+    if times is None:
+        return {"open": True, "runs_allowed": cfg.scope_runs_per_day, "times": "any time"}
+    now = screen_times.local_now(cfg.timezone)
+    return {"open": screen_times.slot(now, times) is not None,
+            "runs_allowed": screen_times.runs_allowed(now, times, cfg.scope_runs_per_day),
+            "next": screen_times.next_time(now, times),
+            "times": screen_times.describe(times, cfg.timezone)}
+
+
 @app.post("/v1/schedule/watchlists", tags=["watchlists"])
 def scheduled_watchlist(request: Request, _tenant: str = Depends(require_tenant)) -> dict:
     """Re-screen the next active watchlist, in any workspace, not run for most
     of a day. Where screens run inside requests (Vercel) it runs in this one,
-    up to FOCI_SCREEN_SECONDS. `left` is how many more are due."""
+    up to FOCI_SCREEN_SECONDS. `left` is how many more are due.
+
+    Only in the hour after each of the day's screening times
+    (FOCI_SCREEN_TIMES); asked at any other time, it says when the next is."""
     site = store_for(auth.DEFAULT_TENANT)
+    window = _screening_now()
+    if not window["open"]:
+        return {"status": "not a screening time", "left": 0, "next": window["next"],
+                "times": window["times"]}
 
     def due_now() -> tuple[str, dict]:
         # A watch on a whole office still catching up is due again a few
-        # minutes after its last run, up to FOCI_SCOPE_RUNS_PER_DAY a day.
+        # minutes after its last run, up to its share of FOCI_SCOPE_RUNS_PER_DAY
+        # for the screening times begun so far today.
         return _hours_ago(SWEEP_WATCHLISTS_HOURS), {
             "catch_up_before": _hours_ago(CATCH_UP_MINUTES / 60), "today": _today()[:10],
-            "runs_per_day": cfg.scope_runs_per_day}
+            "runs_per_day": _screening_now()["runs_allowed"]}
 
     before, catch_up = due_now()
     for row in site.watchlists_due(before, **catch_up):

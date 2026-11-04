@@ -173,8 +173,16 @@ leave it set to the admin key.
 
 To try it: **Actions** → **Daily alerts** → **Run workflow**.
 
-The same setting also drives **Daily watchlists**, which re-screens each active watchlist on
-the Watchlists page at 10:30 UTC, one at a time, so its notices are in that day's alerts.
+The same setting also drives **Scheduled screens**, which re-screens each active watchlist on
+the Watchlists page, one at a time, at the site's **screening times**: 9 am, 1 pm and 5 pm
+Eastern unless you say otherwise. It asks every hour; outside the hour after each screening
+time the site answers "not a screening time" and nothing runs. Each watchlist is screened
+once a day, at the first screening time it is due; a whole office still catching up uses a
+share of its daily runs at each one. Change the times with `FOCI_SCREEN_TIMES` in Vercel
+(for example `08:00,12:00,16:00`, or `any` for no restriction) and the time zone with
+`FOCI_TIMEZONE` (`America/New_York`, `America/Chicago`, `America/Denver`,
+`America/Los_Angeles`). A screen someone starts themselves — **Screen** or **Run now** —
+still runs straight away.
 Nothing on Vercel runs in the background, so without it a watchlist runs only when someone
 presses **Run now**. Each screen stops after four minutes and keeps what it finished.
 
@@ -355,10 +363,11 @@ AFWERX is its two contracting offices, FA8649 (the Air Force SBIR/STTR office) a
 (AFRL/RGKA). AFRL is every office whose FPDS name says AFRL.
 
 **It takes days, not minutes.** AFWERX awards to well over a thousand companies a year, and a
-contractor's screen reads several registries. The watch runs with the daily **Daily
-watchlists** workflow (section 6) and, while it has work left, again every few minutes after
-each run, up to **12 runs a day** — each up to 4 minutes on Vercel, up to 10 contractors a run.
-Change the number with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's
+contractor's screen reads several registries. The watch runs with **Scheduled screens** at
+each screening time (section 6) and, while it has work left, again every few minutes after
+each run, up to **12 runs a day** shared across the screening times — each up to 4 minutes on
+Vercel, up to 10 contractors a run. Started outside a screening time, its first run waits for
+the next one. Change the number with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's
 free-plan hours, so keep it modest there. The portfolio shows how far it has got.
 
 DoD publishes its contract actions about **90 days late**, so the four most recent months are

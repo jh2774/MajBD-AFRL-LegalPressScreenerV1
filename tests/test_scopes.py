@@ -227,7 +227,7 @@ def site(tmp_path, monkeypatch):
         base = {"FOCI_API_KEYS": "default:admin-key", "FOCI_DB": str(tmp_path / "w.db"),
                 "FOCI_CACHE": str(tmp_path / "cache"), "FOCI_OUT": str(tmp_path / "out"),
                 "FOCI_PUBLIC": "true", "RESEND_API_KEY": "re_not_real",
-                "ALERTS_FROM": "alerts@contractscreener.com"}
+                "ALERTS_FROM": "alerts@contractscreener.com", "FOCI_SCREEN_TIMES": "any"}
         for name in ENV:
             monkeypatch.delenv(name, raising=False)
         for k, v in {**base, **env}.items():

@@ -1,30 +1,32 @@
-# Once a day, re-screen every active watchlist on the deployed site, in every
-# workspace — the site's own and each account's.
+# Re-screen every active watchlist on the deployed site, in every workspace —
+# the site's own and each account's — at the site's screening times: 9 am,
+# 1 pm and 5 pm Eastern unless FOCI_SCREEN_TIMES and FOCI_TIMEZONE in Vercel
+# say otherwise. This asks every hour; outside those times the site answers
+# "not a screening time" and nothing runs, so the times are set in one place
+# and daylight saving takes care of itself.
 #
 # A site on Vercel cannot sweep its own watchlists: nothing there runs in the
 # background, and a screen runs inside the request that asks for it. So this
 # asks for one watchlist at a time (POST /v1/schedule/watchlists), which runs
 # in that request — up to FOCI_SCREEN_SECONDS, four minutes there, after which
 # a screen stops and keeps what it finished — until the site says none is left.
-# It runs before the daily alert check, so a notice a sweep raises is in that
-# day's alerts.
 #
 # Uses the same settings as the daily alerts (Settings → Secrets and variables
 # → Actions): the variable FOCI_SITE_URL, and the secret FOCI_ALERTS_KEY only
 # for a site that needs a key. Does nothing until FOCI_SITE_URL is set.
 #
 # Also runnable by hand from the Actions tab ("Run workflow").
-name: Daily watchlists
+name: Scheduled screens
 
 on:
   schedule:
-    - cron: "30 10 * * *"      # 10:30 UTC, ahead of the alert check at 12:15
+    - cron: "5 * * * *"        # every hour; the site decides which hours screen
   workflow_dispatch: {}
 
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 70        # one screening hour, and the run under way at its end
     steps:
       - name: Re-screen each active watchlist
         env:
@@ -49,7 +51,7 @@ jobs:
                    -H "Content-Type: application/json" -d '{}' \
                    "$SITE/v1/schedule/watchlists"); then
               fails=0
-              echo "$r" | jq -c '{status, left}'
+              echo "$r" | jq -c '{status, left, next}'
               if [ "$(echo "$r" | jq -r .left)" = "0" ]; then
                 exit 0
               fi

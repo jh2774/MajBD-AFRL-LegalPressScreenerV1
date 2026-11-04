@@ -264,6 +264,11 @@ class Config:
     # FOCI_SCREEN_SECONDS; on Vercel's free plan they count towards its hours.
     scope_runs_per_day: int = field(default_factory=lambda: int(
         _env("FOCI_SCOPE_RUNS_PER_DAY", "12") or 12))
+    # When scheduled screens run: the hour after each of these times, in
+    # FOCI_TIMEZONE. "any" for whenever the schedule asks (screen_times.py).
+    screen_times: str = field(default_factory=lambda: _env(
+        "FOCI_SCREEN_TIMES", "09:00,13:00,17:00"))
+    timezone: str = field(default_factory=lambda: _env("FOCI_TIMEZONE", "America/New_York"))
 
     def ensure_dirs(self) -> None:
         for d in (self.cache_dir, self.out_dir):
