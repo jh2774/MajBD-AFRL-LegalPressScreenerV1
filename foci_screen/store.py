@@ -329,6 +329,31 @@ CREATE TABLE IF NOT EXISTS account_portfolios (
     created_at   TEXT NOT NULL,
     updated_at   TEXT NOT NULL
 );
+-- How far a watch on a scope (scopes.py) has read its awards: per month for an
+-- office, read from FPDS a page at a time; one row ("all") for an agency read
+-- from USAspending. `next_start` is where the next run picks up; `done` once
+-- the whole of it is read, and `fetched_at` says when, so a recent month can be
+-- read again for the awards DoD publishes 90 days late.
+CREATE TABLE IF NOT EXISTS scope_index (
+    tenant_id    TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    month        TEXT NOT NULL,
+    query        INTEGER NOT NULL DEFAULT 0,
+    next_start   INTEGER NOT NULL DEFAULT 0,
+    done         INTEGER NOT NULL DEFAULT 0,
+    awards       INTEGER NOT NULL DEFAULT 0,
+    fetched_at   TEXT,
+    PRIMARY KEY (tenant_id, scope, month, query)
+);
+-- When each contractor was last screened in full, finding or not. A watch on
+-- a whole office screens a few each run, those never screened first, then the
+-- longest ago.
+CREATE TABLE IF NOT EXISTS entity_screens (
+    tenant_id    TEXT NOT NULL,
+    entity_key   TEXT NOT NULL,
+    screened_at  TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, entity_key)
+);
 -- What each account has searched for, opened and screened, newest first: the
 -- signed-in dashboard is this, not everything ever screened. Seen by that
 -- account only, and trimmed to the most recent few of each kind.
@@ -423,6 +448,13 @@ CREATE TABLE IF NOT EXISTS contracts (
     is_subaward   INTEGER DEFAULT 0,
     prime_award_id TEXT,
     prime_recipient_name TEXT,
+    -- The contracting office that made the award (FPDS), and its name: what a
+    -- watch on a whole office matches (scopes.py).
+    office_id     TEXT,
+    office_name   TEXT,
+    -- From the vendor's SAM registration as FPDS carries it: yes, no, or blank
+    -- for unknown. A sole proprietor is a person, and is not screened.
+    sole_proprietor TEXT,
     updated_at    TEXT NOT NULL,
     UNIQUE (tenant_id, contract_key)
 );
@@ -501,6 +533,12 @@ CREATE TABLE IF NOT EXISTS watchlists (
     active       INTEGER NOT NULL DEFAULT 1,
     last_run_at  TEXT,
     last_run_id  TEXT,
+    -- A watch on a whole office with work still to do: months of awards not
+    -- yet read, or contractors not yet screened. It may run again the same
+    -- day, up to a daily number of runs, until it has caught up.
+    backlog      INTEGER NOT NULL DEFAULT 0,
+    runs_day     TEXT,
+    runs_today   INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL,
     -- Only the screening-policy settings this watchlist changes, as JSON.
     -- Everything else follows the tenant's policy. NULL: follows it entirely.
@@ -522,6 +560,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_tenant ON runs(tenant_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_contracts_entity ON contracts(tenant_id, entity_key);
 CREATE INDEX IF NOT EXISTS idx_contracts_ko ON contracts(tenant_id, ko_email);
 CREATE INDEX IF NOT EXISTS idx_contracts_agency ON contracts(tenant_id, agency);
+CREATE INDEX IF NOT EXISTS idx_contracts_office ON contracts(tenant_id, office_id);
 CREATE INDEX IF NOT EXISTS idx_entdocs ON entity_documents(tenant_id, entity_key);
 CREATE INDEX IF NOT EXISTS idx_disp_rule ON dispositions(tenant_id, rule_id);
 CREATE INDEX IF NOT EXISTS idx_disp_entity ON dispositions(tenant_id, entity_key);
@@ -565,6 +604,12 @@ COLUMN_ADDITIONS = [
     ("users", "portfolio_id", "TEXT"),
     ("organisations", "self_made", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "name", "TEXT"),
+    ("contracts", "office_id", "TEXT"),
+    ("contracts", "office_name", "TEXT"),
+    ("contracts", "sole_proprietor", "TEXT"),
+    ("watchlists", "backlog", "INTEGER NOT NULL DEFAULT 0"),
+    ("watchlists", "runs_day", "TEXT"),
+    ("watchlists", "runs_today", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -614,7 +659,7 @@ _KEEP_IF_BLANK = (
     "solicitation_id", "recipient_uei", "recipient_country",
     "country_of_incorporation", "foreign_funding", "ko_name", "ko_email",
     "ko_source", "ko_confidence", "source_url", "prime_award_id",
-    "prime_recipient_name",
+    "prime_recipient_name", "office_id", "office_name", "sole_proprietor",
 )
 # Written unconditionally. `entity_key` is always supplied by the caller;
 # `foreign_owned` and `is_subaward` are 0/1 with no "unknown" to protect, so a
@@ -2460,6 +2505,17 @@ class Store:
     # --------------------------------------------------------- entity identity
     LINK_STATUSES = ("auto", "confirmed", "rejected")
 
+    def keys_followed_further(self, entity_keys: list[str]) -> list[str]:
+        """Of these contractors, those with more to follow than notices: an SEC
+        record a person confirmed, or a fund watch. Two queries, however many
+        are asked about — for an alert list on a whole office."""
+        wanted = {k.upper() for k in entity_keys if k}
+        rows = self._query("SELECT entity_key FROM entity_links WHERE tenant_id=? AND"
+                           " status='confirmed'", (self.tenant_id,))
+        rows += self._query("SELECT entity_key FROM vehicle_watches WHERE tenant_id=?",
+                            (self.tenant_id,))
+        return sorted({r["entity_key"].upper() for r in rows} & wanted)
+
     def get_entity_link(self, entity_key: str) -> dict | None:
         return self._one("SELECT * FROM entity_links WHERE tenant_id=? AND entity_key=?",
                          (self.tenant_id, entity_key.upper()))
@@ -2578,22 +2634,40 @@ class Store:
         """Every tenant's active watchlists — for the scheduler, not the API."""
         return self._query("SELECT * FROM watchlists WHERE active=1 ORDER BY tenant_id")
 
-    def watchlists_due(self, before: str) -> list[dict]:
-        """Every tenant's active watchlists not run since `before`, oldest
-        first — for the daily sweep, which covers every workspace."""
-        return self._query(
-            "SELECT * FROM watchlists WHERE active=1 AND (last_run_at IS NULL OR"
-            " last_run_at < ?) ORDER BY last_run_at IS NOT NULL, last_run_at, watchlist_id",
-            (before,))
+    # The condition for a watchlist being due: not run since `before`, or —
+    # one with a backlog — not run in the last few minutes and under its runs
+    # for the day.
+    _DUE = ("active=1 AND (last_run_at IS NULL OR last_run_at < ? OR (backlog=1 AND"
+            " last_run_at < ? AND (runs_day IS NULL OR runs_day <> ? OR runs_today < ?)))")
 
-    def claim_watchlist_run(self, watchlist_id: str, before: str) -> bool:
-        """Mark a watchlist as run now, unless something ran it since `before`:
-        two sweeps at once must not screen the same list twice."""
+    def watchlists_due(self, before: str, *, catch_up_before: str = "", today: str = "",
+                       runs_per_day: int = 0) -> list[dict]:
+        """Every tenant's active watchlists due a run, oldest first — for the
+        daily sweep, which covers every workspace. One catching up on a whole
+        office is due again `catch_up_before`, up to `runs_per_day` a day."""
+        return self._query(
+            f"SELECT * FROM watchlists WHERE {self._DUE}"
+            " ORDER BY last_run_at IS NOT NULL, last_run_at, watchlist_id",
+            (before, catch_up_before or before, today, runs_per_day))
+
+    def claim_watchlist_run(self, watchlist_id: str, before: str, *,
+                            catch_up_before: str = "", today: str = "",
+                            runs_per_day: int = 0) -> bool:
+        """Mark a watchlist as run now, unless it is no longer due: two sweeps
+        at once must not screen the same list twice. Counts the day's runs."""
         with self._tx() as c:
-            c.execute("UPDATE watchlists SET last_run_at=? WHERE watchlist_id=? AND"
-                      " (last_run_at IS NULL OR last_run_at < ?)",
-                      (_now(), watchlist_id, before))
+            c.execute(
+                f"UPDATE watchlists SET last_run_at=?, runs_today=CASE WHEN runs_day=?"
+                f" THEN runs_today + 1 ELSE 1 END, runs_day=? WHERE watchlist_id=? AND"
+                f" {self._DUE}",
+                (_now(), today, today, watchlist_id, before, catch_up_before or before,
+                 today, runs_per_day))
             return c.rowcount() == 1
+
+    def set_watchlist_backlog(self, watchlist_id: str, backlog: bool) -> None:
+        with self._tx() as c:
+            c.execute("UPDATE watchlists SET backlog=? WHERE watchlist_id=?",
+                      (1 if backlog else 0, watchlist_id))
 
     def alert_workspaces_due(self, before: str) -> list[str]:
         """Workspaces with an active alert list not checked since `before`."""
@@ -2656,8 +2730,9 @@ class Store:
                 " solicitation_id, recipient_uei, recipient_country,"
                 " country_of_incorporation, foreign_owned, foreign_funding, ko_name,"
                 " ko_email, ko_source, ko_confidence, ip_clauses, source_url,"
-                " is_subaward, prime_award_id, prime_recipient_name, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " is_subaward, prime_award_id, prime_recipient_name, office_id,"
+                " office_name, sole_proprietor, updated_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 # Every column except the identity of the row — see
                 # CONTRACT_UPDATE_CLAUSE. The list used to carry entity_name
                 # but not entity_key, uei or country_of_incorporation, so an
@@ -2679,8 +2754,116 @@ class Store:
                  contract.foreign_funding, o.name, o.email, o.source, o.confidence,
                  json.dumps(contract.ip_clause_hits or []), contract.source_url,
                  1 if contract.is_subaward else 0, contract.prime_award_id,
-                 contract.prime_recipient_name, _now()))
+                 contract.prime_recipient_name,
+                 getattr(contract, "contracting_office_id", "") or "",
+                 getattr(contract, "contracting_office_name", "") or "",
+                 {True: "yes", False: "no"}.get(getattr(contract, "is_sole_proprietor", None),
+                                                 ""),
+                 _now()))
         return changes
+
+    # ------------------------------------------------------ whole offices
+    # A watch on a scope (scopes.py): every contractor its awards name.
+
+    def scope_index_rows(self, scope_id: str) -> list[dict]:
+        return self._query("SELECT * FROM scope_index WHERE tenant_id=? AND scope=?"
+                           " ORDER BY month DESC, query", (self.tenant_id, scope_id))
+
+    def save_scope_index(self, scope_id: str, month: str, query: int, *,
+                         next_start: int, done: bool, awards: int) -> None:
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO scope_index (tenant_id, scope, month, query, next_start, done,"
+                " awards, fetched_at) VALUES (?,?,?,?,?,?,?,?)"
+                " ON CONFLICT (tenant_id, scope, month, query) DO UPDATE SET"
+                " next_start=excluded.next_start, done=excluded.done,"
+                " awards=scope_index.awards + excluded.awards,"
+                " fetched_at=excluded.fetched_at",
+                (self.tenant_id, scope_id, month, query, next_start, 1 if done else 0,
+                 awards, _now()))
+
+    def reopen_scope_index(self, scope_id: str, month: str, query: int) -> None:
+        """Read a month again from its first page: DoD publishes late."""
+        with self._tx() as c:
+            c.execute("UPDATE scope_index SET next_start=0, done=0, awards=0 WHERE"
+                      " tenant_id=? AND scope=? AND month=? AND query=?",
+                      (self.tenant_id, scope_id, month, query))
+
+    def mark_entity_screened(self, entity_key: str) -> None:
+        with self._tx() as c:
+            c.execute("INSERT INTO entity_screens (tenant_id, entity_key, screened_at)"
+                      " VALUES (?,?,?) ON CONFLICT (tenant_id, entity_key) DO UPDATE SET"
+                      " screened_at=excluded.screened_at",
+                      (self.tenant_id, entity_key, _now()))
+
+    def scope_entity_keys(self, scope) -> list[str]:
+        clause, params = scope.sql()
+        rows = self._query(f"SELECT DISTINCT entity_key FROM contracts WHERE tenant_id=?"
+                           f" AND ({clause}) ORDER BY entity_key",
+                           (self.tenant_id, *params))
+        return [r["entity_key"] for r in rows]
+
+    def scope_candidates(self, scope, screened_before: str, limit: int) -> list[dict]:
+        """Contractors in a scope to screen next: never screened first, largest
+        first; then those screened longest ago, before `screened_before`."""
+        clause, params = scope.sql("c")
+        return self._query(
+            f"SELECT c.entity_key, MAX(c.entity_name) AS entity_name,"
+            f" SUM(c.amount) AS obligated, s.screened_at FROM contracts c"
+            f" LEFT JOIN entity_screens s ON s.tenant_id=c.tenant_id AND"
+            f" s.entity_key=c.entity_key"
+            f" WHERE c.tenant_id=? AND ({clause}) AND (s.screened_at IS NULL OR"
+            f" s.screened_at < ?)"
+            f" GROUP BY c.entity_key, s.screened_at"
+            f" ORDER BY (s.screened_at IS NOT NULL), s.screened_at, SUM(c.amount) DESC,"
+            f" c.entity_key LIMIT ?",
+            (self.tenant_id, *params, screened_before, limit))
+
+    _SEVERITY_RANK = ("CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1"
+                      " WHEN 'medium' THEN 2 WHEN 'low' THEN 3 WHEN 'info' THEN 4"
+                      " ELSE 5 END")
+
+    def scope_rows(self, scope, limit: int = 100, offset: int = 0) -> list[dict]:
+        """A scope's contractors for its portfolio: the most serious latest
+        finding first, then the largest; each with its awards and when it was
+        last screened. One query, however many there are."""
+        clause, params = scope.sql("c")
+        return self._query(
+            f"SELECT e.entity_key, e.entity_name, e.contract_count, e.obligated,"
+            f" s.screened_at, f.severity, f.score, f.created_at AS finding_at"
+            f" FROM (SELECT c.entity_key, MAX(c.entity_name) AS entity_name,"
+            f" COUNT(*) AS contract_count, SUM(c.amount) AS obligated FROM contracts c"
+            f" WHERE c.tenant_id=? AND ({clause}) GROUP BY c.entity_key) e"
+            f" LEFT JOIN entity_screens s ON s.tenant_id=? AND s.entity_key=e.entity_key"
+            f" LEFT JOIN findings f ON f.id=(SELECT MAX(id) FROM findings g WHERE"
+            f" g.tenant_id=? AND g.entity_key=e.entity_key)"
+            f" ORDER BY {self._SEVERITY_RANK}, e.obligated DESC, e.entity_key"
+            f" LIMIT ? OFFSET ?",
+            (self.tenant_id, *params, self.tenant_id, self.tenant_id, limit, offset))
+
+    def scope_summary(self, scope) -> dict:
+        """How many contractors and awards a scope holds, how many contractors
+        have been screened, and their latest findings by severity."""
+        clause, params = scope.sql("c")
+        head = self._one(
+            f"SELECT COUNT(DISTINCT c.entity_key) AS contractors, COUNT(*) AS awards,"
+            f" SUM(c.amount) AS obligated FROM contracts c WHERE c.tenant_id=? AND ({clause})",
+            (self.tenant_id, *params)) or {}
+        screened = self._one(
+            f"SELECT COUNT(*) AS n FROM entity_screens s WHERE s.tenant_id=? AND"
+            f" s.entity_key IN (SELECT c.entity_key FROM contracts c WHERE c.tenant_id=?"
+            f" AND ({clause}))", (self.tenant_id, self.tenant_id, *params)) or {}
+        rows = self._query(
+            f"SELECT f.severity, COUNT(*) AS n FROM findings f WHERE f.id IN ("
+            f"SELECT MAX(g.id) FROM findings g WHERE g.tenant_id=? AND g.entity_key IN"
+            f" (SELECT c.entity_key FROM contracts c WHERE c.tenant_id=? AND ({clause}))"
+            f" GROUP BY g.entity_key) GROUP BY f.severity",
+            (self.tenant_id, self.tenant_id, *params))
+        return {"contractors": int(head.get("contractors") or 0),
+                "awards": int(head.get("awards") or 0),
+                "obligated": float(head.get("obligated") or 0),
+                "screened": int(screened.get("n") or 0),
+                "severity": {r["severity"]: int(r["n"]) for r in rows if r["severity"]}}
 
     def _contract_changes(self, key: str, contract, entity_key: str,
                           run_id: str) -> list[dict]:

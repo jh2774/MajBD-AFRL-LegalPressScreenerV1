@@ -36,11 +36,21 @@ class ScreenRequest(BaseModel):
     fetch_filing_bodies: bool = True
     min_severity: str = Field("low", pattern="^(info|low|medium|high|critical)$")
     skip_web: bool = False
+    # A whole office or agency (scopes.py), read and screened over many runs.
+    scope: str = Field("", max_length=300)
 
     @model_validator(mode="after")
     def needs_a_subject(self) -> ScreenRequest:
         agency = (self.agency or "").strip()
         recipient = (self.recipient or "").strip()
+        if self.scope:
+            from ..scopes import ScopeError, parse
+            try:
+                self.scope = parse(self.scope).id
+            except ScopeError as exc:
+                raise ValueError(str(exc)) from exc
+            self.agency, self.recipient = agency, recipient
+            return self
         if not agency and not recipient:
             raise ValueError(
                 "Name an agency to screen its awards, or a recipient to screen "
@@ -69,6 +79,16 @@ class PortfolioRequest(BaseModel):
 
 class PortfolioKey(BaseModel):
     key: str = Field(..., min_length=1, max_length=64_000)
+    # A portfolio of a whole office lists its contractors a page at a time.
+    offset: int = Field(0, ge=0, le=1_000_000)
+
+
+class ScopeWatch(BaseModel):
+    """Watch every contractor in an office or agency, with alerts, in one go."""
+    scope: str = Field(..., min_length=2, max_length=300)
+    # Who is emailed when one of them changes. Empty: no alert list yet.
+    emails: list[str] = Field(default_factory=list, max_length=25)
+    months_back: int = Field(12, ge=1, le=36)
 
 
 EMAIL_RX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"

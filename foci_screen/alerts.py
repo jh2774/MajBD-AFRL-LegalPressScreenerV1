@@ -37,6 +37,8 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from . import consent, fund_managers
+from . import portfolio as portfolio_keys
+from . import scopes as scopes_mod
 from . import vehicles as vehicles_engine
 from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
@@ -255,12 +257,52 @@ def watched_keys(store, entities: list[str]) -> list[str]:
     return list(dict.fromkeys(out))
 
 
+def list_scope(subscription: dict):
+    """The office or agency a list follows (scopes.Scope), or None."""
+    try:
+        scope = portfolio_keys.decode(subscription.get("portfolio_key") or "").scope
+        return scopes_mod.parse(scope["id"]) if scope else None
+    except (portfolio_keys.PortfolioKeyError, scopes_mod.ScopeError):
+        return None
+
+
+def follow_scope(store, subscription: dict) -> int:
+    """Bring a list on a whole office up to date with it: every contractor its
+    awards name now. Those just added are baselined — their history is not
+    news. Returns how many joined."""
+    scope = list_scope(subscription)
+    if scope is None:
+        return 0
+    now = store.scope_entity_keys(scope)
+    added = [k for k in now if k not in set(subscription["companies"])]
+    if set(now) != set(subscription["companies"]):
+        store.save_alert_subscription(
+            subscription_id=subscription["subscription_id"], name=subscription["name"],
+            emails=subscription["emails"], companies=now,
+            portfolio_key=subscription.get("portfolio_key") or "",
+            active=bool(subscription.get("active", True)))
+        subscription["companies"] = now
+        baseline(store, subscription["subscription_id"], added, award_keys=True)
+    return len(added)
+
+
+def followed(store, subscription: dict, entities: list[str]) -> tuple[list[str], list[str]]:
+    """(the keys notices are looked for under, the keys with an SEC record or
+    funds to follow). A list on a whole office holds the award record's own
+    keys, thousands of them: none needs resolving, and only the few with more
+    than notices to follow are looked at one by one."""
+    if list_scope(subscription) is not None:
+        return entities, store.keys_followed_further(entities)
+    entities = watched_keys(store, entities)
+    return entities, entities
+
+
 def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     crds, entities = split_keys(subscription["companies"])
-    entities = watched_keys(store, entities)
-    ciks = store.confirmed_ciks(entities)
+    entities, further = followed(store, subscription, entities)
+    ciks = store.confirmed_ciks(further)
     sent = store.alert_already_sent(subscription["subscription_id"])
-    looked_up = fund_watches(store, entities)
+    looked_up = fund_watches(store, further)
     items = [adv_item(c, looked_up) for c in store.adv_changes(crds, limit=200)]
     items += [formd_item(c, base_url, ciks.get(str(c.get("cik")), ""))
               for c in store.formd_changes(list(ciks), limit=200)]
@@ -268,7 +310,7 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     # Funds named after a contractor: an item exists only for a filing made
     # after both the watch and this list began, whenever the index learns of it.
     started = str(subscription.get("created_at") or "")[:10]
-    for watch in watched_vehicles(store, entities):
+    for watch in watched_vehicles(store, further):
         items += vehicles_engine.alert_items(store, watch, base_url, since=started)
         items += manager_items(store, watch, since=started)
     # A firm that is in the portfolio and also manages a watched contractor's
@@ -319,17 +361,27 @@ def manager_items(store, watch: dict, since: str = "") -> list[dict]:
             and fund_managers.tie_to_contractor(change, [watch])]
 
 
-def baseline(store, subscription_id: str, companies: list[str]) -> int:
-    """Mark everything already known as sent. Future changes only."""
+def baseline(store, subscription_id: str, companies: list[str],
+             award_keys: bool = False) -> int:
+    """Mark everything already known as sent. Future changes only.
+
+    `award_keys`: the companies are the award record's own keys (a list on a
+    whole office), so none needs resolving, and only those with an SEC record
+    or funds to follow are looked at one by one."""
     crds, entities = split_keys(companies)
-    entities = watched_keys(store, entities)
+    if award_keys:
+        further = store.keys_followed_further(entities)
+    else:
+        entities = watched_keys(store, entities)
+        further = entities
     ids = [f"adv:{c['change_id']}" for c in store.adv_changes(crds, limit=5000)]
-    ciks = list(store.confirmed_ciks(entities))
+    ciks = list(store.confirmed_ciks(further))
     ids += [f"formd:{c['change_id']}" for c in store.formd_changes(ciks, limit=5000)]
-    ids += [f"notice:{n['notice_id']}" for n in store.notices_for_entities(entities, 5000)]
+    ids += [f"notice:{n['notice_id']}"
+            for n in store.notices_for_entities(entities, max(5000, len(entities) * 3))]
     # A contractor added to a list that already existed: the fund filings made
     # since its watch began were news before it joined, not now.
-    for watch in watched_vehicles(store, entities):
+    for watch in watched_vehicles(store, further):
         ids += [i["item_id"] for i in vehicles_engine.alert_items(store, watch)]
         ids += [i["item_id"] for i in manager_items(store, watch)]
     store.mark_alert_sent(subscription_id, ids)
@@ -453,11 +505,11 @@ def run_alerts(store, adv: AdvConnector, mailer: Mailer, base_url: str = "",
     all_crds: list[str] = []
     all_entities: list[str] = []
     for s in subscriptions:
+        follow_scope(store, s)
         crds, entities = split_keys(s["companies"])
         all_crds += crds
-        all_entities += entities
+        all_entities += followed(store, s, entities)[1]
     firms = refresh_advisers(store, adv, all_crds)
-    all_entities = watched_keys(store, all_entities)
     companies = (refresh_issuers(store, formd, list(store.confirmed_ciks(all_entities)))
                  if formd is not None else {})
 

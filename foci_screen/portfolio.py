@@ -13,6 +13,11 @@ database has been rebuilt from nothing.
 
     FOCI-PORTFOLIO-1.<base64url(deflate(json))>.<checksum>
 
+A portfolio can instead name a whole office or agency (`scope`, see
+scopes.py): its companies are then whoever that office's awards name, as far
+as this site has read them, and the key stays one short line however many
+there are.
+
 The checksum is not security. It is there because the realistic failure is a
 key that got truncated copying it out of an email or a text file, and a
 portfolio that silently loads eight of its ten companies is worse than one
@@ -60,11 +65,13 @@ class Portfolio:
     name: str = "Portfolio"
     companies: list[Company] = field(default_factory=list)
     created_at: str = field(default_factory=_now)
+    # A whole office or agency: {"id": scope id, "label": what to call it}.
+    scope: dict | None = None
 
     def to_dict(self) -> dict:
         return {"name": self.name,
                 "companies": [c.to_dict() for c in self.companies],
-                "created_at": self.created_at}
+                "created_at": self.created_at, "scope": self.scope}
 
 
 def _checksum(payload: bytes) -> str:
@@ -85,11 +92,14 @@ def _canonical(portfolio: Portfolio) -> bytes:
         # and the key is read by humans copying it around, so it stays short.
         "c": [[c.key, c.name] for c in portfolio.companies],
     }
+    # Only when there is one, so every key made before scopes reads the same.
+    if portfolio.scope:
+        body["s"] = {"id": portfolio.scope["id"], "label": portfolio.scope.get("label", "")}
     return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 def encode(portfolio: Portfolio) -> str:
-    if not portfolio.companies:
+    if not portfolio.companies and not portfolio.scope:
         raise PortfolioKeyError("A portfolio needs at least one company.")
     if len(portfolio.companies) > MAX_COMPANIES:
         raise PortfolioKeyError(
@@ -148,15 +158,28 @@ def decode(text: str) -> Portfolio:
         body_obj = json.loads(raw.decode("utf-8"))
         companies = [Company(key=str(k), name=str(n))
                      for k, n in body_obj.get("c", [])]
-    except (ValueError, TypeError) as exc:
+        scope = body_obj.get("s") or None
+        if scope is not None:
+            scope = {"id": str(scope["id"]), "label": str(scope.get("label") or "")}
+    except (ValueError, TypeError, KeyError) as exc:
         raise PortfolioKeyError("That key's contents are not readable.") from exc
 
-    if not companies:
+    if not companies and not scope:
         raise PortfolioKeyError("That key holds no companies.")
 
     return Portfolio(name=str(body_obj.get("n") or "Portfolio"),
                      companies=companies,
-                     created_at=str(body_obj.get("t") or _now()))
+                     created_at=str(body_obj.get("t") or _now()), scope=scope)
+
+
+def from_scope(scope) -> Portfolio:
+    """A portfolio of every contractor in a scope (scopes.Scope).
+
+    Undated, so the same office always makes the same key: asking for it twice
+    finds the portfolio and alert list already made rather than a second set.
+    """
+    return Portfolio(name=f"{scope.title()}: every contractor", created_at="",
+                     scope={"id": scope.id, "label": scope.title()})
 
 
 def from_entity_keys(name: str, keys: list[str],

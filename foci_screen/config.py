@@ -259,6 +259,11 @@ class Config:
     # (vercel.json "crons"), once it is set on the project. Optional on a public
     # site; on one that needs a key it is how the daily job gets in.
     cron_secret: str = field(default_factory=lambda: _env("CRON_SECRET"))
+    # How many runs a day a watch on a whole office may make while it catches
+    # up — reading its awards, screening its contractors. Each is up to
+    # FOCI_SCREEN_SECONDS; on Vercel's free plan they count towards its hours.
+    scope_runs_per_day: int = field(default_factory=lambda: int(
+        _env("FOCI_SCOPE_RUNS_PER_DAY", "12") or 12))
 
     def ensure_dirs(self) -> None:
         for d in (self.cache_dir, self.out_dir):

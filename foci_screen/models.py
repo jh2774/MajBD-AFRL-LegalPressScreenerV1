@@ -83,6 +83,7 @@ class Contract(Serialisable):
     psc_description: str = ""
     solicitation_id: str = ""
     contracting_office_id: str = ""
+    contracting_office_name: str = ""
     recipient_country: str = ""
     country_of_incorporation: str = ""
     state_of_incorporation: str = ""

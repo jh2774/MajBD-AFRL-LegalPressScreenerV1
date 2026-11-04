@@ -31,6 +31,7 @@ from .. import accounts, aliases, consent, fund_managers, portfolio_mail, sysche
 from .. import alerts as alerts_engine
 from .. import policy as screening
 from .. import portfolio as portfolio_keys
+from .. import scopes as scopes_mod
 from .. import vehicles as vehicles_engine
 from ..config import get_config
 from ..connectors.adv import PDF_URL as ADV_PDF_URL
@@ -69,6 +70,7 @@ from .schemas import (
     PortfolioKey,
     PortfolioRequest,
     RuleSetting,
+    ScopeWatch,
     ScreenRequest,
     SignalDisposition,
     TokenPassword,
@@ -940,13 +942,16 @@ def save_my_portfolio(body: AccountPortfolio, request: Request) -> dict:
 # follows it, matched by its key.
 
 def _listed(row: dict) -> dict:
+    scope = None
     try:
-        companies = len(portfolio_keys.decode(row["portfolio_key"]).companies)
+        decoded = portfolio_keys.decode(row["portfolio_key"])
+        scope = decoded.scope
+        companies = None if scope else len(decoded.companies)
     except portfolio_keys.PortfolioKeyError:
         companies = None
     return {"portfolio_id": row["portfolio_id"], "name": row["name"],
             "portfolio_key": row["portfolio_key"], "companies": companies,
-            "updated_at": row["updated_at"]}
+            "scope": (scope or {}).get("label") or None, "updated_at": row["updated_at"]}
 
 
 @app.get("/v1/me/portfolios", tags=["accounts"])
@@ -1485,6 +1490,12 @@ def edit_portfolio(req: PortfolioEdit, store: Store = Depends(tenant_store)) -> 
             raise HTTPException(400, str(exc)) from exc
     else:
         current = portfolio_keys.Portfolio(name=req.name or "Portfolio")
+    if current.scope:
+        raise HTTPException(
+            400, "This portfolio is every contractor at "
+                 f"{current.scope.get('label') or 'an office'}: it follows the office's "
+                 "awards, so companies are not added to it or taken off by hand. Build a "
+                 "portfolio of your own for a list you choose.")
 
     dropping = {k.strip().upper() for k in req.remove if k.strip()}
     keys = [c.key for c in current.companies if c.key.upper() not in dropping]
@@ -1527,6 +1538,8 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
         loaded = portfolio_keys.decode(req.key)
     except portfolio_keys.PortfolioKeyError as exc:
         raise HTTPException(400, str(exc)) from exc
+    if loaded.scope:
+        return _scope_portfolio(loaded, store, req.offset)
 
     rows: list[dict] = []
     for company in loaded.companies:
@@ -1597,6 +1610,133 @@ def load_portfolio(req: PortfolioKey, store: Store = Depends(tenant_store)) -> d
         },
         "severity": by_severity,
     }
+
+
+# ------------------------------------------------------- whole offices
+# Every contractor an office or agency's awards name (scopes.py), watched with
+# one search: a watchlist that reads its awards and screens its contractors a
+# few at a time, a portfolio that is the office, and an alert list on it.
+
+SCOPE_PAGE = 100            # contractors a page, on a portfolio of a whole office
+SCOPE_PER_RUN = 10          # contractors screened per run of its watch
+
+
+def _scope_or_400(text: str):
+    try:
+        return scopes_mod.parse(text)
+    except scopes_mod.ScopeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _scope_watch(store: Store, scope) -> dict | None:
+    """This workspace's watch on a scope, if it has one."""
+    for row in store.list_watchlists():
+        if _json(row.get("params")).get("scope") == scope.id:
+            return row
+    return None
+
+
+def _scope_progress(store: Store, scope) -> dict:
+    """What has been done for a scope here: its contractors, how many are
+    screened, and its watch's state."""
+    summary = store.scope_summary(scope)
+    watch = _scope_watch(store, scope)
+    index = store.scope_index_rows(scope.id)
+    return {**summary,
+            "months_read": sorted({r["month"] for r in index if r["done"]}),
+            "watch": {"watchlist_id": watch["watchlist_id"], "active": bool(watch["active"]),
+                      "last_run_at": watch.get("last_run_at"),
+                      "last_run_id": watch.get("last_run_id"),
+                      "catching_up": bool(watch.get("backlog"))} if watch else None}
+
+
+def _scope_portfolio(loaded, store: Store, offset: int) -> dict:
+    """A portfolio that is a whole office: its contractors a page at a time,
+    the most serious latest finding first, with the totals for all of them."""
+    scope = _scope_or_400(loaded.scope["id"])
+    progress = _scope_progress(store, scope)
+    rows = store.scope_rows(scope, SCOPE_PAGE + 1, offset)
+    companies = [{
+        "entity_key": r["entity_key"], "page_key": r["entity_key"],
+        "entity_name": r["entity_name"] or r["entity_key"],
+        "severity": r["severity"], "score": r["score"],
+        "last_screened": r["screened_at"] or r["finding_at"],
+        "obligated": float(r["obligated"] or 0),
+        "contract_count": int(r["contract_count"] or 0),
+        "screened_here": bool(r["screened_at"] or r["finding_at"]), "kind": "contractor",
+        "cik": None, "latest_raise": None, "funds": None,
+    } for r in rows[:SCOPE_PAGE]]
+    return {
+        "name": loaded.name, "created_at": loaded.created_at, "companies": companies,
+        "totals": {"companies": progress["contractors"],
+                   "screened_here": progress["screened"],
+                   "obligated": progress["obligated"], "contracts": progress["awards"]},
+        "severity": progress["severity"],
+        "scope": {**scope.to_dict(), **{k: progress[k] for k in ("months_read", "watch")},
+                  "offset": offset, "page": SCOPE_PAGE, "more": len(rows) > SCOPE_PAGE},
+    }
+
+
+@app.get("/v1/scopes/lookup", tags=["portfolio"])
+def lookup_scope(q: str = Query(..., min_length=2, max_length=300),
+                 store: Store = Depends(tenant_store)) -> dict:
+    """An office or agency, by name or code, and how far this workspace has got
+    with it — what the page shows before anyone starts watching it."""
+    scope = _scope_or_400(q)
+    key = portfolio_keys.encode(portfolio_keys.from_scope(scope))
+    return {"scope": scope.to_dict(), "progress": _scope_progress(store, scope),
+            "portfolio_key": key}
+
+
+@app.post("/v1/scopes/watch", status_code=201, tags=["portfolio"])
+def watch_scope(body: ScopeWatch, request: Request,
+                tenant: str = Depends(require_tenant),
+                admin: bool = Depends(is_admin),
+                trusted: bool = Depends(vouched)) -> dict:
+    """Watch every contractor in an office or agency, in one step.
+
+    A watchlist reads its awards and screens its contractors, a few each run,
+    every day — several times a day until it has caught up — and its first run
+    starts now. Its portfolio is the office: whoever its awards name. Given
+    addresses, an alert list on that portfolio emails them when any of those
+    contractors changes, under the usual rules: an address that has not agreed
+    to alerts is asked first. Signed in, the portfolio is kept on the account
+    and opened.
+    """
+    store = store_for(tenant)
+    scope = _scope_or_400(body.scope)
+    watch = _scope_watch(store, scope)
+    if watch is None:
+        screen = ScreenRequest(scope=scope.id, agency=scope.title(),
+                               months_back=body.months_back, max_entities=SCOPE_PER_RUN,
+                               skip_web=True, fetch_filing_bodies=False)
+        watchlist_id = store.create_watchlist(f"{scope.title()}: every contractor",
+                                              screen.model_dump())
+    else:
+        watchlist_id = watch["watchlist_id"]
+        if not watch["active"]:
+            store.set_watchlist_active(watchlist_id, True)
+    store.set_watchlist_backlog(watchlist_id, True)
+    started = run_watchlist(watchlist_id, request, tenant)
+
+    key = portfolio_keys.encode(portfolio_keys.from_scope(scope))
+    user = session_user(request)
+    account_view = None
+    if user is not None:
+        account_view = add_portfolio(AccountPortfolio(portfolio_key=key), request)["account"]
+
+    alerts = None
+    if body.emails:
+        existing = next((s for s in store.alert_subscriptions()
+                         if s.get("portfolio_key") == key), None)
+        alerts = save_subscription(
+            AlertSubscriptionRequest(
+                subscription_id=existing["subscription_id"] if existing else "",
+                name=f"{scope.title()}: every contractor", emails=body.emails,
+                portfolio_key=key),
+            request, store, admin, trusted)
+    return {"scope": scope.to_dict(), "watchlist_id": watchlist_id, "run": started,
+            "portfolio_key": key, "account": account_view, "alerts": alerts}
 
 
 def _latest_raise(store: Store, entity_keys: list[str]) -> dict:
@@ -2012,7 +2152,9 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
     except portfolio_keys.PortfolioKeyError as exc:
         raise HTTPException(400, str(exc)) from exc
 
-    companies = [c.key for c in loaded.companies]
+    scope = _scope_or_400(loaded.scope["id"]) if loaded.scope else None
+    companies = (store.scope_entity_keys(scope) if scope
+                 else [c.key for c in loaded.companies])
     existing = store.alert_subscription(body.subscription_id) \
         if body.subscription_id else None
     before = set(existing["companies"]) if existing else set()
@@ -2051,7 +2193,8 @@ def save_subscription(body: AlertSubscriptionRequest, request: Request,
                      else {**a, "email": consent.mask(a["email"])} for a in v]
                  for k, v in asked.items()}
     baselined = alerts_engine.baseline(store, sub_id,
-                                       [c for c in companies if c not in before])
+                                       [c for c in companies if c not in before],
+                                       award_keys=scope is not None)
     return {"subscription": _shown_list(store, sub, admin), "baselined": baselined,
             "declined": shown, "consent": asked}
 
@@ -2173,6 +2316,7 @@ def run_alerts(request: Request, only_if_due: bool = Query(False),
 
 SWEEP_ALERTS_HOURS = 12           # a workspace checked more recently is skipped
 SWEEP_WATCHLISTS_HOURS = 20
+CATCH_UP_MINUTES = 3              # a watch catching up runs again after this
 
 
 def _hours_ago(hours: float) -> str:
@@ -2265,26 +2409,36 @@ def scheduled_watchlist(request: Request, _tenant: str = Depends(require_tenant)
     """Re-screen the next active watchlist, in any workspace, not run for most
     of a day. Where screens run inside requests (Vercel) it runs in this one,
     up to FOCI_SCREEN_SECONDS. `left` is how many more are due."""
-    before = _hours_ago(SWEEP_WATCHLISTS_HOURS)
     site = store_for(auth.DEFAULT_TENANT)
-    due = site.watchlists_due(before)
-    for n, row in enumerate(due):
-        if not site.claim_watchlist_run(row["watchlist_id"], before):
+
+    def due_now() -> tuple[str, dict]:
+        # A watch on a whole office still catching up is due again a few
+        # minutes after its last run, up to FOCI_SCOPE_RUNS_PER_DAY a day.
+        return _hours_ago(SWEEP_WATCHLISTS_HOURS), {
+            "catch_up_before": _hours_ago(CATCH_UP_MINUTES / 60), "today": _today()[:10],
+            "runs_per_day": cfg.scope_runs_per_day}
+
+    before, catch_up = due_now()
+    for row in site.watchlists_due(before, **catch_up):
+        if not site.claim_watchlist_run(row["watchlist_id"], before, **catch_up):
             continue                    # another sweep took it
         tenant = row["tenant_id"]
         store = store_for(tenant)
         options = {**_json(row["params"]), "watchlist_id": row["watchlist_id"]}
         run_id = store.start_run(options.get("agency", ""), options, status="queued")
         store.mark_watchlist_run(row["watchlist_id"], run_id)
-        left = len(due) - n - 1
         if queue.backend != "request":
             queue.enqueue(tenant, run_id, options, **_hold_for(run_id, request))
-            return {"status": "queued", "left": left}
-        if not store.claim_run(run_id):
-            return {"status": "already running", "left": left}
-        from .. import jobs as jobs_mod
-        jobs_mod.run_screen_job(tenant, run_id, options, limit_seconds=cfg.screen_seconds)
-        return {"status": (store.get_run(run_id) or {}).get("status", ""), "left": left}
+            status = "queued"
+        elif not store.claim_run(run_id):
+            status = "already running"
+        else:
+            from .. import jobs as jobs_mod
+            jobs_mod.run_screen_job(tenant, run_id, options, limit_seconds=cfg.screen_seconds)
+            status = (store.get_run(run_id) or {}).get("status", "")
+        # Counted after the run: one still catching up may be due again.
+        before, catch_up = due_now()
+        return {"status": status, "left": len(site.watchlists_due(before, **catch_up))}
     return {"status": "nothing due", "left": 0}
 
 
@@ -2571,6 +2725,9 @@ def suggest(q: str = Query("", max_length=120),
         return {"query": q, "local": [], "remote": [], "remote_checked": False}
 
     local: list[dict] = []
+    for scope in scopes_mod.suggest(q):
+        local.append({"kind": "scope", "label": scope.title(), "key": scope.id,
+                      "detail": "every contractor — watch them all at once"})
     for row in store.search_entities(q, limit=6):
         local.append({"kind": "entity", "label": row["entity_name"],
                       "key": row["entity_key"], "severity": row.get("severity"),
@@ -2737,8 +2894,13 @@ def agency_profile(name: str,
     # Two lists on one page, each paged on its own: turning through an
     # agency's contractors should not reset where its officer list was.
     contracts = store.contracts_where("agency", name, 1)
+    # Every contractor at it, watched at once (scopes.py): a department, or a
+    # sub-agency inside its department.
+    scope = f"agency:{name}"
     if not contracts:
         contracts = store.contracts_where("sub_agency", name, 1)
+        if contracts:
+            scope = f"agency:{contracts[0]['agency']}|{name}"
     if not contracts:
         raise HTTPException(404, "No contracts recorded for that agency.")
     entities, entities_more = _paged(
@@ -2761,6 +2923,7 @@ def agency_profile(name: str,
         "officers_more": officers_more,
         # Every contractor, for "watch them all" — not the page shown.
         "entity_keys": store.entity_keys_for_agency(name),
+        "scope": scope,
     }
 
 

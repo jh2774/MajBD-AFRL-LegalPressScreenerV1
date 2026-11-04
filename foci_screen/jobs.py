@@ -100,7 +100,14 @@ def run_screen_job(tenant_id: str, run_id: str, options: dict,
     try:
         store.mark_running(run_id)
         opts = ScreenOptions(**options)
+        if opts.scope and limit_seconds and not opts.time_budget:
+            # A run over a whole office plans its own time, so it can stop
+            # cleanly — with its notices drafted — before the hard limit.
+            opts.time_budget = max(60, limit_seconds - 30)
         result = screener.run(opts, progress=progress, run_id=run_id)
+        if opts.scope and opts.watchlist_id:
+            store.set_watchlist_backlog(opts.watchlist_id,
+                                        bool(result.stats.get("backlog")))
 
         notices, held = raise_notices(store, result.findings, run_id,
                                       watchlist_id=opts.watchlist_id)

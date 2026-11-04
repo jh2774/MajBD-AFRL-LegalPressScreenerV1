@@ -60,6 +60,79 @@ def _flag(elem, *names: str) -> bool | None:
     return None
 
 
+def _attr(elem, path: str, name: str = "name") -> str:
+    """An attribute of the first element called `path` — FPDS puts the readable
+    name of a code there: <contractingOfficeID name="AFRL/RGKA">FA2280</...>."""
+    if elem is None:
+        return ""
+    for node in elem.iter():
+        if node.tag.split("}")[-1] == path:
+            return (node.get(name) or "").strip()
+    return ""
+
+
+# FPDS gives agencies as codes; awards from USAspending spell them out. The
+# defence ones are spelled the USAspending way so the two sources agree.
+_DOD_SUBTIERS = {"5700": "Department of the Air Force", "2100": "Department of the Army",
+                 "1700": "Department of the Navy"}
+
+
+def _amount(text: str) -> float:
+    try:
+        return float(text or 0)
+    except ValueError:
+        return 0.0
+
+
+def contract_from_entry(entry) -> Contract | None:
+    """One FPDS contract action as an award, or None without a PIID.
+
+    The office that awarded it is kept (`contracting_office_id` and its name),
+    which is what lets a whole office be watched. The amount is the award's
+    total obligated to date when the action carries it, so the newest action
+    on an award gives its total rather than one modification's slice.
+    """
+    piid = _text(entry, "PIID")
+    if not piid:
+        return None
+    sub_code = _text(entry, "contractingOfficeAgencyID")
+    sub_name = _DOD_SUBTIERS.get(sub_code) or _attr(entry, "contractingOfficeAgencyID").title()
+    agency = ("Department of Defense" if sub_code in _DOD_SUBTIERS or sub_code.startswith("97")
+              else _attr(entry, "departmentID").title() or sub_name)
+    total = _amount(_text(entry, "totalObligatedAmount"))
+    contract = Contract(
+        award_id=piid, piid=piid,
+        recipient_name=_text(entry, "vendorName"),
+        recipient_uei=_text(entry, "UEI"),
+        parent_recipient_name=_text(entry, "ultimateParentUEIName"),
+        parent_recipient_uei=_text(entry, "ultimateParentUEI"),
+        awarding_agency=agency, awarding_sub_agency=sub_name,
+        award_amount=total or _amount(_text(entry, "obligatedAmount")),
+        start_date=(_text(entry, "signedDate") or "")[:10],
+        end_date=(_text(entry, "currentCompletionDate")
+                  or _text(entry, "ultimateCompletionDate") or "")[:10],
+        description=_text(entry, "descriptionOfContractRequirement"),
+        naics_code=_text(entry, "principalNAICSCode"),
+        naics_description=_attr(entry, "principalNAICSCode", "description"),
+        psc_code=_text(entry, "productOrServiceCode"),
+        psc_description=_attr(entry, "productOrServiceCode", "description"),
+        solicitation_id=_text(entry, "solicitationID"),
+        contracting_office_id=_text(entry, "contractingOfficeID"),
+        contracting_office_name=_attr(entry, "contractingOfficeID"),
+        country_of_incorporation=_text(entry, "countryOfIncorporation"),
+        state_of_incorporation=_text(entry, "stateOfIncorporation"),
+        foreign_owned_and_located=_text(entry, "isForeignOwnedAndLocated").lower()
+        in ("true", "y", "yes"),
+        foreign_funding=_text(entry, "foreignFunding"),
+        source_url=f'https://www.fpds.gov/ezsearch/search.do?q=PIID:"{piid}"',
+    )
+    FPDSConnector._apply_registration(contract, _registration(entry))
+    officer = FPDSConnector._officer_from_entry(entry)
+    if officer.is_addressable:
+        contract.officer = officer
+    return contract
+
+
 def _registration(entry) -> dict:
     """The vendor's SAM registration details, as FPDS copies them onto an award.
 
@@ -111,6 +184,39 @@ class FPDSConnector:
             log.debug("FPDS parse error for %s: %s", piid, exc)
             return []
         return list(root.iter(f"{ATOM_NS}entry"))
+
+    # FPDS's feed gives ten actions a page, and a modification is an action of
+    # its own: an office's month is one query, read page by page.
+    PAGE = 10
+
+    def search_page(self, query: str, start: int = 0) -> tuple[list[Contract], bool, bool]:
+        """One page of a feed query: (awards, more pages after this, answered).
+
+        Modifications of one award on the page are folded into it, keeping the
+        newest action's details. `answered` is False when FPDS did not reply
+        usably, so a caller can try the page again rather than skip it.
+        """
+        resp = self.http.get(FEED, params={"FEEDNAME": "PUBLIC", "q": query,
+                                           "start": str(start)})
+        if resp.get("status") != 200 or not resp.get("text"):
+            return [], False, False
+        try:
+            root = ET.fromstring(resp["text"])
+        except ET.ParseError as exc:
+            log.debug("FPDS parse error for %s at %s: %s", query, start, exc)
+            return [], False, False
+        entries = list(root.iter(f"{ATOM_NS}entry"))
+        more = any(link.get("rel") == "next" for link in root.iter(f"{ATOM_NS}link"))
+        newest: dict[str, tuple[str, Contract]] = {}
+        for entry in entries:
+            contract = contract_from_entry(entry)
+            if contract is None:
+                continue
+            signed = _text(entry, "signedDate")
+            held = newest.get(contract.piid)
+            if held is None or signed > held[0]:
+                newest[contract.piid] = (signed, contract)
+        return [c for _, c in newest.values()], more and bool(entries), True
 
     def enrich(self, contract: Contract) -> Contract:
         # `fpds_piid` is the prime's PIID for a subaward: a subcontract has no
@@ -203,7 +309,8 @@ class FPDSConnector:
         entries.sort(key=lambda e: _text(e, "signedDate") or "", reverse=True)
         return _registration(entries[0])
 
-    def _officer_from_entry(self, entry) -> ContractingOfficer:
+    @staticmethod
+    def _officer_from_entry(entry) -> ContractingOfficer:
         """Prefer the approver (warranted official) over the last editor."""
         candidates = [
             ("approvedBy", "high"),

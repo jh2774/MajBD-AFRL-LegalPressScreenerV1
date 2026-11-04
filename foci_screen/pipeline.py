@@ -7,10 +7,13 @@ a FastAPI request handler or a queue worker later without modification.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 from . import policy as screening
+from . import scopes as scopes_mod
 from .connectors.alerts import AlertConnector
 from .connectors.feeds import FeedConnector
 from .connectors.fpds import FPDSConnector
@@ -20,7 +23,7 @@ from .connectors.sec_edgar import EdgarConnector
 from .connectors.usaspending import USASpendingConnector, looks_like_an_individual
 from .connectors.uspto_dataset import PatentAssignmentDataset
 from .connectors.webwatch import WebWatchConnector
-from .models import Change, Contract, Document, Entity, Finding
+from .models import Change, Contract, ContractingOfficer, Document, Entity, Finding
 from .risk import engine
 from .store import Store
 
@@ -50,6 +53,12 @@ class ScreenOptions:
     # The watchlist that started this run, if one did. Its policy, laid over
     # the tenant's, decides what is screened for and what raises a notice.
     watchlist_id: str = ""
+    # A whole office or agency (scopes.py): every contractor its awards name,
+    # read over successive runs and screened `max_entities` at a time.
+    scope: str = ""
+    # Seconds this run may take, so a run over a scope stops in time to finish
+    # properly. 0: Screener.SCOPE_RUN_SECONDS.
+    time_budget: int = 0
 
 
 @dataclass
@@ -92,7 +101,7 @@ class Screener:
         # return an id before the work started. When it did, the caller owns the
         # run's lifecycle and this method must not close it out.
         owns_run = not run_id
-        subject = opts.recipient or opts.agency
+        subject = opts.recipient or opts.agency or opts.scope
         # Each run reads its own policy: a Screener reused across runs must
         # not carry one watchlist's settings into the next.
         self._watchlist_id = opts.watchlist_id
@@ -100,6 +109,8 @@ class Screener:
         if owns_run:
             run_id = self.store.start_run(subject, opts.__dict__)
         result = ScreenResult(run_id=run_id, options=opts)
+        if opts.scope:
+            return self._run_scope(opts, result, progress, run_id, owns_run)
 
         # --- step 1: contracts ------------------------------------------
         progress(f"Searching USAspending for {subject} awards "
@@ -193,6 +204,168 @@ class Screener:
         if owns_run:
             self.store.finish_run(run_id, stats=result.stats)
         return result
+
+    # ---------------------------------------------------- a whole office
+    # A run over a scope reads its awards for part of the time it has — a month
+    # of an office at a time, from FPDS; an agency's largest awards, from
+    # USAspending — and keeps every one, whoever it names. Then it screens the
+    # scope's contractors in turn, those never screened first, for the rest.
+    # What it does not reach, the next run does; the watch says it has a
+    # backlog until nothing is left.
+    SCOPE_RUN_SECONDS = 240
+    INDEX_SHARE = 0.4
+    SCREEN_MARGIN = 45          # no new contractor with less than this left
+    REREAD_MONTHS = 4           # DoD publishes contract actions 90 days late,
+    REREAD_DAYS = 7             # so recent months are read again weekly
+    RESCREEN_DAYS = 30
+    AGENCY_PAGES = 20           # USAspending: an agency's 2,000 largest awards
+    PAGES_PER_QUERY = 300       # a guard against a feed that never ends
+
+    def _run_scope(self, opts: ScreenOptions, result: ScreenResult, progress,
+                   run_id: str, owns_run: bool) -> ScreenResult:
+        scope = scopes_mod.parse(opts.scope)
+        started = time.monotonic()
+        budget = opts.time_budget or self.SCOPE_RUN_SECONDS
+        index_until = started + budget * self.INDEX_SHARE
+        stop_at = started + budget
+        progress(f"Reading the awards of {scope.title()}...")
+        if scope.source == "fpds":
+            indexed, left = self._index_fpds(scope, opts, run_id, index_until, progress)
+        else:
+            indexed, left = self._index_usaspending(scope, opts, run_id, index_until,
+                                                    progress)
+        progress(f"  {indexed} award(s) read this run; {left} part(s) still to read.")
+
+        stale = (datetime.now(timezone.utc) - timedelta(days=self.RESCREEN_DAYS)) \
+            .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+        screened = 0
+        for row in self.store.scope_candidates(scope, stale, opts.max_entities):
+            if time.monotonic() > stop_at - self.SCREEN_MARGIN:
+                break
+            key = row["entity_key"]
+            contracts = [contract_from_row(r)
+                         for r in self.store.contracts_where("entity_key", key, 6)]
+            if not contracts:
+                continue
+            name = contracts[0].recipient_name or key
+            progress(f"\n[{name}]")
+            if any(c.is_sole_proprietor for c in contracts):
+                result.notes.append(
+                    f"Did not screen {name}: its SAM registration, as FPDS records it, is "
+                    f"a sole proprietorship — a person, whom this tool does not screen.")
+                self.store.mark_entity_screened(key)
+                continue
+            entity = self._build_entity(name, contracts, opts)
+            finding = self._screen_entity(entity, contracts, run_id, opts, progress, [])
+            self.store.mark_entity_screened(key)
+            screened += 1
+            if finding:
+                self.store.save_finding(finding)
+                result.findings.append(finding)
+            result.contracts.extend(contracts)
+
+        summary = self.store.scope_summary(scope)
+        unscreened = max(0, summary["contractors"] - summary["screened"])
+        result.findings.sort(key=lambda f: -f.total_score)
+        result.stats = dict(self.http.stats)
+        result.stats.update({
+            "scope": scope.id, "awards_indexed": indexed, "parts_left": left,
+            "contractors": summary["contractors"], "screened_total": summary["screened"],
+            "entities_screened": screened, "unscreened": unscreened,
+            # More to do than one run did: the watch runs again today.
+            "backlog": bool(left or unscreened)})
+        result.notes.append(
+            f"{scope.title()}: {summary['contractors']} contractor(s) found so far, "
+            f"{summary['screened']} screened"
+            + (f"; {unscreened} still to screen" if unscreened else "")
+            + (f"; {left} part(s) of the award record still to read" if left else "")
+            + ". Each run screens a few more.")
+        result.notes.extend(self.coverage_notes())
+        if owns_run:
+            self.store.finish_run(run_id, stats=result.stats)
+        return result
+
+    def _index_fpds(self, scope, opts: ScreenOptions, run_id: str, until: float,
+                    progress) -> tuple[int, int]:
+        """Read the scope's months from FPDS, newest first, a page at a time,
+        from where the last run stopped. (awards read, parts left unread)."""
+        months = scopes_mod.months_back(date.today(), opts.months_back)
+        recent = set(months[:self.REREAD_MONTHS])
+        reread_before = (datetime.now(timezone.utc) - timedelta(days=self.REREAD_DAYS)) \
+            .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+        state = {(r["month"], r["query"]): r for r in self.store.scope_index_rows(scope.id)}
+        queries = scope.fpds_queries()
+        indexed, left = 0, 0
+        for month in months:
+            first, last = scopes_mod.month_range(month)
+            for qi, query in enumerate(queries):
+                row = state.get((month, qi))
+                if row and row["done"]:
+                    if month in recent and (row["fetched_at"] or "") < reread_before:
+                        self.store.reopen_scope_index(scope.id, month, qi)
+                        row = None
+                    else:
+                        continue
+                if time.monotonic() >= until:
+                    left += 1
+                    continue
+                start = row["next_start"] if row else 0
+                pages = 0
+                while True:
+                    contracts, more, answered = self.fpds.search_page(
+                        f"{query} SIGNED_DATE:[{first},{last}]", start)
+                    if not answered:
+                        left += 1           # FPDS did not answer: next run, same page
+                        break
+                    for c in contracts:
+                        self.store.save_contract(c, run_id, (c.recipient_uei
+                                                             or c.recipient_name).upper())
+                    indexed += len(contracts)
+                    start += self.fpds.PAGE
+                    pages += 1
+                    done = not more or pages >= self.PAGES_PER_QUERY
+                    out_of_time = time.monotonic() >= until
+                    self.store.save_scope_index(scope.id, month, qi, next_start=start,
+                                                done=done, awards=len(contracts))
+                    if done:
+                        break
+                    if out_of_time:
+                        left += 1
+                        break
+                progress(f"  {month}: read to action {start}.")
+        return indexed, left
+
+    def _index_usaspending(self, scope, opts: ScreenOptions, run_id: str, until: float,
+                           progress) -> tuple[int, int]:
+        """An agency's largest awards in the window, 100 a page, up to
+        AGENCY_PAGES; read again from the first page a week after finishing."""
+        agency, sub = (scope.values + ("",))[:2]
+        reread_before = (datetime.now(timezone.utc) - timedelta(days=self.REREAD_DAYS)) \
+            .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+        rows = self.store.scope_index_rows(scope.id)
+        row = rows[0] if rows else None
+        if row and row["done"]:
+            if (row["fetched_at"] or "") >= reread_before:
+                return 0, 0
+            self.store.reopen_scope_index(scope.id, "all", 0)
+            row = None
+        page = (row["next_start"] if row else 0) + 1
+        indexed = 0
+        while time.monotonic() < until:
+            contracts, more = self.usaspending.search_awards_page(
+                agency, sub_agency=sub, months_back=opts.months_back, page=page)
+            for c in contracts:
+                self.store.save_contract(c, run_id, (c.recipient_uei
+                                                     or c.recipient_name).upper())
+            indexed += len(contracts)
+            done = not more or page >= self.AGENCY_PAGES
+            self.store.save_scope_index(scope.id, "all", 0, next_start=page, done=done,
+                                        awards=len(contracts))
+            progress(f"  page {page}: {len(contracts)} award(s).")
+            if done:
+                return indexed, 0
+            page += 1
+        return indexed, 1
 
     def _subaward_entities(self, opts: ScreenOptions,
                            already: dict[str, list[Contract]],
@@ -585,3 +758,40 @@ class Screener:
                                           getattr(self, "_watchlist_id", ""))
             self._cached_policy = cached
         return cached
+
+
+def contract_from_row(row: dict) -> Contract:
+    """A stored award (a `contracts` row) back as a Contract, for screening a
+    contractor whose awards were read on an earlier run."""
+    sole = {"yes": True, "no": False}.get(row.get("sole_proprietor") or "")
+    return Contract(
+        award_id=row.get("award_id") or row.get("contract_key") or "",
+        piid=row.get("piid") or "",
+        recipient_name=row.get("entity_name") or "",
+        recipient_uei=row.get("recipient_uei") or "",
+        awarding_agency=row.get("agency") or "",
+        awarding_sub_agency=row.get("sub_agency") or "",
+        award_amount=float(row.get("amount") or 0),
+        start_date=row.get("start_date") or "",
+        end_date=row.get("end_date") or "",
+        description=row.get("description") or "",
+        naics_description=row.get("naics_description") or "",
+        psc_description=row.get("psc_description") or "",
+        solicitation_id=row.get("solicitation_id") or "",
+        contracting_office_id=row.get("office_id") or "",
+        contracting_office_name=row.get("office_name") or "",
+        recipient_country=row.get("recipient_country") or "",
+        country_of_incorporation=row.get("country_of_incorporation") or "",
+        foreign_owned_and_located=bool(row.get("foreign_owned")),
+        foreign_funding=row.get("foreign_funding") or "",
+        is_sole_proprietor=sole,
+        officer=ContractingOfficer(
+            name=row.get("ko_name") or "", email=row.get("ko_email") or "",
+            source=row.get("ko_source") or "", confidence=row.get("ko_confidence") or "low",
+            office_code=row.get("office_id") or ""),
+        ip_clause_hits=list(row.get("ip_clauses") or []),
+        source_url=row.get("source_url") or "",
+        is_subaward=bool(row.get("is_subaward")),
+        prime_award_id=row.get("prime_award_id") or "",
+        prime_recipient_name=row.get("prime_recipient_name") or "",
+    )

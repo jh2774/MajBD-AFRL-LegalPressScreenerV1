@@ -334,6 +334,36 @@ after the last test to the same list.
 To close the site again, remove `FOCI_PUBLIC` and redeploy: every page then needs a key from
 `FOCI_API_KEYS`, entered with **API key** at the top right.
 
+## Watching a whole office or agency (AFWERX, AFRL)
+
+To have alerts on every company an office contracts with, set up in one go: type **AFWERX**
+(or **AFRL**, an office code such as **FA8650**, or open an agency's page) in the search box,
+choose it, give the addresses to email, and press **Watch every contractor**. That one press:
+
+1. **reads the office's awards** for the period chosen (12 months by default) — every contract
+   and other transaction, whoever won it. An office comes from FPDS, the federal procurement
+   record, because USAspending cannot narrow below the Department of the Air Force; an agency
+   comes from USAspending (its 2,000 largest awards);
+2. **screens each contractor in turn**, a few each run, those never screened first — then
+   each again every month;
+3. **keeps a portfolio that is the office**: new contractors join it as their awards appear.
+   Signed in, it is saved to your account; it lists the flagged contractors first, 100 a page;
+4. **sets up an email alert list** on it. An address is asked to confirm first, unless it is
+   your own confirmed one. Alerts go out when any of the contractors is flagged.
+
+AFWERX is its two contracting offices, FA8649 (the Air Force SBIR/STTR office) and FA2280
+(AFRL/RGKA). AFRL is every office whose FPDS name says AFRL.
+
+**It takes days, not minutes.** AFWERX awards to well over a thousand companies a year, and a
+contractor's screen reads several registries. The watch runs with the daily **Daily
+watchlists** workflow (section 6) and, while it has work left, again every few minutes after
+each run, up to **12 runs a day** — each up to 4 minutes on Vercel, up to 10 contractors a run.
+Change the number with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's
+free-plan hours, so keep it modest there. The portfolio shows how far it has got.
+
+DoD publishes its contract actions about **90 days late**, so the four most recent months are
+read again each week as they fill in.
+
 ## Starting from an empty database
 
 Nothing comes across from the old site. Screen the agencies or contractors you need from the

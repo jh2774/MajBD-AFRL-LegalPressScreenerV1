@@ -192,6 +192,53 @@ class USASpendingConnector:
             ))
         return contracts
 
+    def search_awards_page(self, agency: str, *, sub_agency: str = "",
+                           months_back: int = 12, page: int = 1) -> tuple[list[Contract], bool]:
+        """One page of 100 of an agency's awards in the window, largest first,
+        and whether another follows — for reading a whole agency over several
+        runs."""
+        end = date.today()
+        start = end - timedelta(days=30 * months_back)
+        agencies = [{"type": "awarding", "tier": "toptier", "name": agency}]
+        if sub_agency:
+            agencies.append({"type": "awarding", "tier": "subtier", "name": sub_agency})
+        payload = {"filters": {
+            "award_type_codes": list(CONTRACT_TYPE_CODES), "agencies": agencies,
+            "time_period": [{"start_date": start.isoformat(), "end_date": end.isoformat()}]},
+            "fields": FIELDS, "page": page, "limit": 100, "sort": "Award Amount",
+            "order": "desc", "subawards": False}
+        resp = self.http.post(f"{BASE}/search/spending_by_award/", json_body=payload)
+        if resp.get("status") != 200:
+            log.warning("USAspending page %s for %s failed (%s)", page, agency,
+                        resp.get("status"))
+            return [], False
+        data = resp.get("json") or {}
+        contracts = [self._contract_from_row(row) for row in data.get("results", [])]
+        return contracts, bool((data.get("page_metadata") or {}).get("hasNext"))
+
+    @staticmethod
+    def _contract_from_row(row: dict) -> Contract:
+        naics = row.get("NAICS") or {}
+        psc = row.get("PSC") or {}
+        return Contract(
+            award_id=str(row.get("Award ID") or ""),
+            piid=str(row.get("Award ID") or ""),
+            generated_internal_id=row.get("generated_internal_id") or "",
+            recipient_name=row.get("Recipient Name") or "",
+            recipient_uei=row.get("Recipient UEI") or "",
+            awarding_agency=row.get("Awarding Agency") or "",
+            awarding_sub_agency=row.get("Awarding Sub Agency") or "",
+            award_amount=float(row.get("Award Amount") or 0),
+            start_date=row.get("Start Date") or "",
+            end_date=row.get("End Date") or "",
+            description=row.get("Description") or "",
+            naics_code=str(naics.get("code") or ""),
+            naics_description=naics.get("description") or "",
+            psc_code=str(psc.get("code") or ""),
+            psc_description=psc.get("description") or "",
+            source_url=f"https://www.usaspending.gov/award/{row.get('generated_internal_id')}",
+        )
+
     # --------------------------------------------------------------- subawards
     def search_subawards(self, agency: str, *, months_back: int = 12, limit: int = 25,
                          tier: str = "toptier", sub_agency: str = "",

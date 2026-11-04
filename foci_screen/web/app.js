@@ -2774,6 +2774,10 @@ async function viewAgency(name, params) {
       <div class="sub">${num(d.contract_count)} award(s) screened</div>
     </div>
 
+    ${d.scope ? `<div class="actions" style="margin:-6px 0 16px">
+      <a class="button primary" href="#/scope/${encodeURIComponent(d.scope)}">Watch every
+        contractor at ${esc(d.agency)}</a></div>` : ""}
+
     <div class="grid cols-3">
       ${statCard("Obligated", money(d.obligated))}
       ${statCard("Contractors", num(d.entity_count ?? d.entities.length))}
@@ -3271,7 +3275,138 @@ function wireAddToPortfolio() {
   };
 }
 
-function portfolioTable(companies) {
+/* A portfolio that is a whole office: how far its watch has got. */
+function scopeProgressCard(d) {
+  const s = d.scope;
+  const t = d.totals;
+  const watch = s.watch;
+  const pct = t.companies ? Math.round((t.screened_here / t.companies) * 100) : 0;
+  return `<div class="card">
+    <h2>Every contractor at ${esc(s.label)}</h2>
+    <p class="muted" style="font-size:13px">${esc(s.about || "")}</p>
+    <p>${num(t.companies)} contractor${t.companies === 1 ? "" : "s"} found so far${
+      s.months_read.length ? `, from ${num(s.months_read.length)} month${
+        s.months_read.length === 1 ? "" : "s"} of awards read in full` : ""};
+      <strong>${num(t.screened_here)} screened</strong> (${pct}%).</p>
+    <div class="bar-track" style="max-width:420px"><div class="bar-fill"
+      style="width:${pct}%;background:var(--accent)"></div></div>
+    <p class="muted" style="font-size:12.5px;margin-top:10px">${watch
+      ? `${watch.catching_up ? "Still catching up: its watch runs several times a day, "
+                               + "reading awards and screening a few contractors each run."
+                             : "Caught up: its watch runs once a day for new awards and "
+                               + "contractors, and screens each again every month."}
+         ${watch.last_run_id ? `<a href="#/screens/${encodeURIComponent(watch.last_run_id)}">Its
+           latest run</a>.` : ""}`
+      : `Nobody is watching this office yet, so nothing new is read.
+         <a href="#/scope/${encodeURIComponent(s.id)}">Start watching it</a>.`}
+      Email alerts below go out when any of them is flagged.</p>
+  </div>`;
+}
+
+function scopePager(d) {
+  const s = d.scope;
+  if (!s.offset && !s.more) return "";
+  const shown = d.companies.length;
+  return `<div class="pager">
+    <span class="muted">${num(s.offset + 1)}–${num(s.offset + shown)} of
+      ${num(d.totals.companies)}</span>
+    ${s.offset ? `<a href="#/portfolio?from=${Math.max(0, s.offset - s.page)}">Previous</a>` : ""}
+    ${s.more ? `<a href="#/portfolio?from=${s.offset + s.page}">Next ${num(s.page)}</a>` : ""}
+  </div>`;
+}
+
+/* An office or agency, and the one button that watches all of it: its awards
+ * read, its contractors screened in turn, a portfolio that is the office, and
+ * email alerts on it. */
+async function viewScope(id) {
+  setBusy("Looking it up…");
+  const d = await api(`/v1/scopes/lookup?q=${encodeURIComponent(id)}`);
+  const s = d.scope;
+  const p = d.progress;
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>${esc(s.label)}</h1>
+      <div class="sub">${esc(s.about || (s.source === "fpds"
+        ? "A contracting office, from the federal procurement record (FPDS)."
+        : "An agency, from USAspending."))}</div>
+    </div>
+
+    ${p.watch ? `<div class="card">
+      <h2>Already watched</h2>
+      <p>${num(p.contractors)} contractor${p.contractors === 1 ? "" : "s"} found so far;
+        ${num(p.screened)} screened.</p>
+      <div class="actions"><button class="primary" id="scope-open">Open its portfolio</button></div>
+    </div>` : ""}
+
+    <div class="card">
+      <h2>Watch every contractor${p.watch ? " — and add people to its alerts" : ""}</h2>
+      <p class="muted">One step does all of it:</p>
+      <ol class="muted">
+        <li><strong>Read its awards.</strong> Every contract ${s.source === "fpds"
+          ? "and other transaction this office awarded" : "this agency awarded"} in the period
+          you choose, from the ${s.source === "fpds" ? "federal procurement record (FPDS)"
+          : "USAspending record"} — whoever won them.</li>
+        <li><strong>Screen each contractor in turn.</strong> A few each run, several runs a
+          day until all are done, then each again every month. With hundreds of companies
+          this takes days, not minutes; the portfolio shows how far it has got.</li>
+        <li><strong>Keep a portfolio that is the office.</strong> New contractors join it as
+          their awards appear.</li>
+        <li><strong>Email alerts.</strong> Whoever you list hears when any of them is flagged.
+          Each address is asked to confirm first, unless it is yours.</li>
+      </ol>
+      <label class="field" style="display:block;margin-top:12px" for="scope-emails">Email
+        alerts to <span class="muted">(one or more addresses; leave empty for none yet)</span></label>
+      <input id="scope-emails" type="text" class="text-input" autocomplete="email"
+        value="${esc(account ? account.email : "")}" placeholder="name@agency.gov"
+        style="width:100%;max-width:420px;display:block;margin-top:6px">
+      <label class="field" style="display:block;margin-top:12px" for="scope-months">Awards
+        from the last</label>
+      <select id="scope-months" class="text-input" style="margin-top:6px">
+        <option value="6">6 months</option><option value="12" selected>12 months</option>
+        <option value="24">24 months</option></select>
+      <div class="actions"><button class="primary" id="scope-watch">Watch every
+        contractor</button></div>
+      <p class="muted" id="scope-status" role="status" style="font-size:12.5px"></p>
+    </div>`;
+
+  const openPortfolio = async () => {
+    if (account) {
+      const r = await apiPost("/v1/me/portfolios", { portfolio_key: d.portfolio_key });
+      account = r.account;
+    } else {
+      await rememberPortfolioKey(d.portfolio_key);
+    }
+    rememberAlertListId("");
+    location.hash = "#/portfolio";
+  };
+  const open = document.getElementById("scope-open");
+  if (open) open.onclick = openPortfolio;
+
+  document.getElementById("scope-watch").onclick = async () => {
+    const button = document.getElementById("scope-watch");
+    const status = document.getElementById("scope-status");
+    button.disabled = true;
+    status.textContent = "Setting it up…";
+    try {
+      const r = await apiPost("/v1/scopes/watch", {
+        scope: s.id,
+        emails: document.getElementById("scope-emails").value.split(/[\s,;]+/).filter(Boolean),
+        months_back: Number(document.getElementById("scope-months").value),
+      });
+      // Where screens run inside a request (Vercel), this page runs the first.
+      runScreenInRequest(r.run);
+      if (account && r.account) account = r.account;
+      else await rememberPortfolioKey(r.portfolio_key);
+      if (r.alerts && r.alerts.subscription) rememberAlertListId(r.alerts.subscription.subscription_id);
+      location.hash = "#/portfolio";
+    } catch (e) {
+      status.textContent = e.message || String(e);
+      button.disabled = false;
+    }
+  };
+}
+
+function portfolioTable(companies, removable = true) {
   const contractors = companies.filter((r) => r.kind !== "adviser");
   const firms = companies.filter((r) => r.kind === "adviser");
 
@@ -3311,8 +3446,9 @@ function portfolioTable(companies) {
       <td>${raise(r)}</td>
       <td>${pooled(r)}</td>
       <td>${r.last_screened ? day(r.last_screened) : "—"}</td>
-      <td><button class="linkish pf-remove" data-key="${esc(r.entity_key)}"
-        data-name="${esc(r.entity_name)}" title="Take it off this portfolio">Remove</button></td>
+      ${removable ? `<td><button class="linkish pf-remove" data-key="${esc(r.entity_key)}"
+        data-name="${esc(r.entity_name)}" title="Take it off this portfolio">Remove</button></td>`
+        : ""}
     </tr>`).join("");
 
   const firmRows = firms.map((r) => `
@@ -3332,7 +3468,7 @@ function portfolioTable(companies) {
       <thead><tr><th>Contractor</th><th>Latest severity</th><th class="num">Awards</th>
         <th class="num">Obligated</th><th title="From the company's latest SEC Form D">Latest private raise</th>
         <th title="Investment funds named after the company, and the money their latest notices report. Looked up on the contractor's page.">Funds named after it</th>
-        <th>Screened</th><th></th></tr></thead>
+        <th>Screened</th>${removable ? "<th></th>" : ""}</tr></thead>
       <tbody>${contractorRows}</tbody></table></div>` : ""}
     ${firms.length ? `<h3 style="margin-top:${contractors.length ? "18px" : "0"}">Investment firms</h3>
       <div class="table-wrap"><table>
@@ -3893,8 +4029,9 @@ async function viewAdviser(crd) {
   };
 }
 
-async function viewPortfolio() {
+async function viewPortfolio(params) {
   const key = savedPortfolioKey();
+  const from = params ? Math.max(0, Number(params.get("from")) || 0) : 0;
   const mine = await myPortfolios();
   if (!key) {
     view.innerHTML = portfolioEmpty("", "", mine);
@@ -3906,7 +4043,7 @@ async function viewPortfolio() {
   setBusy("Opening portfolio…");
   let d;
   try {
-    d = await apiPost("/v1/portfolio", { key });
+    d = await apiPost("/v1/portfolio", { key, offset: from });
   } catch (e) {
     // A stored key that no longer loads must not trap the page: show the
     // reason and the form, with the key still in the box to be corrected.
@@ -3923,7 +4060,8 @@ async function viewPortfolio() {
     <div class="page-head">
       <h1>${esc(d.name)}</h1>
       <div class="sub">${num(d.totals.companies)} compan${d.totals.companies === 1 ? "y" : "ies"}
-        · saved ${day(d.created_at)}${mine && mine.portfolios.length > 1
+        · ${d.scope ? "every contractor its awards name, as far as read"
+                    : `saved ${day(d.created_at)}`}${mine && mine.portfolios.length > 1
           ? ` · <button type="button" class="linkish" id="pf-mine-jump">one of
               ${num(mine.portfolios.length)} in your account</button>` : ""}</div>
     </div>
@@ -3941,14 +4079,17 @@ async function viewPortfolio() {
       ${severityChart(d.severity)}
     </div>` : ""}
 
+    ${d.scope ? scopeProgressCard(d) : ""}
+
     <div class="card">
       <h2>Companies</h2>
-      ${unscreened ? `<div class="muted" style="font-size:12px;margin-bottom:10px">
+      ${unscreened && !d.scope ? `<div class="muted" style="font-size:12px;margin-bottom:10px">
         ${num(unscreened)} of these ${unscreened === 1 ? "has" : "have"} not been
         screened on this deployment. They are listed because that is the useful
         half of the answer — it is what to screen next, and leaving them out
         would make the portfolio look complete when it is not.</div>` : ""}
-      ${portfolioTable(d.companies)}
+      ${portfolioTable(d.companies, !d.scope)}
+      ${d.scope ? scopePager(d) : ""}
     </div>
 
     ${alertsHtml}
@@ -4002,7 +4143,8 @@ function myPortfoliosCard(mine) {
     const open = p.portfolio_id === mine.open;
     return `<tr>
       <td>${open ? `<strong>${esc(p.name)}</strong> <span class="pill">open</span>` : esc(p.name)}</td>
-      <td class="num">${p.companies === null ? "—" : num(p.companies)}</td>
+      <td class="num">${p.scope ? "whole office" : p.companies === null ? "—"
+        : num(p.companies)}</td>
       <td>${day(p.updated_at)}</td>
       <td>${open ? "" : `<button class="linkish pf-mine-open"
           data-id="${esc(p.portfolio_id)}">Open</button> · `}<button class="linkish pf-mine-remove"
@@ -4769,7 +4911,8 @@ const ROUTES = [
                                     (params && params.get("entity")) || "")],
   [/^\/notices$/, () => viewNotices()],
   [/^\/rules$/, () => viewRules()],
-  [/^\/portfolio$/, () => viewPortfolio()],
+  [/^\/portfolio$/, (params) => viewPortfolio(params)],
+  [/^\/scope\/(.+)$/, (s) => viewScope(decodeURIComponent(s))],
   [/^\/screening$/, () => viewScreening()],
   [/^\/watchlists$/, () => viewWatchlists()],
   [/^\/portfolio\/open\/(.+)$/, (k) => viewOpenPortfolio(decodeURIComponent(k))],
@@ -4947,9 +5090,11 @@ function markMatches(label, query) {
 }
 
 const SUGGEST_KIND = { entity: "contractor", officer: "contracting officer", agency: "agency",
-                       unscreened: "not screened yet", recent: "recent search" };
+                       unscreened: "not screened yet", recent: "recent search",
+                       scope: "whole office" };
 const SUGGEST_GROUPS = [
   ["recent", "You searched for and opened lately"],
+  ["scope", "Every contractor at an office"],
   ["local", "Screened here"],
   ["remote", "Not screened here yet — choose one to screen it"],
 ];
@@ -5027,6 +5172,7 @@ function chooseSuggestion(index) {
   if (item.kind === "entity") location.hash = `#/entity/${encodeURIComponent(item.key)}`;
   else if (item.kind === "officer") location.hash = `#/officer/${encodeURIComponent(item.key)}`;
   else if (item.kind === "agency") location.hash = `#/agency/${encodeURIComponent(item.key)}`;
+  else if (item.kind === "scope") location.hash = `#/scope/${encodeURIComponent(item.key)}`;
   // A recent search runs again; an unscreened contractor goes to the search
   // page, which is where the offer to screen it lives. Still a choice, not a
   // screen.
@@ -5062,7 +5208,10 @@ async function fetchSuggestions(q) {
     const d = await api(`/v1/suggest?q=${encodeURIComponent(q)}`);
     // A slower earlier request must not overwrite a newer answer.
     if (seq !== suggestSeq) return;
-    renderSuggestions({ local: d.local || [], remote: d.remote || [] }, q);
+    const local = d.local || [];
+    renderSuggestions({ scope: local.filter((i) => i.kind === "scope"),
+                        local: local.filter((i) => i.kind !== "scope"),
+                        remote: d.remote || [] }, q);
   } catch {
     if (seq === suggestSeq) hideSuggestions();
   }
