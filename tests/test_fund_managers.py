@@ -444,8 +444,8 @@ def test_a_managers_new_filing_reaches_the_list_without_the_firm_being_added(sto
     [delivery] = store.alert_deliveries(sid)
     body = delivery["body_text"]
     assert "The share of MW LSVC SHIELD AI, LLC owned by investors outside the United " \
-           "States rose from 21% to 30%." in body
-    assert f"{MW} reported a new private fund: MW LSVC SHIELD AI-III, LLC." in body
+           "States rose from 21% to 30%" in body
+    assert f"{MW} reported a new private fund: MW LSVC SHIELD AI-III, LLC" in body
     assert "is 40% owned by investors outside the United States" in body
     assert body.count("This fund is named after Shield AI, which is in this portfolio.") == 2
     assert "MW REAL ESTATE FUND" not in body and "filed an updated Form ADV" not in body, \
@@ -482,7 +482,9 @@ def test_a_firm_that_is_also_in_the_portfolio_is_read_once_and_said_once(store):
     assert adv.read == ["283630"]
     assert (result["firms_checked"], result["managers_checked"]) == (1, 0)
     body = store.alert_deliveries(sid)[0]["body_text"]
-    assert body.count("rose from 21% to 30%") == 1
+    # Each flag is listed at the top, then set out: once in each.
+    details = body.split("—" * 24)[1]
+    assert details.count("rose from 21% to 30%") == 1
     assert "MW REAL ESTATE FUND, LP" in body, "watched in its own right: all of it is said"
 
 

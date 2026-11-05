@@ -233,13 +233,14 @@ def test_expired_responses_are_deleted_and_the_oldest_go_first_when_full(tmp_pat
         os.utime(path, (now - age_seconds, now - age_seconds))
         return path
 
-    expired = cached("expired", 10, 7200)
+    expired = cached("expired", 10, 8 * 86400)
     oldest = cached("oldest", 500, 3000)
     middle = cached("middle", 400, 2000)
     newest = cached("newest", 400, 1000)
 
     assert http.prune_cache() == 2
-    assert not expired.exists(), "past its lifetime: nothing would ever read it again"
+    assert not expired.exists(), \
+        "past the week an old copy may stand in for a source that is down"
     assert not oldest.exists(), "1.3 MB against a 1 MB cap: the oldest makes room"
     assert middle.exists() and newest.exists()
 

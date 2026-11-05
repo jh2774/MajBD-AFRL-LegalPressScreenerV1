@@ -1374,6 +1374,30 @@ class Store:
                  status, _now(), json.dumps(signal_ids or []), trigger_reason))
         return notice_id
 
+    def finding_for_notice(self, notice: dict) -> dict | None:
+        """The finding a notice was raised from: by its id where the notice
+        has one, otherwise the contractor's finding in the notice's run."""
+        row = None
+        if str(notice.get("finding_id") or "").isdigit():
+            row = self._one("SELECT id, payload FROM findings WHERE id=? AND tenant_id=?",
+                            (int(notice["finding_id"]), self.tenant_id))
+        if row is None:
+            row = self._one("SELECT id, payload FROM findings WHERE run_id=? AND"
+                            " entity_key=? AND tenant_id=? ORDER BY id DESC LIMIT 1",
+                            (notice.get("run_id") or "", notice.get("entity_key") or "",
+                             self.tenant_id))
+        return _with_id(row) if row else None
+
+    def document_titles(self, keys: list[str]) -> dict[str, str]:
+        """{document key: its title}, for the documents named."""
+        keys = list(dict.fromkeys(k for k in keys if k))[:200]
+        if not keys:
+            return {}
+        marks = ",".join("?" for _ in keys)
+        rows = self._query(f"SELECT document_key, title FROM snapshots"
+                           f" WHERE document_key IN ({marks})", tuple(keys))
+        return {r["document_key"]: r["title"] or "" for r in rows}
+
     def notified_signal_ids(self, entity_key: str) -> set[str]:
         """Evidence about this contractor that a notice has already covered.
 
@@ -2847,6 +2871,18 @@ class Store:
             f" ORDER BY (s.screened_at IS NOT NULL), s.screened_at, SUM(c.amount) DESC,"
             f" c.entity_key LIMIT ?",
             (self.tenant_id, *params, screened_before, limit))
+
+    def scope_due(self, scope, screened_before: str) -> int:
+        """How many of a scope's contractors are due a screen: never screened,
+        or last screened before `screened_before`."""
+        clause, params = scope.sql("c")
+        row = self._one(
+            f"SELECT COUNT(DISTINCT c.entity_key) AS n FROM contracts c"
+            f" LEFT JOIN entity_screens s ON s.tenant_id=c.tenant_id AND"
+            f" s.entity_key=c.entity_key"
+            f" WHERE c.tenant_id=? AND ({clause}) AND (s.screened_at IS NULL OR"
+            f" s.screened_at < ?)", (self.tenant_id, *params, screened_before)) or {}
+        return int(row.get("n") or 0)
 
     _SEVERITY_RANK = ("CASE f.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1"
                       " WHEN 'medium' THEN 2 WHEN 'low' THEN 3 WHEN 'info' THEN 4"

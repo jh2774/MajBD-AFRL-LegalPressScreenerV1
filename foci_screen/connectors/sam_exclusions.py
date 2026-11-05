@@ -31,6 +31,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from ..models import Document
+from . import screening_lists as lists
 from .sec_edgar import normalise_holder
 
 log = logging.getLogger("foci.sam_exclusions")
@@ -44,6 +45,7 @@ PAGE_URL = "https://sam.gov/data-services/Exclusions/Public%20V2?privacy=Public"
 # A person, not a business. Matched only by UEI or CAGE, never by name: a
 # contractor sharing a name with an excluded individual says nothing.
 INDIVIDUAL = "Individual"
+VESSEL = "Vessel"
 
 REFRESH_SECONDS = 24 * 3600
 # After a failed download, how long before another screen tries again. Each
@@ -192,8 +194,17 @@ class SAMExclusionsConnector:
         if not out and name:
             norm = normalise_holder(name)
             if norm:
-                add(db.execute("SELECT * FROM exclusions WHERE norm=? AND classification!=?",
-                               (norm, INDIVIDUAL)).fetchall(), "name", "contractor")
+                # With no identifier, only the same name will do, and never a
+                # ship's: "VICTORY SYSTEMS LLC" is not the vessel VICTORY, nor
+                # "CRIUS TECHNOLOGY GROUP" the Hong Kong firm CRIUS LIMITED.
+                # The index's own normalising drops "Systems", "Technology"
+                # and "Group", which made each pair the same.
+                want = lists.key_of(name)
+                rows = [r for r in db.execute(
+                    "SELECT * FROM exclusions WHERE norm=? AND classification NOT IN (?,?)",
+                    (norm, INDIVIDUAL, VESSEL)).fetchall()
+                    if lists.compare(want, lists.key_of(r["name"])) == "exact"]
+                add(rows, "name", "contractor")
         if parent_uei and parent_uei.strip().upper() != (uei or "").strip().upper():
             add(db.execute("SELECT * FROM exclusions WHERE uei=?",
                            (parent_uei.strip().upper(),)).fetchall(), "uei", "parent")

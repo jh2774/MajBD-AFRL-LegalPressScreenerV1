@@ -17,8 +17,9 @@ from . import scopes as scopes_mod
 from .connectors.alerts import AlertConnector
 from .connectors.feeds import FeedConnector
 from .connectors.fpds import FPDSConnector
-from .connectors.registries import IAPDConnector, OFACConnector, SAMConnector, USPTOConnector
+from .connectors.registries import IAPDConnector, SAMConnector, USPTOConnector
 from .connectors.sam_exclusions import SAMExclusionsConnector
+from .connectors.screening_lists import ScreeningLists
 from .connectors.sec_edgar import EdgarConnector
 from .connectors.usaspending import USASpendingConnector, looks_like_an_individual
 from .connectors.uspto_dataset import PatentAssignmentDataset
@@ -28,6 +29,19 @@ from .risk import engine
 from .store import Store
 
 log = logging.getLogger("foci.pipeline")
+
+# Hosts as a reader knows them, for the notes on sources that did not answer.
+SOURCE_NAMES = {
+    "www.sec.gov": "SEC EDGAR", "data.sec.gov": "SEC EDGAR", "efts.sec.gov": "SEC EDGAR",
+    "api.adviserinfo.sec.gov": "IAPD (SEC adviser search)",
+    "reports.adviserinfo.sec.gov": "IAPD (Form ADV)",
+    "api.usaspending.gov": "USAspending", "www.fpds.gov": "FPDS",
+    "api.sam.gov": "SAM.gov", "sam.gov": "SAM.gov", "falextracts.s3.amazonaws.com": "SAM.gov",
+    "data.trade.gov": "trade.gov (screening lists)",
+    "www.treasury.gov": "Treasury (sanctions lists)",
+    "sanctionslistservice.ofac.treas.gov": "Treasury (sanctions lists)",
+    "api.uspto.gov": "USPTO", "assignment-api.uspto.gov": "USPTO",
+}
 
 
 @dataclass
@@ -80,7 +94,8 @@ class Screener:
         self.fpds = FPDSConnector(http)
         self.edgar = EdgarConnector(http)
         self.iapd = IAPDConnector(http)
-        self.ofac = OFACConnector(http)
+        # Treasury, Commerce and State's sanctions and export lists, in one.
+        self.lists = ScreeningLists(http)
         self.exclusions = SAMExclusionsConnector(http, getattr(config, "cache_dir", ".cache"))
         self.uspto = USPTOConnector(http, config.uspto_api_key)
         self.patent_dataset = PatentAssignmentDataset(
@@ -233,6 +248,10 @@ class Screener:
         budget = opts.time_budget or self.SCOPE_RUN_SECONDS
         index_until = started + budget * self.INDEX_SHARE
         stop_at = started + budget
+        # Nothing is retried or started past the point where the run must stop
+        # to finish properly: a source that hangs cannot take the run with it.
+        if hasattr(self.http, "deadline"):
+            self.http.deadline = stop_at - 10
         progress(f"Reading the awards of {scope.title()}...")
         if scope.source == "fpds":
             indexed, left = self._index_fpds(scope, opts, run_id, index_until, progress)
@@ -241,8 +260,7 @@ class Screener:
                                                     progress)
         progress(f"  {indexed} award(s) read this run; {left} part(s) still to read.")
 
-        stale = (datetime.now(timezone.utc) - timedelta(days=self.RESCREEN_DAYS)) \
-            .replace(microsecond=0, tzinfo=None).isoformat() + "Z"
+        stale = scopes_mod.rescreen_before(self.RESCREEN_DAYS)
         screened = 0
         for row in self.store.scope_candidates(
                 scope, stale, max(opts.max_entities, self.SCOPE_SCREEN_CAP)):
@@ -270,22 +288,28 @@ class Screener:
                 result.findings.append(finding)
             result.contracts.extend(contracts)
 
+        if hasattr(self.http, "deadline"):
+            self.http.deadline = 0.0
         summary = self.store.scope_summary(scope)
         unscreened = max(0, summary["contractors"] - summary["screened"])
+        # Screened, but before the rules last changed (or a month ago): due again.
+        due = self.store.scope_due(scope, stale)
         result.findings.sort(key=lambda f: -f.total_score)
         result.stats = dict(self.http.stats)
         result.stats.update({
             "scope": scope.id, "awards_indexed": indexed, "parts_left": left,
             "contractors": summary["contractors"], "screened_total": summary["screened"],
-            "entities_screened": screened, "unscreened": unscreened,
+            "entities_screened": screened, "unscreened": unscreened, "due": due,
             # More to do than one run did: the watch runs again today.
-            "backlog": bool(left or unscreened)})
+            "backlog": bool(left or unscreened or due)})
         result.notes.append(
             f"{scope.title()}: {summary['contractors']} contractor(s) found so far, "
             f"{summary['screened']} screened"
             + (f"; {unscreened} still to screen" if unscreened else "")
             + (f"; {left} part(s) of the award record still to read" if left else "")
-            + ". Each run screens a few more.")
+            + (f"; {due - unscreened} to screen again under the current rules"
+               if due > unscreened else "")
+            + ". Each run screens dozens more.")
         result.notes.extend(self.coverage_notes())
         if owns_run:
             self.store.finish_run(run_id, stats=result.stats)
@@ -473,6 +497,10 @@ class Screener:
         exclusions = getattr(self, "exclusions", None)
         if exclusions is not None and exclusions.coverage_note():
             notes.append(exclusions.coverage_note())
+        lists = getattr(self, "lists", None)
+        if lists is not None and getattr(lists, "coverage", ""):
+            notes.append(lists.coverage)
+        notes.extend(self._source_notes())
         if self.web.skipped_js_hosts:
             hosts = ", ".join(sorted(self.web.skipped_js_hosts))
             notes.append(
@@ -530,6 +558,28 @@ class Screener:
                         "request — check it by hand if it matters."))
         return notes
 
+    def _source_notes(self) -> list[str]:
+        """One line per source that did not answer during the run: how often,
+        the last error, and whether an older copy stood in. Silence here would
+        read as "nothing found there"."""
+        failures = getattr(getattr(self, "http", None), "failures", None) or {}
+        notes = []
+        for host, f in sorted(failures.items()):
+            if not (f.get("count") or f.get("skipped")):
+                continue
+            label = SOURCE_NAMES.get(host, host)
+            parts = []
+            if f.get("count"):
+                parts.append(f"{f['count']} failed attempt(s), the last: {f['last_error']}")
+            if f.get("skipped"):
+                parts.append(f"{f['skipped']} request(s) not tried after that")
+            if f.get("stale"):
+                parts.append(f"an older saved copy used {f['stale']} time(s)")
+            notes.append(f"{label} did not always answer during this run ("
+                         + "; ".join(parts) + "). Contractors screened while it was "
+                         "down are marked on their pages as not fully checked.")
+        return notes
+
     # -------------------------------------------------------------- entity
     def _build_entity(self, name: str, contracts: list[Contract],
                       opts: ScreenOptions) -> Entity:
@@ -579,77 +629,130 @@ class Screener:
 
     # ------------------------------------------------------------ evidence
     def _gather(self, entity: Entity, opts: ScreenOptions,
-                progress) -> list[Document]:
+                progress, coverage: dict | None = None) -> list[Document]:
+        """Every source's documents about this contractor. `coverage` is filled
+        with what each source said: checked, not checked and why, or not fully
+        checked because it did not answer. Each source is asked on its own: one
+        that fails is recorded and the rest still run."""
         docs: list[Document] = []
+        checked = coverage if coverage is not None else {}
+        http = getattr(self, "http", None)
 
+        def step(label: str, fn) -> list:
+            marks = http.failure_marks() if hasattr(http, "failure_marks") else {}
+            try:
+                got = fn() or []
+            except Exception as exc:        # noqa: BLE001 - the other sources still run
+                log.warning("%s failed for %s: %s", label, entity.name, exc)
+                progress(f"  {label}: failed ({type(exc).__name__}: {exc}); carrying on.")
+                checked[label] = f"not checked: it failed ({type(exc).__name__})"
+                return []
+            failed = http.failed_hosts_since(marks) if hasattr(http, "failed_hosts_since") \
+                else []
+            if failed:
+                checked[label] = ("not fully checked: "
+                                  + ", ".join(SOURCE_NAMES.get(h, h) for h in failed)
+                                  + " did not answer")
+            else:
+                checked.setdefault(label, "checked")
+            return got
+
+        owners: list[Document] = []
         if entity.cik:
             progress(f"  SEC EDGAR: CIK {entity.cik} ({', '.join(entity.aliases)})")
-            filings = self.edgar.recent_filings(entity.cik, limit=12)
-            if opts.fetch_filing_bodies:
-                for f in filings[:6]:
-                    self.edgar.fetch_filing_text(f)
-            docs.extend(filings)
-        else:
-            progress("  SEC EDGAR: no confident CIK match (skipping filings)")
 
-        if entity.cik:
+            def filings():
+                found = self.edgar.recent_filings(entity.cik, limit=12)
+                if opts.fetch_filing_bodies:
+                    for f in found[:6]:
+                        self.edgar.fetch_filing_text(f)
+                return found
+            docs.extend(step("SEC filings", filings))
             progress("  SEC EDGAR full-text search for IP security agreements...")
-            docs.extend(self.edgar.full_text_search(
-                entity.parent_name or entity.name, cik=entity.cik))
-        else:
-            progress("  SEC EDGAR full-text: skipped (needs a CIK to attribute hits)")
-
-        if entity.cik:
+            docs.extend(step("SEC full-text search", lambda: self.edgar.full_text_search(
+                entity.parent_name or entity.name, cik=entity.cik)))
             progress("  SEC ownership filings (Schedule 13D/13G)...")
-            owners = self.edgar.ownership_filings(entity.cik)
+            owners = step("SEC ownership filings (5% holders)",
+                          lambda: self.edgar.ownership_filings(entity.cik))
             docs.extend(owners)
             # Individuals are not investment advisers; looking them up in IAPD
             # would only find firms that share their surname.
             firms = [o for o in owners if o.meta.get("person_type") != "IN"]
             progress(f"  IAPD: {len(firms)} holder(s) to look up...")
             for owner in firms:
-                docs.extend(self.iapd.find_adviser(
-                    owner.meta["holder"], percent=owner.meta.get("percent"),
-                    filing=f"{owner.doc_type} filed {owner.published}",
-                    filing_url=owner.url))
+                docs.extend(step("IAPD (holders that are advisers)",
+                                 lambda owner=owner: self.iapd.find_adviser(
+                                     owner.meta["holder"], percent=owner.meta.get("percent"),
+                                     filing=f"{owner.doc_type} filed {owner.published}",
+                                     filing_url=owner.url)))
         else:
-            progress("  Ownership filings and IAPD: skipped (needs a CIK to "
-                     "know whose holders to look up)")
+            progress("  SEC EDGAR: no confident CIK match (skipping filings, full-text "
+                     "search, ownership filings and IAPD)")
+            checked["SEC filings"] = ("not checked: no SEC record was matched to this "
+                                      "contractor — pick one on its page to add it")
 
         progress("  SAM.gov exclusions (debarment and suspension)...")
-        docs.extend(self.exclusions.screen(
+        docs.extend(step("SAM.gov exclusions", lambda: self.exclusions.screen(
             entity.name, uei=entity.uei, cage=entity.cage,
-            parent_name=entity.parent_name, parent_uei=entity.parent_uei))
+            parent_name=entity.parent_name, parent_uei=entity.parent_uei)))
+        exclusions_note = getattr(self.exclusions, "coverage_note", lambda: "")()
+        if exclusions_note and checked.get("SAM.gov exclusions") == "checked":
+            checked["SAM.gov exclusions"] = f"not fully checked: {exclusions_note}"
 
-        progress("  OFAC SDN name screen...")
-        docs.extend(self.ofac.screen(entity.name))
-        if entity.parent_name and entity.parent_name != entity.name:
-            docs.extend(self.ofac.screen(entity.parent_name))
+        progress("  U.S. sanctions and export screening lists...")
+        lists = self.lists
+
+        def screen_names():
+            found = list(lists.screen(entity.name))
+            if entity.parent_name and entity.parent_name != entity.name:
+                found += lists.screen(entity.parent_name, whose="parent")
+            # The company's 5% holders, from their 13D/13G filings: a listed
+            # investor is the case FOCI exists for.
+            for holder in dict.fromkeys(o.meta.get("holder", "") for o in owners
+                                        if o.meta.get("person_type") != "IN"):
+                if holder:
+                    found += lists.screen(holder, whose="holder")
+            return found
+        docs.extend(step("Sanctions and export lists", screen_names))
+        if not getattr(lists, "available", True):
+            checked["Sanctions and export lists"] = "not checked: no list could be downloaded"
+        elif getattr(lists, "complete", True) is False:
+            checked["Sanctions and export lists"] = ("Treasury's lists only: trade.gov's "
+                                                     "combined list could not be downloaded")
 
         if self.uspto.available:
             progress("  USPTO assignment records...")
-            docs.extend(self.uspto.assignments(entity.parent_name or entity.name))
+            docs.extend(step("USPTO patent liens", lambda: self.uspto.assignments(
+                entity.parent_name or entity.name)))
         elif self.patent_dataset.available:
             # The research dataset is a snapshot. Saying where it stops is the
             # difference between "no liens" and "no liens recorded by then".
             through = self.patent_dataset.latest_recorded() or "its last release"
             progress(f"  USPTO Patent Assignment Dataset (recorded through {through}; "
                      f"liens recorded later are NOT checked)...")
-            seen: set[str] = set()
-            for name in dict.fromkeys(filter(None, (entity.name, entity.parent_name))):
-                for doc in self.patent_dataset.security_interests(name):
-                    if doc.key not in seen:
-                        seen.add(doc.key)
-                        docs.append(doc)
+
+            def liens():
+                seen: set[str] = set()
+                found = []
+                for name in dict.fromkeys(filter(None, (entity.name, entity.parent_name))):
+                    for doc in self.patent_dataset.security_interests(name):
+                        if doc.key not in seen:
+                            seen.add(doc.key)
+                            found.append(doc)
+                return found
+            docs.extend(step("USPTO patent liens", liens))
+            checked["USPTO patent liens"] = (f"checked up to {through}, the dataset's "
+                                             f"last recording; later liens not seen")
         else:
             progress("  USPTO: skipped (no USPTO_API_KEY or imported Patent Assignment "
                      "Dataset — IP liens NOT checked)")
+            checked["USPTO patent liens"] = ("not checked: the site has no USPTO key or "
+                                             "imported patent dataset")
 
         if self.sam.available and entity.uei:
             progress("  SAM.gov entity registration...")
-            sam_doc = self.sam.entity(entity.uei)
-            if sam_doc:
-                docs.append(sam_doc)
+            docs.extend(step("SAM.gov registration",
+                             lambda: [d for d in [self.sam.entity(entity.uei)] if d]))
 
         if entity.domains and not opts.skip_web:
             for domain in entity.domains:
@@ -659,7 +762,8 @@ class Screener:
                 # rather than worked around, which matters on hosts whose bot
                 # management refuses an identified crawler.
                 progress(f"  looking for a release feed on {domain}...")
-                releases = self.feeds.collect(domain, company=entity.name)
+                releases = step("Company website",
+                                lambda d=domain: self.feeds.collect(d, company=entity.name))
                 if releases:
                     kinds = ", ".join(sorted({d.meta.get("release_kind", "press")
                                               for d in releases}))
@@ -667,13 +771,15 @@ class Screener:
                 docs.extend(releases)
 
                 progress(f"  crawling {domain} (IR / press / legal)...")
-                docs.extend(self.web.collect(domain, company=entity.name))
+                docs.extend(step("Company website",
+                                 lambda d=domain: self.web.collect(d, company=entity.name)))
 
         # Saved alert emails, which reach the hosts that refuse a crawler.
         # Keyed on the release URL like the feed items, so an announcement
         # that arrived both ways is one document, not two that each read new.
         if self.alerts.available() and not opts.skip_web:
-            mailed = self.alerts.collect(entity.name, entity.domains)
+            mailed = step("Saved release emails",
+                          lambda: self.alerts.collect(entity.name, entity.domains))
             if mailed:
                 progress(f"  {len(mailed)} release(s) from saved email alerts.")
             docs.extend(mailed)
@@ -685,7 +791,8 @@ class Screener:
                        opts: ScreenOptions, progress,
                        record_changes: list[dict] | None = None) -> Finding | None:
         policy = self._policy()
-        docs = self._gather(entity, opts, progress)
+        coverage: dict[str, str] = {}
+        docs = self._gather(entity, opts, progress, coverage)
         # Releases of a kind this tenant does not read are dropped before they
         # are observed, so switching a kind off also stops it building a
         # history — rather than storing everything and hiding some of it.
@@ -741,6 +848,7 @@ class Screener:
                     s.is_new = False
 
         finding = engine.build_finding(entity, contracts, signals, run_id=run_id)
+        finding.coverage = coverage
         progress(f"  -> {finding.severity.upper()} (score {finding.total_score}, "
                  f"{len(finding.signals)} signals)")
 

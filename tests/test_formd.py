@@ -7,6 +7,7 @@ country codes). Company and people names are invented.
 from __future__ import annotations
 
 import importlib
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -494,7 +495,7 @@ def test_a_portfolio_of_names_is_alerted_like_any_other(store):
     assert result["companies_checked"] == 1
     [delivery] = store.alert_deliveries(sid)
     assert "reported raising money privately" in delivery["body_text"]
-    assert f"{NAME} was flagged (HIGH)" in delivery["body_text"]
+    assert re.search(rf"\[HIGH\] FLAG \d+: {re.escape(NAME)}", delivery["body_text"])
 
 
 # ----------------------------------------------------------------------- API

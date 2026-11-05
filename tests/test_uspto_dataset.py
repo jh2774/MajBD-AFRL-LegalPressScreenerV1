@@ -223,7 +223,7 @@ def test_a_screen_uses_the_dataset_and_says_how_current_it_is(dataset):
     screener = object.__new__(Screener)
     screener.edgar = SimpleNamespace()
     screener.iapd = SimpleNamespace()
-    screener.ofac = SimpleNamespace(screen=lambda name: [])
+    screener.lists = SimpleNamespace(screen=lambda name, whose="": [])
     screener.exclusions = SimpleNamespace(screen=lambda *a, **k: [])
     screener.uspto = SimpleNamespace(available=False)
     screener.patent_dataset = dataset

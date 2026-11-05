@@ -15,10 +15,14 @@ Four kinds of item go into an alert:
   * **Flagged contractors** — a notice the screening policy raised for a
     contractor in the portfolio.
 
-What an alert does not contain is a verdict. Each item says what changed, one
-sentence on what that part of the form is, and exactly where to look. Deciding
-what it means is left to the person reading it, who is better placed to — the
-alert's job is to get them to the source, not to stand in for it.
+Each item is a flag: one line saying how serious the screen rates it, what
+was found and which sources said so, then the detail under it — the evidence
+word for word, why the rule counts it, the document to open and what could
+not be checked (`notify.flags`). A change to a filing that the screen does
+not rate itself is rated from how its reader orders such changes, and one
+of little weight is an UPDATE rather than a flag. What an alert does not
+contain is a determination: deciding what it means is left to the person
+reading it, and every line takes them to the source.
 
 Everyone on a list can take themselves off it. Each message carries a link of
 its own, and the headers mail clients turn into an "Unsubscribe" button
@@ -44,7 +48,7 @@ from .connectors import formd as formd_mod
 from .connectors.adv import AdvConnector, AdviserSnapshot, AdvUnavailable, compare
 from .connectors.formd import FormDConnector, FormDUnavailable, IssuerSnapshot
 from .connectors.vehicles import VehicleConnector
-from .notify import bounces, names
+from .notify import bounces, flags, names
 from .notify.mailer import Mailer
 
 log = logging.getLogger("foci.alerts")
@@ -199,7 +203,14 @@ def adv_item(change: dict, watches: list[dict] | tuple = ()) -> dict:
         "links": [("Firm summary on the SEC's adviser site", change["links"]["summary"]),
                   ("Full Form ADV (PDF)", change["links"]["form"])],
         "importance": change.get("importance", 1) + (1 if tie else 0),
+        "severity": flags.from_importance(change.get("importance", 1) + (1 if tie else 0)),
+        "flag": _flag(change.get("headline", "")),
+        "sources": ["Form ADV", "IAPD"],
     }
+
+
+def _flag(headline: str) -> str:
+    return (headline or "").strip().rstrip(".")
 
 
 def formd_item(change: dict, base_url: str = "", entity_key: str = "") -> dict:
@@ -220,24 +231,31 @@ def formd_item(change: dict, base_url: str = "", entity_key: str = "") -> dict:
         "where": change.get("where", ""),
         "links": links,
         "importance": change.get("importance", 1),
+        "severity": flags.from_importance(change.get("importance", 1)),
+        "flag": _flag(change.get("headline", "")),
+        "sources": ["Form D", "SEC EDGAR"],
     }
 
 
-def notice_item(notice: dict, base_url: str) -> dict:
-    key = notice.get("entity_key", "")
-    link = f"{base_url.rstrip('/')}/#/entity/{key}" if base_url else ""
+def notice_item(notice: dict, base_url: str, finding: dict | None = None,
+                titles: dict[str, str] | None = None) -> dict:
+    """A contractor the screen flagged: what it found, each piece of evidence
+    with its source and why it counts, the awards, and what was not checked."""
+    parts = flags.notice_parts(notice, finding, titles or {}, base_url)
+    severity = (notice.get("severity") or "medium").lower()
     return {
         "item_id": f"notice:{notice['notice_id']}",
         "kind": "notice",
         "company": notice.get("entity_name", ""),
         "headline": f"{notice.get('entity_name', '')} was flagged "
-                    f"({(notice.get('severity') or '').upper()}).",
-        "detail": notice.get("trigger_reason") or notice.get("subject") or "",
-        "explainer": "A flag means the screen found evidence worth a person's attention. "
-                     "The contractor's page lists the evidence and the source of each item.",
-        "where": "The contractor's page in FOCI-Screener",
-        "links": [("Open the contractor", link)] if link else [],
+                    f"({severity.upper()}).",
+        "detail": "" if parts["points"] else (notice.get("trigger_reason")
+                                             or notice.get("subject") or ""),
+        "explainer": "",
+        "where": "" if parts["links"] else "The contractor's page in FOCI-Screener",
         "importance": 5,
+        "severity": severity if severity in flags.SEVERITIES else "medium",
+        **parts,
     }
 
 
@@ -306,7 +324,9 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
     items = [adv_item(c, looked_up) for c in store.adv_changes(crds, limit=200)]
     items += [formd_item(c, base_url, ciks.get(str(c.get("cik")), ""))
               for c in store.formd_changes(list(ciks), limit=200)]
-    items += [notice_item(n, base_url) for n in store.notices_for_entities(entities)]
+    items += [flagged_item(store, n, base_url)
+              for n in store.notices_for_entities(entities)
+              if f"notice:{n['notice_id']}" not in sent]
     # Funds named after a contractor: an item exists only for a filing made
     # after both the watch and this list began, whenever the index learns of it.
     started = str(subscription.get("created_at") or "")[:10]
@@ -320,7 +340,17 @@ def pending_items(store, subscription: dict, base_url: str) -> list[dict]:
         if item["item_id"] not in seen:
             seen.add(item["item_id"])
             fresh.append(item)
-    return sorted(fresh, key=lambda i: -i["importance"])
+    return sorted(fresh, key=lambda i: (flags.rank(i.get("severity", "info")),
+                                        -i["importance"]))
+
+
+def flagged_item(store, notice: dict, base_url: str) -> dict:
+    """`notice_item` with the finding it came from, and the titles of the
+    documents its evidence is in."""
+    finding = store.finding_for_notice(notice)
+    keys = [s.get("document_key") for s in (finding or {}).get("signals") or []
+            if s.get("document_key")]
+    return notice_item(notice, base_url, finding, store.document_titles(keys))
 
 
 def fund_watches(store, entities: list[str]) -> list[dict]:
@@ -412,60 +442,33 @@ def baseline_entity(store, entity_key: str) -> int:
 
 def compose(subscription: dict, items: list[dict],
             unsubscribe: str = "") -> tuple[str, str, str]:
-    """(subject, plain text, html) — plain text first; it is what is read."""
-    name = subscription["name"]
-    n = len(items)
-    subject = f"FOCI-Screener: {n} update{'s' if n != 1 else ''} for \"{name}\""
+    """(subject, plain text, html) — plain text first; it is what is read.
 
-    lines = [
-        f"FOCI-Screener found {n} update{'s' if n != 1 else ''} for the companies "
-        f"in \"{name}\".",
-        "",
-        "Each item says what changed and where to look. It does not say what the "
-        "change means — that is for you to judge from the source.",
-        "",
-    ]
-    for i, item in enumerate(items, 1):
-        lines.append(f"{i}. {item['headline']}")
-        if item["detail"]:
-            lines.append(f"   {item['detail']}")
-        if item["explainer"]:
-            lines.append(f"   What this is: {item['explainer']}")
-        if item["where"]:
-            lines.append(f"   Where to look: {item['where']}")
-        for label, url in item["links"]:
-            lines.append(f"   {label}: {url}")
-        lines.append("")
-    lines += ["—", footer(name, unsubscribe)]
-    text = "\n".join(lines)
+    One line per flag, most serious first, then each again with its detail
+    (`notify.flags`). The subject carries the most serious rating."""
+    name = subscription["name"]
+    items = [_as_flag(i) for i in items]
+    subject = (f"FOCI-Screener [{flags.LABEL[flags.worst(items)]}]: "
+               f"{flags.counts(items)} for \"{name}\"")
+    text = flags.text_body(name, items, footer(name, unsubscribe))
 
     e = html_lib.escape
-    parts = [
-        '<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;'
-        'line-height:1.5;color:#1c1c1c;max-width:640px">',
-        f"<p>FOCI-Screener found <strong>{n} update{'s' if n != 1 else ''}</strong> "
-        f"for the companies in <strong>{e(name)}</strong>.</p>",
-        '<p style="color:#555">Each item says what changed and where to look. It does '
-        "not say what the change means — that is for you to judge from the source.</p>",
-    ]
-    for item in items:
-        links = " · ".join(f'<a href="{e(url)}">{e(label)}</a>' for label, url in item["links"])
-        parts.append(
-            '<div style="border-left:3px solid #c8a24a;padding:6px 12px;margin:14px 0">'
-            f"<div><strong>{e(item['headline'])}</strong></div>"
-            + (f"<div>{e(item['detail'])}</div>" if item["detail"] else "")
-            + (f'<div style="color:#555;font-size:13.5px"><em>What this is:</em> '
-               f"{e(item['explainer'])}</div>" if item["explainer"] else "")
-            + (f'<div style="font-size:13.5px"><em>Where to look:</em> {e(item["where"])}'
-               f"</div>" if item["where"] else "")
-            + (f'<div style="font-size:13.5px">{links}</div>' if links else "")
-            + "</div>")
     note = e(footer(name)).replace(chr(10), "<br>")
     if unsubscribe:
         note = e(footer(name, "\0")).replace(chr(10), "<br>").replace(
             "\0", f'<a href="{e(unsubscribe)}" style="color:#777">{e(unsubscribe)}</a>')
-    parts.append(f'<p style="color:#777;font-size:12.5px">{note}</p></div>')
-    return subject, text, "".join(parts)
+    return subject, text, flags.html_body(name, items, note)
+
+
+def _as_flag(item: dict) -> dict:
+    """An item from anywhere — a fund named after a contractor, or an older
+    caller — with the fields a flag needs."""
+    item = dict(item)
+    item.setdefault("severity", flags.from_importance(item.get("importance", 1)))
+    item.setdefault("flag", _flag(item.get("headline", "")))
+    item.setdefault("sources", ["Form D", "SEC EDGAR"] if item.get("kind") == "vehicle"
+                    else [])
+    return item
 
 
 # ------------------------------------------------------------------- the run

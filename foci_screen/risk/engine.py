@@ -140,8 +140,12 @@ def rule_foci_jurisdiction(doc: Document, ctx: RuleContext) -> list[Signal]:
     """
     # Registry records are fields, not prose, and have their own rules. An IAPD
     # record's office line reads "... Cayman Islands"; read here as well, the
-    # one fact would be flagged twice, once as a bare mention.
-    if doc.source in ("iapd", "sam_exclusions") or (doc.meta or {}).get("ownership"):
+    # one fact would be flagged twice, once as a bare mention. A screening-list
+    # entry names its sanctions programme ("RUSSIA-EO14024") and the listed
+    # company's addresses: that is the list's own rule's evidence, and read
+    # here it turned every loose name match into "Russia named" as well.
+    if doc.source in ("iapd", "sam_exclusions", *LIST_SOURCES) \
+            or (doc.meta or {}).get("ownership"):
         return []
     text = doc.text
     if not text.strip():
@@ -378,30 +382,112 @@ def rule_contract_structural(contract: Contract, ctx: RuleContext) -> list[Signa
             evidence=f"isForeignGovernment=true on {contract.piid or contract.award_id}",
             source="fpds", source_url=contract.usaspending_url, is_new=ctx.is_new))
 
-    if contract.foreign_funding and "not applicable" not in contract.foreign_funding.lower():
+    funds = foreign_funds(contract.foreign_funding)
+    if funds:
         score = _score("STRUCTURE", ctx, 1.2)
         signals.append(Signal(
             rule_id="STRUCT-FOREIGN-FUNDING-01", category="STRUCTURE", severity=_sev(score),
-            score=score, title="Award carries a foreign-funding indicator",
-            rationale=(f"FPDS foreign funding field reads '{contract.foreign_funding}'. "
+            score=score, title="Award is paid for with foreign funds",
+            rationale=(f"FPDS records this award's foreign funding as '{funds}'. "
                        f"Confirm whether foreign funds support performance and whether "
                        f"that was disclosed."),
-            evidence=contract.foreign_funding, source="fpds",
-            source_url=contract.usaspending_url, is_new=ctx.is_new))
+            evidence=f"Foreign funding: {funds} on {contract.piid or contract.award_id}",
+            source="fpds", source_url=contract.usaspending_url, is_new=ctx.is_new))
     return signals
 
 
+# FPDS codes the foreign-funding field: A and B are foreign money, X is "not
+# applicable" — what nearly every award carries. Read as a flag, "X" flagged
+# 494 of 495 AFWERX contractors. USAspending spells the values out.
+FOREIGN_FUNDING_CODES = {"A": "Foreign Funds FMS", "B": "Foreign Funds non-FMS"}
+
+
+def foreign_funds(value: str) -> str:
+    """The foreign funding an award records, readably, or "" for none."""
+    v = (value or "").strip()
+    if v.upper() in FOREIGN_FUNDING_CODES:
+        return FOREIGN_FUNDING_CODES[v.upper()]
+    return v if "foreign funds" in v.lower() else ""
+
+
+# Where screening-list matches come from: the lists (connectors.screening_lists),
+# and "ofac" for documents stored by earlier versions, which read the SDN list.
+LIST_SOURCES = ("screening_lists", "ofac")
+
+# How good the name match is -> (rule, severity, weight, how it is said).
+SANCTION_MATCHES = {
+    "exact": ("SANCTION-01", "critical", 2.6, "has the same name as"),
+    "core": ("SANCTION-02", "high", 1.6, "has the same distinctive name as"),
+    "variant": ("SANCTION-03", "medium", 0.9, "has a name close to that of"),
+    # Not exact, and the listed company is abroad while nothing marks this
+    # contractor as its U.S. arm: kept on the record, not raised.
+    "abroad": ("SANCTION-04", "low", 0.3, "has a name like that of"),
+}
+
+# What being on each list means, in a sentence, for a reader who has not met
+# the list before.
+LIST_MEANING = {
+    "Treasury SDN list": "U.S. persons are generally barred from dealing with anyone "
+                         "on this list, and its property in the U.S. is blocked.",
+    "Commerce Entity List": "Exporting, re-exporting or transferring items subject to "
+                            "U.S. export rules to a listed party needs a licence, "
+                            "usually refused.",
+    "Commerce Military End User list": "Certain U.S. items may not go to a listed party "
+                                       "without a licence, because of its military use.",
+    "Commerce Unverified List": "The Commerce Department could not verify this party's "
+                                "bona fides; exports to it need extra checks.",
+    "Commerce Denied Persons List": "This party has lost U.S. export privileges.",
+    "State Department ITAR debarred list": "This party is barred from taking part in "
+                                           "exporting U.S. defence articles and services.",
+    "Treasury Chinese military companies list (CMIC)": "Treasury lists it as part of "
+                                                       "China's military-industrial "
+                                                       "complex; U.S. persons may not "
+                                                       "buy its public securities.",
+    "Treasury sectoral sanctions list (SSI)": "Some kinds of financing and dealings with "
+                                              "this party are prohibited.",
+}
+
+
 def rule_sanctions_hit(doc: Document, ctx: RuleContext) -> list[Signal]:
-    if doc.source != "ofac":
+    """The contractor, its parent or one of its 5% holders has a name on a U.S.
+    sanctions or export screening list. Always a name match: graded by how
+    good it is, and by whether the listed company is abroad while nothing
+    marks this contractor as its U.S. arm."""
+    if doc.source not in LIST_SOURCES:
         return []
-    score = _score("SANCTIONS", ctx, 1.0)
+    meta = doc.meta or {}
+    kind = meta.get("match") or "variant"          # an earlier version's fuzzy match
+    if kind != "exact" and meta.get("listed_abroad") and not meta.get("us_arm") \
+            and not _foreign_contractor(ctx):
+        kind = "abroad"
+    rule_id, severity, weight, how = SANCTION_MATCHES.get(kind, SANCTION_MATCHES["variant"])
+    whose = meta.get("whose") or "contractor"
+    listed = meta.get("list") or "a U.S. screening list"
+    entry = meta.get("entry") or doc.title
+    who = ("The contractor" if whose == "contractor" else
+           "The contractor's parent" if whose == "parent" else
+           f"A 5% holder of the contractor ({meta.get('screened_name', '')})")
+    rationale = (f"{who} {how} {entry}, on the {listed}. "
+                 + (LIST_MEANING.get(listed, "") + " " if LIST_MEANING.get(listed) else "")
+                 + "This is a name match only: confirm it against the entry's addresses "
+                   "and identifiers before acting on it.")
+    if kind == "abroad":
+        rationale += (f" The listed company's addresses are in "
+                      f"{meta.get('listed_countries') or 'other countries'}, and nothing in "
+                      f"this contractor's name marks it as that company's U.S. arm, so it "
+                      f"is recorded rather than flagged.")
+    score = _score("SANCTIONS", ctx, weight * (0.8 if whose != "contractor" else 1.0))
     return [Signal(
-        rule_id="SANCTION-01", category="SANCTIONS", severity="critical", score=score,
-        title="Possible sanctions/screening-list name match",
-        rationale=("A name on the OFAC SDN list is similar to the contractor or a "
-                   "party named in its filings. This is a name match only and must be "
-                   "adjudicated against identifiers before any action is taken."),
-        evidence=doc.text[:600], source="ofac", source_url=doc.url, is_new=ctx.is_new)]
+        rule_id=rule_id, category="SANCTIONS", severity=severity, score=score,
+        title=f"Name on the {listed}: {entry}",
+        rationale=rationale, evidence=doc.text[:900], source=doc.source,
+        source_url=doc.url, is_new=ctx.is_new)]
+
+
+def _foreign_contractor(ctx: RuleContext) -> bool:
+    """Whether the awards place the contractor outside the United States."""
+    return any(c and c.strip().upper() not in ("USA", "US", "UNITED STATES")
+               for c in ctx.entity.countries)
 
 
 def rule_sam_exclusion(doc: Document, ctx: RuleContext) -> list[Signal]:

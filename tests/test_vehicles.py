@@ -7,6 +7,7 @@ history never sent as news, and a fund a person has ruled out staying out.
 from __future__ import annotations
 
 import importlib
+import re
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -543,8 +544,8 @@ def test_a_new_fund_is_emailed_once_with_where_to_look(store):
     assert edgar.reads == [new["accession"]], "only the filing being reported is read"
     [delivery] = store.alert_deliveries(sid)
     body = delivery["body_text"]
-    assert ("An investment fund named after Northwind filed with the SEC: "
-            "Northwind Co-Invest III LLC.") in body
+    assert ("FLAG 1: An investment fund named after Northwind filed with the SEC: "
+            "Northwind Co-Invest III LLC (Form D, SEC EDGAR)") in body
     assert f"It reports raising $12.0 million from 40 investors (Form D filed {iso(filed)})" \
         in body
     assert "What this is: A fund like this collects money" in body
@@ -616,7 +617,7 @@ def test_edgar_failing_does_not_stop_the_rest_of_the_alert(store):
     result = alerts.run_alerts(store, FakeAdv(), Mailer(FakeCfg()), vehicles=Down())
     assert result["funds"] == {"error": "ConnectionError: EDGAR is not answering"}
     [delivery] = store.alert_deliveries(sid)
-    assert f"{NAME} was flagged (HIGH)" in delivery["body_text"]
+    assert re.search(rf"\[HIGH\] FLAG \d+: {re.escape(NAME)}", delivery["body_text"])
 
 
 def test_nothing_is_fetched_when_no_contractor_is_watched_for_funds(store):

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -523,7 +524,8 @@ def test_a_change_after_subscribing_produces_one_readable_email(store):
     assert "rose from 30% to 51%" in body
     assert "What this is:" in body and "Where to look:" in body
     assert "https://adviserinfo.sec.gov/firm/summary/999001" in body
-    assert "does not say what the change means" in body
+    assert "[HIGH] FLAG 1: The share of" in body, "a rise in foreign ownership: high"
+    assert "not a finding of wrongdoing" in body
 
 
 def test_an_item_is_emailed_once(store):
@@ -580,7 +582,7 @@ def test_a_flagged_contractor_in_the_portfolio_is_included(store):
 
     alerts.run_alerts(store, FakeAdv(), Mailer(FakeCfg()), "https://site.example")
     [delivery] = store.alert_deliveries(sid)
-    assert "ACME DYNAMICS LLC was flagged (HIGH)" in delivery["body_text"]
+    assert re.search(r"\[HIGH\] FLAG \d+: ACME DYNAMICS LLC", delivery["body_text"])
     assert "https://site.example/#/entity/UEI123" in delivery["body_text"]
 
 

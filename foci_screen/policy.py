@@ -77,8 +77,11 @@ EVENTS: dict[str, Event] = {
                             "A contractor's registered country changes", False),
     "foreign_owned": Event("CHANGE-FOREIGN-OWNED-01",
                            "A contractor newly certifies as foreign owned", False),
+    # The same name as an entry on a U.S. sanctions or export list. Weaker
+    # name matches (SANCTION-02 to -04) raise notices by their severity.
     "sanctions_match": Event("SANCTION-01",
-                             "A name matches the sanctions list", False),
+                             "A name is the same as one on a sanctions or export list",
+                             False),
     "legal_release": Event("RELEASE-LEGAL-01",
                            "A new legal disclosure is published", True),
     "financial_release": Event("RELEASE-FINANCIAL-01",

@@ -323,7 +323,8 @@ class Config:
             "fpds": True,
             "sec_edgar": True,
             "iapd": True,
-            "ofac": True,
+            # trade.gov's Consolidated Screening List; Treasury's files stand in.
+            "screening_lists": True,
             "sam_exclusions": True,
             "webwatch": True,
             "ir_email_alerts": bool(self.alerts_dir
@@ -332,7 +333,6 @@ class Config:
             "uspto": bool(self.uspto_api_key),
             "uspto_assignment_dataset": bool(self.patent_assignments_index
                                              and Path(self.patent_assignments_index).is_file()),
-            "trade_gov_csl": bool(self.trade_gov_key),
             "headless_browser": self.browser_enabled and _playwright_installed(),
         }
 

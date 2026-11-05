@@ -233,6 +233,9 @@ class Finding(Serialisable):
     severity: str = "info"
     run_id: str = ""
     generated_at: str = field(default_factory=_now)
+    # What each source said about this contractor: "checked", or not checked
+    # and why. A clean result means something only next to this.
+    coverage: dict = field(default_factory=dict)
 
     @property
     def obligated_total(self) -> float:

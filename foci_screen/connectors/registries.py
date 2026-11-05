@@ -1,11 +1,11 @@
-"""Smaller registry connectors: IAPD, OFAC, USPTO, SAM.gov.
+"""Smaller registry connectors: IAPD, USPTO, SAM.gov.
+
+The sanctions and export lists are `screening_lists`.
 
 Grouped in one module because each is a thin wrapper over a single endpoint.
 """
 from __future__ import annotations
 
-import csv
-import io
 import json
 import logging
 import re
@@ -122,59 +122,6 @@ class IAPDConnector:
             return (parsed or {}).get("officeAddress") or {}
         except Exception:
             return {}
-
-
-# --------------------------------------------------------------------- OFAC
-class OFACConnector:
-    """OFAC Specially Designated Nationals list (keyless CSV).
-
-    Name matching only. A hit is a question, never a conclusion — SDN entries
-    are adjudicated on identifiers (DOB, passport, address), which this does
-    not attempt.
-    """
-    name = "ofac"
-    SDN_CSV = "https://www.treasury.gov/ofac/downloads/sdn.csv"
-
-    def __init__(self, http) -> None:
-        self.http = http
-        self._rows: list[tuple[str, str, str]] | None = None
-
-    def _load(self) -> list[tuple[str, str, str]]:
-        if self._rows is not None:
-            return self._rows
-        resp = self.http.get(self.SDN_CSV)
-        rows: list[tuple[str, str, str]] = []
-        if resp.get("status") == 200 and resp.get("text"):
-            reader = csv.reader(io.StringIO(resp["text"]))
-            for row in reader:
-                if len(row) >= 4:
-                    rows.append((row[0].strip(), row[1].strip().strip('"'),
-                                 row[3].strip().strip('"')))
-        self._rows = rows
-        return rows
-
-    def screen(self, name: str, threshold: float = 0.90) -> list[Document]:
-        target = _simplify(name)
-        if len(target) < 5:
-            return []
-        out: list[Document] = []
-        for ent_num, sdn_name, program in self._load():
-            candidate = _simplify(sdn_name)
-            if not candidate:
-                continue
-            if abs(len(candidate) - len(target)) > 12:
-                continue
-            ratio = SequenceMatcher(None, target, candidate).ratio()
-            if ratio >= threshold:
-                out.append(Document(
-                    source="ofac", key=f"ofac:{ent_num}", title=sdn_name,
-                    url="https://sanctionssearch.ofac.treas.gov/Details.aspx?id=" + ent_num,
-                    text=(f"OFAC SDN entry {ent_num}: {sdn_name} (program {program}). "
-                          f"Similarity to screened name '{name}': {ratio:.2f}. "
-                          f"Name match only — adjudicate against identifiers."),
-                    doc_type="sanctions_match",
-                    meta={"score": round(ratio, 3), "program": program}))
-        return out[:5]
 
 
 # -------------------------------------------------------------------- USPTO

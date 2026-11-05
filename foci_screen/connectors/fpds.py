@@ -123,7 +123,7 @@ def contract_from_entry(entry) -> Contract | None:
         state_of_incorporation=_text(entry, "stateOfIncorporation"),
         foreign_owned_and_located=_text(entry, "isForeignOwnedAndLocated").lower()
         in ("true", "y", "yes"),
-        foreign_funding=_text(entry, "foreignFunding"),
+        foreign_funding=_foreign_funding(entry),
         source_url=f'https://www.fpds.gov/ezsearch/search.do?q=PIID:"{piid}"',
     )
     FPDSConnector._apply_registration(contract, _registration(entry))
@@ -131,6 +131,17 @@ def contract_from_entry(entry) -> Contract | None:
     if officer.is_addressable:
         contract.officer = officer
     return contract
+
+
+def _foreign_funding(entry) -> str:
+    """The award's foreign funding as FPDS spells it out ("Foreign Funds FMS"),
+    or "" when it has none. The element holds a code — A and B are foreign
+    money, X "not applicable", on nearly every award — and its description."""
+    code = _text(entry, "foreignFunding").upper()
+    if code in ("A", "B"):
+        return _attr(entry, "foreignFunding", "description").title() or (
+            "Foreign Funds FMS" if code == "A" else "Foreign Funds non-FMS")
+    return ""
 
 
 def _registration(entry) -> dict:
@@ -263,7 +274,7 @@ class FPDSConnector:
         parent_uei = _text(latest, "ultimateParentUEI")
         if parent_uei and not contract.parent_recipient_uei:
             contract.parent_recipient_uei = parent_uei
-        ff = _text(latest, "foreignFunding")
+        ff = _foreign_funding(latest)
         if ff and not contract.foreign_funding:
             contract.foreign_funding = ff
         self._apply_registration(contract, _registration(latest))

@@ -266,7 +266,7 @@ def test_a_screen_checks_the_contractor_and_its_parent_by_identifier():
     screener.iapd = SimpleNamespace()
     screener.exclusions = SimpleNamespace(
         screen=lambda name, **ids: asked.append((name, ids)) or [])
-    screener.ofac = SimpleNamespace(screen=lambda name: [])
+    screener.lists = SimpleNamespace(screen=lambda name, whose="": [])
     screener.uspto = SimpleNamespace(available=False)
     screener.patent_dataset = SimpleNamespace(available=False)
     screener.sam = SimpleNamespace(available=False)

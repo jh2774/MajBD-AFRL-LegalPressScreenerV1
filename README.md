@@ -18,7 +18,7 @@ Working and tested end to end. 82 offline tests plus two live diagnostics.
 | Step | State |
 |---|---|
 | 1. Contract discovery (agency → awards → contracting officer) | Working |
-| 2. Contractor enrichment (SEC, IAPD, OFAC, USPTO, SAM, company web) | Working |
+| 2. Contractor enrichment (SEC, IAPD, U.S. screening lists, USPTO, SAM, company web) | Working |
 | 3. Email to the KO | **Renders only. Delivery deliberately inert** — see [Step 3](#step-3-email-deliberately-not-armed) |
 
 Runs two ways from one codebase: a CLI over SQLite for a single analyst, or an HTTP API with a
@@ -70,7 +70,7 @@ actually return, not what their docs claim.
 | **FPDS-NG ATOM** | no | **Contracting officer email**, `countryOfIncorporation`, `isForeignOwnedAndLocated`, `foreignFunding`, ultimate parent UEI |
 | **SEC EDGAR** submissions + full-text search | no | 8-K item codes, the exhibits where IP security agreements actually live, and Schedule 13D/13G holders |
 | **IAPD** `api.adviserinfo.sec.gov` | no | Adviser registration, office country and disclosures for the contractor's 5%+ holders — see [Who holds the contractor](#who-holds-the-contractor) |
-| **OFAC SDN** CSV | no | Sanctions name screening |
+| **Consolidated Screening List** (trade.gov) CSV, daily | no | Twelve U.S. sanctions and export lists in one — Treasury SDN, sectoral, menu-based and Chinese military companies; Commerce Entity List, Military End User, Unverified and Denied Persons; State ITAR debarments and nonproliferation — each entry with its other names. Checked for the contractor, its parent and its 5% holders. Treasury's own SDN and consolidated files, with aliases, stand in when trade.gov does not answer, and the run says the other lists were not checked |
 | **SAM.gov exclusions** public extract | no | Parties debarred or suspended from federal awards, by UEI and CAGE — see [Exclusions](#exclusions) |
 | **SAM.gov** entity + opportunities | yes | Registered address, business types, solicitation point of contact |
 | **USPTO** assignments | yes | Recorded `SECURITY INTEREST` conveyances against the patent estate |
@@ -1417,8 +1417,14 @@ columns are added explicitly.
 - **This is a screen, not an adjudication.** It reports correlations in public records. It is
   not a FOCI determination, a sanctions hit, or a finding of non-compliance, and the notice says
   so in the body rather than in fine print.
-- **OFAC matching is by name similarity only.** Real adjudication uses identifiers the tool does
-  not have. A match is a question.
+- **Screening-list matching is by name only.** Real adjudication uses identifiers the tool does
+  not have. A match is a question. Names are compared by their distinctive words — legal forms
+  ("LLC") and generic words ("International", "Technologies") set aside — never by whole-string
+  similarity, which flagged HERMEUS CORP as the sanctioned "HERMES". Three grades: the same name
+  (`SANCTION-01`, critical); the same distinctive name (`SANCTION-02`, high); a close variant
+  (`SANCTION-03`, medium). A non-exact match to a company listed only abroad, where nothing in
+  the contractor's name marks it as that company's U.S. arm ("… USA"), is recorded but not raised
+  (`SANCTION-04`, low).
 - **CIK resolution is conservative** (≥0.86 similarity with a matching first token). It will
   miss subsidiaries that file under an unrelated name before it will attribute the wrong
   company's filings.

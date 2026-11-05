@@ -22,6 +22,7 @@ from __future__ import annotations
 import calendar
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 OFFICE_CODE = re.compile(r"^[A-Z0-9]{6}$")
 
@@ -164,6 +165,22 @@ def month_range(month: str) -> tuple[str, str]:
     year, mon = (int(x) for x in month.split("-"))
     last = calendar.monthrange(year, mon)[1]
     return f"{year}/{mon:02d}/01", f"{year}/{mon:02d}/{last:02d}"
+
+
+# When the screening rules last changed in a way that alters results: every
+# contractor screened before it is due again, not only those screened over a
+# month ago. 5 Nov 2026: foreign funding read as FPDS codes it, sanctions and
+# export lists matched on distinctive names, all twelve U.S. lists.
+RULES_CHANGED = "2026-11-05T12:00:00Z"
+
+
+def rescreen_before(days: int = 30, now: datetime | None = None) -> str:
+    """Contractors screened before this are screened again: a month ago, or
+    when the rules last changed, whichever is later."""
+    now = now or datetime.now(timezone.utc)
+    month = (now - timedelta(days=days)).replace(microsecond=0, tzinfo=None) \
+        .isoformat() + "Z"
+    return max(month, RULES_CHANGED)
 
 
 def months_back(today, n: int) -> list[str]:

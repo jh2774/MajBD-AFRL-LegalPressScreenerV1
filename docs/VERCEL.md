@@ -78,7 +78,7 @@ redeploy.
 
 Open **https://contractscreener.com**. No key is needed.
 
-1. Click **API key** at the top right, paste your admin key — the part *after*
+1. Click **Admin key** at the top right, paste your admin key — the part *after*
    `default:` — and press **Save**. The button then reads **Admin key ✓**; if it reads **Key
    not accepted**, the site does not know that key (check it against `FOCI_API_KEYS`). Only
    you need do this, on your own computer.
@@ -94,7 +94,7 @@ Open **https://contractscreener.com**. No key is needed.
    A line that says **not working** says what failed and how to fix it.
 3. The banner about the database is gone.
 4. In a private browser window, which holds no key, the site opens and works the same, with
-   **API key** at the top right.
+   **Admin key** at the top right.
 
 ## 5. Email through Resend
 
@@ -350,6 +350,29 @@ after the last test to the same list.
 To close the site again, remove `FOCI_PUBLIC` and redeploy: every page then needs a key from
 `FOCI_API_KEYS`, entered with **API key** at the top right.
 
+## What the alert emails look like
+
+Each email lists its flags first, most serious first, one line each, then sets each out:
+
+```
+[CRITICAL] FLAG 1: BEACON INDUSTRIES, INC. — Contractor is excluded from federal awards (SAM.gov exclusions)
+     What the screen found:
+       • [CRITICAL] Contractor is excluded from federal awards
+         Found: "SAM.gov exclusion record … Excluding Agency: USAF …"
+         Why it counts: SAM.gov's exclusion list matches this contractor by UEI …
+         Document: https://sam.gov/…
+     2 awards looked at, $1.9M in all, from Department of the Air Force.
+     Not fully checked:
+       • USPTO patent liens: not checked: the site has no USPTO key or imported patent dataset
+     Open the contractor in FOCI-Screener: https://contractscreener.com/#/entity/…
+```
+
+The rating is the screen's own, CRITICAL to LOW. A change to a filing that the screen does not
+rate itself (a new Form ADV fund, a Form D) is rated from how much it matters for foreign
+ownership; one of little weight, such as "filed an updated Form ADV", is an **UPDATE**, marked
+INFO. "Not fully checked" lists every source that could not be read for that contractor, so a
+clean result is never confused with an unread one; the contractor's page has the same list.
+
 ## Watching a whole office or agency (AFWERX, AFRL)
 
 To have alerts on every company an office contracts with, set up in one go: type **AFWERX**
@@ -378,6 +401,12 @@ Vercel, screening contractors until its time is nearly spent (at most 100). Its 
 starts as soon as it is set up; after that the screening times carry it on. Change the number
 with `FOCI_SCOPE_RUNS_PER_DAY` in Vercel. Every run counts towards Vercel's free-plan hours,
 so keep it modest there. The portfolio shows how far it has got.
+
+**When the screening rules change, everything is screened again.** On 5 November 2026 the
+rules changed in ways that alter results — foreign funding read as FPDS codes it, sanctions and
+export lists matched on distinctive names, all twelve U.S. lists rather than Treasury's alone —
+so every contractor screened before then is due again, at the screening times or with
+**Screen all … now**.
 
 **An admin can screen all of it now.** With the admin key saved in the browser (the button at
 the top right reads **Admin key ✓**), or signed in to the site's own workspace, the office's

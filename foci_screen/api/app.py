@@ -1704,6 +1704,9 @@ def _scope_progress(store: Store, scope) -> dict:
     index = store.scope_index_rows(scope.id)
     window = _screening_now()
     return {**summary,
+            # Never screened, or screened before the rules last changed or a
+            # month ago: what "Screen all" would screen.
+            "due": store.scope_due(scope, scopes_mod.rescreen_before()),
             "screening": {"times": window["times"], "next": window.get("next")},
             "months_read": sorted({r["month"] for r in index if r["done"]}),
             "watch": {"watchlist_id": watch["watchlist_id"], "active": bool(watch["active"]),
@@ -1735,7 +1738,7 @@ def _scope_portfolio(loaded, store: Store, offset: int) -> dict:
                    "obligated": progress["obligated"], "contracts": progress["awards"]},
         "severity": progress["severity"],
         "scope": {**scope.to_dict(),
-                  **{k: progress[k] for k in ("months_read", "watch", "screening")},
+                  **{k: progress[k] for k in ("months_read", "watch", "screening", "due")},
                   "offset": offset, "page": SCOPE_PAGE, "more": len(rows) > SCOPE_PAGE},
     }
 

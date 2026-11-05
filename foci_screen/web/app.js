@@ -65,6 +65,7 @@ function showError(err) {
  * page never shows the browser's portfolio and then swaps in the account's. */
 let account = null;
 let authStatus = null;
+let publicSite = false;         // /health said so (`showPublicKeyLabels`)
 
 function notSignedIn() {
   // Someone holding a key has a wrong key; anyone else needs to sign in.
@@ -100,11 +101,20 @@ async function refreshAccount() {
   // could only ever be refused; either way it would only confuse.
   const keyButton = document.getElementById("key-button");
   keyButton.hidden = !!account || (!authStatus.keys && !authStatus.public);
-  // Whether the key in this browser is one the site knows, said where it is set.
-  keyButton.textContent = !apiKey ? "API key"
+  labelKeyButton();
+}
+
+/* Whether the key in this browser is one the site knows, said where it is
+ * set. Called again once /health has said the site is public, which used to
+ * put back a plain "Admin key" over the answer. */
+function labelKeyButton() {
+  const keyButton = document.getElementById("key-button");
+  const open = (authStatus && authStatus.public) || publicSite;
+  keyButton.textContent = !apiKey ? (open ? "Admin key" : "API key")
+    : !authStatus ? "Admin key"
     : authStatus.key_accepted ? "Admin key ✓" : "Key not accepted";
   keyButton.title = !apiKey ? "Enter the site's admin key"
-    : authStatus.key_accepted ? "This browser holds the site's admin key"
+    : authStatus && authStatus.key_accepted ? "This browser holds the site's admin key"
     : "The site does not know the key saved in this browser";
 }
 
@@ -903,6 +913,26 @@ const VERDICT_LABEL = {
 /* `opts.entityKey` turns on the verdict controls. A verdict is the only
  * labelled data this tool ever produces, so it is collected where a reviewer
  * is already reading the evidence rather than on a separate screen. */
+/* What each source said in the latest screen: a clean result means something
+ * only next to the sources that were actually read. */
+function coverageCard(coverage) {
+  const rows = Object.entries(coverage).sort(([, a], [, b]) =>
+    (a === "checked") - (b === "checked"));
+  const gaps = rows.filter(([, said]) => said !== "checked").length;
+  return `<div class="card">
+    <h2>What the latest screen checked</h2>
+    <div class="muted" style="font-size:12px;margin-bottom:8px">${gaps
+      ? `${gaps} source${gaps === 1 ? " was" : "s were"} not fully checked: nothing found
+         there is not the same as nothing there.`
+      : "Every source this screen reads was checked."}</div>
+    <table><tbody>${rows.map(([source, said]) => `<tr>
+      <td>${esc(source)}</td>
+      <td class="${said === "checked" ? "muted" : ""}">${said === "checked"
+        ? "Checked" : esc(said.charAt(0).toUpperCase() + said.slice(1))}</td></tr>`).join("")}
+    </tbody></table>
+  </div>`;
+}
+
 function signalList(signals, opts = {}) {
   if (!signals || !signals.length) return `<div class="empty">No signals.</div>`;
   const verdicts = opts.dispositions || {};
@@ -1087,9 +1117,10 @@ function aboutCard() {
         recent awards from USAspending and FPDS, with the winning company, its
         parent, and the contracting officer responsible for each award.</li>
         <li><strong>Check the contractors.</strong> For each company it reads
-        SEC filings, investment-adviser records, the OFAC sanctions list, SAM.gov
-        registrations, USPTO patent assignments, and the company's own press and
-        investor pages.</li>
+        SEC filings, investment-adviser records, twelve U.S. sanctions and export lists
+        (among them Treasury's SDN list and Commerce's Entity List) for it, its parent
+        and its 5% holders, SAM.gov exclusions and registrations, USPTO patent
+        assignments, and the company's own press and investor pages.</li>
         <li><strong>Track what changed.</strong> Every document it reads is
         stored and fingerprinted. On later screens, rules run against what is
         new, so findings point to fresh disclosures rather than old news.</li>
@@ -1707,6 +1738,8 @@ async function viewEntity(key, params) {
         Marking these is what makes rule weights measurable rather than assumed —
         see <a href="#/rules">rule precision</a>.</div>
       ${signalList(f.signals, { entityKey: key, dispositions: d.dispositions })}</div>` : ""}
+
+    ${f && f.coverage && Object.keys(f.coverage).length ? coverageCard(f.coverage) : ""}
 
     ${history.length > 1 ? `<div class="card">
       <h2>Severity over time</h2>
@@ -3331,7 +3364,7 @@ function scopeProgressCard(d) {
       : `Nobody is watching this office yet, so nothing new is read.
          <a href="#/scope/${encodeURIComponent(s.id)}">Start watching it</a>.`}
       Email alerts below go out when any of them is flagged.</p>
-    ${screenAllControls(watch, t.companies - t.screened_here)}
+    ${screenAllControls(watch, s.due ?? (t.companies - t.screened_here))}
   </div>`;
 }
 
@@ -3348,8 +3381,9 @@ function screenAllControls(watch, left) {
   return `<div class="actions"><button class="primary" id="screen-all"
       data-watch="${esc(watch.watchlist_id)}">Screen all ${num(left)} now</button></div>
     <p class="muted" id="screen-all-status" role="status" style="font-size:12.5px">For admins:
-      runs one batch after another — dozens of contractors every few minutes — until all
-      are screened. Keep this page open; stop at any time.</p>`;
+      runs one batch after another — dozens of contractors every few minutes — until every
+      one not yet screened, or screened before the rules last changed, is done. Keep this
+      page open; stop at any time.</p>`;
 }
 
 function showScreenAll() {
@@ -3391,8 +3425,9 @@ function wireScreenAll(scopeId) {
         if (r.execute) await apiPost(r.execute, {}).catch(() => null);
         else await waitForRun(r.run_id);
         const p = (await api(`/v1/scopes/lookup?q=${encodeURIComponent(scopeId)}`)).progress;
-        const line = `${num(p.screened)} of ${num(p.contractors)} screened after batch ${batch}.`;
-        if (!p.watch || !p.watch.catching_up) {
+        const line = `${num(p.contractors - (p.due ?? 0))} of ${num(p.contractors)} up to `
+          + `date after batch ${batch}.`;
+        if (!p.watch || !p.watch.catching_up || p.due === 0) {
           run.done = true;
           say(`${line} All done.`);
           break;
@@ -3449,7 +3484,7 @@ async function viewScope(id) {
       <p>${num(p.contractors)} contractor${p.contractors === 1 ? "" : "s"} found so far;
         ${num(p.screened)} screened.</p>
       <div class="actions"><button id="scope-open">Open its portfolio</button></div>
-      ${screenAllControls(p.watch, p.contractors - p.screened)}
+      ${screenAllControls(p.watch, p.due ?? (p.contractors - p.screened))}
     </div>` : ""}
 
     <div class="card">
@@ -5081,7 +5116,8 @@ let storageIsEphemeral = false;
  * button asks for is the one for the few actions kept for whoever looks
  * after the site. */
 function showPublicKeyLabels() {
-  document.getElementById("key-button").textContent = "Admin key";
+  publicSite = true;
+  labelKeyButton();
   document.getElementById("key-title").textContent = "Admin key";
   document.getElementById("key-explain").textContent =
     "Nobody needs a key to use this site. The admin key is only for deleting a "
